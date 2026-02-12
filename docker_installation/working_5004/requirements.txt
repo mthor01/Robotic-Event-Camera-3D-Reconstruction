@@ -1,0 +1,10 @@
+numpy
+pandas
+scipy
+matplotlib
+ipywidgets
+opencv-python
+sk-video
+fire
+h5py
+

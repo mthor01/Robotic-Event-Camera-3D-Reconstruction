@@ -1,0 +1,39 @@
+# Docker startup
+
+docker run -it --rm -v /cshome:/cshome -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix --net=host --privileged deoxys_autostart
+
+docker run -it --rm --runtime=nvidia --gpus all \
+  -e DISPLAY=$DISPLAY \
+  -e XAUTHORITY=/root/.Xauthority \
+  -e POSE_PUB_BIND=tcp://host.docker.internal:5556 \
+  -e MUJOCO_GL=glx \
+  -v "$HOME/.Xauthority:/root/.Xauthority:ro" \
+  -v "$(pwd):/workspace/project" \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  --net=host --privileged \
+  openvla
+
+docker run -it --rm \
+  -v "$(pwd):/work/project" \
+  -e POSE_PUB_BIND=tcp://host.docker.internal:5556 \
+  metavision-462 \
+  bash
+
+
+# testing
+
+python project/franka_pipeline/main.py --osc-demo --simulated-robot
+
+#zeromq test
+xhost +local:root
+
+docker compose up
+
+docker exec -it openvla bash
+
+docker exec -it metavision bash
+
+python project/franka_pipeline/my_main.py --simulated-robot
+
+python3 project/zmq_pose_receiver.py
+

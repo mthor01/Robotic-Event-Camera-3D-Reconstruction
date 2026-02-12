@@ -1,0 +1,158 @@
+# Following the tutorial on https://zhuyifengzju.github.io/deoxys_docs/html/installation/codebase_installation.html
+docker run -it -v /cshome:/cshome -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix --net=host --privileged ros:noetic
+
+apt update && apt upgrade -y
+apt install git nano wget  -y 
+
+# add to /etc/security/limits.conf
+nano /etc/security/limits.conf
+
+@realtime soft rtprio 99
+@realtime soft priority 99
+@realtime soft memlock 102400
+@realtime hard rtprio 99
+@realtime hard priority 99
+@realtime hard memlock 102400
+
+
+
+# Install Deoxys
+cd ~
+git clone https://github.com/UT-Austin-RPL/deoxys_control
+cd deoxys_control/deoxys
+bash ./InstallPackage
+# -> select 0.8.0
+
+# export LD_LIBRARY_PATH=$(dirname "${0}")/../lib:$LD_LIBRARY_PATH fix for symlinks, but not required
+make -j build_franka=1 
+make -j build_deoxys=1
+
+# for some reason the libfiles were generated into deoxys_control/deoxys, not sure why, but by moving them to ./lib it worked (nor sure if the LD_LIBRARY_PATH export above was required for this)
+# MOVE Libraries to lib folder!
+
+# Install python + conda (accept + yes, yes) (order of Deoxys install and conda environment creation is important, otherwise the protobuf from the conda environment overshadows the one installed on the system)
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh 
+bash Miniconda3-latest-Linux-x86_64.sh
+
+# restart shell / container
+# build base environment (deoxys requires python <= 3.10)
+conda create -n "deoxys" python=3.10 ipython ipykernel pylint jupyter pip -y
+
+# This command definitely worked
+conda create -n "deoxys" python=3.8 ipython ipykernel pylint jupyter pip pyzmq PyYAML easydict google-api-python-client pybullet numpy hidapi glfw numba termcolor simplejson mujoco==3.1.0 protobuf==3.13.0 matplotlib -c conda-forge
+
+# This command should work (adding scipy and h5py which are also reuquired and using a newer protobuf version)
+conda create -n "deoxys" python=3.8 ipython ipykernel pylint jupyter pip pyzmq PyYAML easydict google-api-python-client pybullet numpy hidapi glfw numba termcolor simplejson mujoco==3.1.0 protobuf==3.20.0 matplotlib h5py scipy -c conda-forge
+
+conda activate deoxys
+
+# In requirements add
+protobuf==3.13.0
+matplotlib
+numpy<2.0.0
+
+# pip install -U -r requirements.txt
+
+# pip install . # don't do this, instead in scripts the os.cwd() path should be added to sys.path
+import os, sys
+sys.path.append(os.getcwd())
+
+
+# In the config/charmander.yml
+change NUC IP to 172.16.0.1 # We run the NUC and PC on the same device
+
+
+# Test if deoxys python install is working:
+from deoxys.utils.config_utils import get_available_controller_configs
+get_available_controller_configs(verbose=True)
+
+
+# run the control programs
+./auto_scripts/auto_arm.sh config/charmander.yml
+./auto_scripts/auto_gripper.sh config/charmander.yml
+
+# Control the arm (careful, that reaching home state is possible from current configuration
+python examples/reset_robot_joints.py
+
+
+# Tuning control parameters
+https://zhuyifengzju.github.io/deoxys_docs/html/tutorials/tuning_controller_parameters.html
+
+
+
+
+
+# Definitely working With new docker Container:
+docker run -it -v /cshome:/cshome -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix --net=host --privileged ros:noetic
+
+    1  apt update && apt upgrade -y
+    2  apt install git nano wget  -y 
+    3  cd ~
+    4  git clone https://github.com/UT-Austin-RPL/deoxys_control
+    5  cd deoxys_control/deoxys
+    6  bash ./InstallPackage
+    7  make -j build_franka=1 
+    8  make -j build_deoxys=1
+    9  ls
+   10  mv libfranka.so* lib/
+   11  mv libyaml-cpp* lib/
+   12  mv libzmqpp* lib/
+   13  ls
+   14  wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh 
+   15  bash Miniconda3-latest-Linux-x86_64.sh
+   16  . ~/.bashrc 
+   17  conda create -n "deoxys" python=3.8 ipython ipykernel pylint jupyter pip pyzmq PyYAML easydict google-api-python-client pybullet numpy hidapi glfw numba termcolor simplejson mujoco==3.1.0 protobuf==3.20.0 matplotlib h5py scipy -c conda-forge
+   18  conda activate deoxys
+   19  sed -i 's/IP: 172.16.0.3/IP: 172.16.0.1/g' deoxys_control/deoxys/config/charmander.yml
+   20  sed -i 's/IP: 172.16.0.3/IP: 172.16.0.1/g' config/charmander.yml
+   21  ./auto_scripts/auto_arm.sh config/charmander.yml
+
+docker exec -it f6af954807f2 /bin/bash
+    ./auto_scripts/auto_gripper.sh config/charmander.yml
+
+
+docker exec -it f6af954807f2 /bin/bash
+    1  conda activate deoxys
+    2  cd ~/deoxys_control/deoxys
+    3  python examples/reset_robot_joints.py
+    4  nano examples/reset_robot_joints.py 
+    5  python examples/reset_robot_joints.py
+
+
+
+# Definitely working With new docker Container:
+docker run -it -v /cshome:/cshome -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix --net=host --privileged ros:noetic
+
+    1  apt update && apt upgrade -y
+    2  apt install git nano wget  -y 
+    3  cd ~
+    4  git clone https://github.com/UT-Austin-RPL/deoxys_control
+    5  cd deoxys_control/deoxys
+    sed -i 's/read version/export version=0.8.0/g' ./InstallPackage
+    6  bash ./InstallPackage
+    7  make -j build_franka=1 
+    8  make -j build_deoxys=1
+    9  ls
+   10  mv libfranka.so* lib/
+   11  mv libyaml-cpp* lib/
+   12  mv libzmqpp* lib/
+   13  ls
+   14  wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh 
+   15  bash Miniconda3-latest-Linux-x86_64.sh
+   16  . ~/.bashrc 
+   17  conda create -n "deoxys" python=3.8 ipython ipykernel pylint jupyter pip pyzmq PyYAML easydict google-api-python-client pybullet numpy hidapi glfw numba termcolor simplejson mujoco==3.1.0 protobuf==3.20.0 matplotlib h5py scipy -c conda-forge
+   18  conda activate deoxys
+   19  sed -i 's/IP: 172.16.0.3/IP: 172.16.0.1/g' deoxys_control/deoxys/config/charmander.yml
+   20  sed -i 's/IP: 172.16.0.3/IP: 172.16.0.1/g' config/charmander.yml
+   21  ./auto_scripts/auto_arm.sh config/charmander.yml
+
+docker exec -it f6af954807f2 /bin/bash
+    ./auto_scripts/auto_gripper.sh config/charmander.yml
+
+
+docker exec -it f6af954807f2 /bin/bash
+    1  conda activate deoxys
+    2  cd ~/deoxys_control/deoxys
+    3  python examples/reset_robot_joints.py
+    4  nano examples/reset_robot_joints.py 
+    5  python examples/reset_robot_joints.py

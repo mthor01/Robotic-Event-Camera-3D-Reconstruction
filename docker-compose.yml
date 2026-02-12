@@ -1,0 +1,37 @@
+services:
+  openvla:
+    image: openvla
+    container_name: openvla
+    privileged: true
+    ipc: host
+    gpus: all
+    tty: true
+    stdin_open: true
+    environment:
+      DISPLAY: ${DISPLAY}
+      XAUTHORITY: /root/.Xauthority
+      MUJOCO_GL: glx
+      POSE_PUB_BIND: tcp://0.0.0.0:5556
+    volumes:
+      - ${HOME}/.Xauthority:/root/.Xauthority:ro
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ./:/workspace/project
+    networks: [robotnet]
+    # keep container alive + interactive (similar to `docker run -it`)
+    command: ["bash"]
+
+  metavision:
+    image: metavision-462
+    container_name: metavision
+    tty: true
+    stdin_open: true
+    volumes:
+      - ./:/work/project
+    environment:
+      POSE_PUB_CONNECT: tcp://openvla:5556
+    networks: [robotnet]
+    command: ["bash"]
+
+networks:
+  robotnet:
+    driver: bridge
