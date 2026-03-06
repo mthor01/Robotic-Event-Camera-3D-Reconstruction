@@ -4,7 +4,14 @@ services:
     container_name: openvla
     privileged: true
     ipc: host
-    gpus: all
+    #gpus: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     tty: true
     stdin_open: true
     environment:
@@ -21,7 +28,8 @@ services:
     command: ["bash"]
 
   metavision:
-    image: metavision-462
+    #image: metavision-462
+    image: meta_and_pytorch
     container_name: metavision
     tty: true
     stdin_open: true
