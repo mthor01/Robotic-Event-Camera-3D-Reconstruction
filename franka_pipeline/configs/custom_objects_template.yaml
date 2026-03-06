@@ -1,0 +1,55 @@
+# Custom Objects Configuration for Synthetic Data Recording
+#
+# CURRENT LIMITATION:
+#   Due to MuJoCo's architecture, loading custom meshes at runtime requires
+#   recompiling the model. For now, this config controls the POSITION of the
+#   existing red cube in the scene. The first object's position will be used.
+#
+#   Full custom mesh support requires creating custom robosuite environments
+#   with the meshes embedded in the XML before simulation starts.
+# 
+# =============================================================================
+# COORDINATE SYSTEMS
+# =============================================================================
+#
+# There are TWO coordinate frames you need to understand:
+#
+# 1. WORLD FRAME (used for object positions in this config)
+#    - Origin: Near center of table
+#    - Table surface: z ≈ 0.8
+#    - Table center: approximately x=0, y=0
+#    - X: positive = toward robot arm
+#    - Y: positive = to the left (from robot's perspective)
+#    - Z: up
+#
+# 2. ROBOT BASE FRAME (used by hemisphere_grid_agent.py)
+#    - Origin: At robot base (which is at world x≈-0.5, y≈0, z≈0.9)
+#    - Hemisphere center: [0.35, 0.0, -0.1] in base frame
+#    - This means the hemisphere looks at a point 0.35m in front of and 0.1m below the robot base
+#
+# CONVERSION:
+#    pos_world = robot_base_pos + pos_base_frame
+#    
+# Example: Hemisphere center [0.35, 0, -0.1] in base frame
+#    If robot_base_pos ≈ [-0.5, 0, 0.9], then:
+#    pos_world ≈ [-0.5+0.35, 0, 0.9-0.1] = [-0.15, 0, 0.8]
+#
+# TIP: Run with --custom-objects-config to see exact values printed at startup!
+#
+# =============================================================================
+
+objects:
+  # The first object's position controls where the cube is placed
+  - name: cube
+    mesh_path: placeholder  # Not used yet - see limitation above
+    
+    # WORLD FRAME position - use the debug output to find the right values
+    # To place at hemisphere center, run once to get the exact world coordinates
+    position: [-0.15, 0.0, 0.82]    # Approximate hemisphere center, on table
+    rotation: [0, 0, 0]             # Rotation in degrees (roll, pitch, yaw)
+
+# FUTURE: When custom mesh loading is implemented, you'll be able to add:
+#  - name: my_mug
+#    mesh_path: /path/to/mug.obj
+#    position: [0.1, -0.1, 0.82]
+#    scale: 0.1

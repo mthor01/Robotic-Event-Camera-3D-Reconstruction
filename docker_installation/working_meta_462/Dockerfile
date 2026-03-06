@@ -42,7 +42,12 @@ RUN python3 -m pip install --upgrade pip \
     opencv-python \
     pyrealsense2 \
     pyzmq \
-    msgpack
+    msgpack \
+    torch \
+    torchvision \
+    pillow \
+    tensorboard \
+    tqdm
 
 
 # Optional: HDF5 plugin path for Ubuntu 22.04 (doc gives this exact path)

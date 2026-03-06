@@ -16,15 +16,17 @@ from scipy.spatial.transform import Rotation
 logger = get_logger(__name__)
 
 
-class HalfSphereRecordingAgent(Agent):
+class HemisphereGridAgent(Agent):
     """Agent that moves between sampled hemisphere poses in a loop to test OscPoseTargetController."""
 
     def __init__(
         self,
         wait_time: float = 0.0,
+        loop: bool = False,  # If True, loop forever; if False, stop after one full hemisphere
     ) -> None:
         super().__init__(action_type="OSC_POSE")
         self.wait_time = wait_time
+        self.loop = loop
 
         radius = 0.15
         base_pose = np.array([0.35, 0.0, -0.1, 0.0, 0.0, 0.0, 0.0], dtype=float)
@@ -42,12 +44,13 @@ class HalfSphereRecordingAgent(Agent):
             filter_p_gt=-1
         )
 
-        logger.info(f"Generated {len(self.poses)} poses for HalfSphereRecordingAgent.")
+        logger.info(f"Generated {len(self.poses)} poses for HemisphereGridAgent.")
 
         self.current_pose_idx = 0
-        self.state = "MOVING"  # States: MOVING, WAITING
+        self.state = "MOVING"  # States: MOVING, WAITING, COMPLETE
         self.wait_start_time: float | None = None
         self.osc_controller: OscPoseTargetController | None = None
+        self.hemisphere_complete = False
 
     def quat_z_points_keep_y_horizontal(
         self,
@@ -214,11 +217,31 @@ class HalfSphereRecordingAgent(Agent):
             if self.wait_start_time is not None and (
                 time.time() - self.wait_start_time > self.wait_time
             ):
-                self.current_pose_idx = (self.current_pose_idx + 1) % len(self.poses)
-                logger.info(f"Wait finished. Moving to pose {self.current_pose_idx}.")
-                self.state = "MOVING"
-                self._init_osc_controller()
-                action, is_finished = self.osc_controller.calculate_action(current_pose)
+                next_idx = self.current_pose_idx + 1
+                
+                # Check if we've completed all poses
+                if next_idx >= len(self.poses):
+                    if self.loop:
+                        # Loop back to start
+                        self.current_pose_idx = 0
+                        logger.info("Hemisphere complete. Looping back to pose 0.")
+                    else:
+                        # Mark hemisphere as complete, stay at final pose
+                        self.hemisphere_complete = True
+                        self.state = "COMPLETE"
+                        logger.info("Hemisphere complete! All poses visited.")
+                else:
+                    self.current_pose_idx = next_idx
+                
+                if self.state != "COMPLETE":
+                    logger.info(f"Wait finished. Moving to pose {self.current_pose_idx}.")
+                    self.state = "MOVING"
+                    self._init_osc_controller()
+                    action, is_finished = self.osc_controller.calculate_action(current_pose)
+
+        elif self.state == "COMPLETE":
+            # Stay at current position, return zero action
+            pass
 
         logger.debug(f"Action: {action}")
 
@@ -226,7 +249,9 @@ class HalfSphereRecordingAgent(Agent):
             "action_type": self.action_type,
             "state": self.state,
             "target_pose_idx": self.current_pose_idx,
+            "total_poses": len(self.poses),
             "is_finished": is_finished,
+            "hemisphere_complete": self.hemisphere_complete,
         }
 
         return action, metadata
@@ -236,3 +261,4 @@ class HalfSphereRecordingAgent(Agent):
         self.state = "MOVING"
         self.wait_start_time = None
         self.osc_controller = None
+        self.hemisphere_complete = False

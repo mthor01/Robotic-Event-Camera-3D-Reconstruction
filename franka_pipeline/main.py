@@ -38,7 +38,7 @@ from franka_pipeline.agents.episode_control_wrapper_agent import (
     EpisodeControlWrapperAgent,
 )
 from franka_pipeline.agents.teleoperation_agent import TeleoperationAgent
-from franka_pipeline.agents.half_sphere_recording_agent import HalfSphereRecordingAgent
+from franka_pipeline.agents.hemisphere_grid_agent import HemisphereGridAgent
 from franka_pipeline.agents.move_to_origin_agent import MoveToOriginAgent
 from franka_pipeline.datacollector import DataCollector
 from franka_pipeline.input_controllers.spacemouse import SpaceMouseController
@@ -50,8 +50,6 @@ from franka_pipeline.sensors import RealsenseCamera, DummyCamera
 from franka_pipeline.sensors.robosuite_camera import RobosuiteCamera
 from franka_pipeline.sim.robosuite_env import RobosuiteSimEnv
 from franka_pipeline.visualization.live_visualizer import LiveVisualizer
-
-from franka_pipeline.agents.half_sphere_recording_agent import HalfSphereRecordingAgent
 
 app = typer.Typer(help="Modular framework for the Franka Emika Panda robot arm")
 
@@ -319,7 +317,7 @@ def main(
         calib_agent.start()
     elif half_sphere_record:
         agent = EpisodeControlWrapperAgent(
-            HalfSphereRecordingAgent(
+            HemisphereGridAgent(
                 #center=np.array([0.0, 0.0, 0.0]),
                 #radius=half_sphere_radius,
                 #n_theta=half_sphere_n_theta,

@@ -37,3 +37,7 @@ python project/franka_pipeline/my_main.py --simulated-robot
 
 python3 project/zmq_pose_receiver.py
 
+#test training with test data
+docker run --gpus all -it --rm   --shm-size=8g   -v /home/mthor9/Desktop/masterarbeit/robot_and_record/Event-Camera-3D-Reconstruction:/work   event-depth-training   python3 train_e2depth.py --data_dir test_data --batch 4 --seq_len 4 --all_sequences
+
+sudo chown -R $USER:$USER *

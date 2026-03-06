@@ -10,7 +10,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation
 
-from franka_pipeline.agents.half_sphere_recording_agent import HalfSphereRecordingAgent
+from franka_pipeline.agents.hemisphere_grid_agent import HemisphereGridAgent
 
 
 def plot_poses(poses: np.ndarray, dirs: np.ndarray, base_point: np.ndarray):
@@ -77,7 +77,7 @@ def plot_poses(poses: np.ndarray, dirs: np.ndarray, base_point: np.ndarray):
 
 def main():
     # Create the agent so we use its exact methods and defaults
-    agent = HalfSphereRecordingAgent(wait_time=0.0)
+    agent = HemisphereGridAgent(wait_time=0.0)
 
     # Option A (simplest): use the poses the agent already generated in __init__
     poses = np.asarray(agent.poses, dtype=float)

@@ -1,0 +1,96 @@
+# Custom Objects Configuration for Empty Table Environment
+#
+# This config file defines objects to place on the table.
+# Supports both primitive shapes and pre-made objects.
+#
+# =============================================================================
+# AVAILABLE OBJECT TYPES
+# =============================================================================
+#
+# PRIMITIVE SHAPES:
+#   - box / cube     : Rectangular box (size = [half_x, half_y, half_z])
+#   - ball / sphere  : Sphere (size = [radius])
+#   - cylinder       : Cylinder (size = [radius, half_height])
+#   - capsule        : Capsule (size = [radius, half_length])
+#
+# PRE-MADE OBJECTS (from robosuite):
+#   - milk           : Milk carton
+#   - bread          : Bread loaf
+#   - cereal         : Cereal box
+#   - can            : Soda can
+#   - bottle         : Bottle
+#
+# =============================================================================
+# COORDINATE SYSTEM
+# =============================================================================
+#
+# WORLD FRAME:
+#   - Table surface: z ≈ 0.8
+#   - Table center: approximately x=0, y=0
+#   - X: positive = toward robot arm
+#   - Y: positive = to the left (from robot's perspective)
+#   - Z: up
+#
+# =============================================================================
+
+objects:
+  # Example 1: Red cube at center of table
+  - name: red_cube
+    type: cube
+    position: [-0.15, 0.0, 0.82]
+    rotation: [0, 0, 0]           # roll, pitch, yaw in degrees
+    size: 0.025                   # single value = cube with this half-size
+    rgba: [1.0, 0.0, 0.0, 1.0]    # red
+    
+  # Example 2: Blue sphere
+  - name: blue_ball
+    type: sphere
+    position: [-0.05, 0.1, 0.83]
+    size: [0.03]                  # radius
+    rgba: [0.0, 0.0, 1.0, 1.0]    # blue
+
+  # Example 3: Green cylinder
+  - name: green_cylinder
+    type: cylinder
+    position: [-0.05, -0.1, 0.83]
+    size: [0.02, 0.04]            # [radius, half_height]
+    rgba: [0.0, 1.0, 0.0, 1.0]    # green
+    rotation: [0, 0, 45]          # rotated 45 degrees around Z
+
+  # Example 4: Yellow capsule
+  # - name: yellow_capsule
+  #   type: capsule
+  #   position: [-0.25, 0.0, 0.85]
+  #   size: [0.015, 0.04]          # [radius, half_length]
+  #   rgba: [1.0, 1.0, 0.0, 1.0]   # yellow
+
+  # Example 5: Milk carton (pre-made object)
+  - name: milk_carton
+    type: milk
+    position: [0.0, 0.15, 0.85]
+
+  # Example 6: Cereal box (pre-made object)
+  # - name: cereal_box
+  #   type: cereal
+  #   position: [0.0, -0.15, 0.85]
+
+  # Example 7: Soda can (pre-made object)
+  # - name: soda_can
+  #   type: can
+  #   position: [-0.2, 0.15, 0.83]
+
+# =============================================================================
+# FULL OBJECT CONFIGURATION REFERENCE
+# =============================================================================
+#
+# - name: unique_name          # Required: unique identifier for the object
+#   type: box                  # Required: object type (see available types above)
+#   position: [x, y, z]        # Required: world frame position
+#   rotation: [r, p, y]        # Optional: roll, pitch, yaw in degrees
+#   size: [...]                # Optional: size params (depends on type)
+#   scale: 1.0                 # Optional: scale factor (for pre-made objects)
+#   rgba: [r, g, b, a]         # Optional: color (0-1 range)
+#   density: 1000.0            # Optional: density in kg/m³
+#   material: "WoodRed"        # Optional: texture name
+#
+# =============================================================================

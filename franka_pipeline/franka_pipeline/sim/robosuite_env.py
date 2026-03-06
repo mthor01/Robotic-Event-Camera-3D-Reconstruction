@@ -41,6 +41,7 @@ class RobosuiteSimEnv(SimEnv):
         control_freq: int = 20,
         camera_width: int = 640,
         camera_height: int = 480,
+        has_renderer: bool = True,
     ) -> None:
         """Initialize the robosuite simulation environment.
 
@@ -49,6 +50,7 @@ class RobosuiteSimEnv(SimEnv):
             control_freq: Control loop frequency in Hz.
             camera_width: Width of the camera images.
             camera_height: Height of the camera images.
+            has_renderer: Whether to show the rendering window (False for headless mode).
         """
         self.controller_type = controller_type
         self.control_freq = control_freq
@@ -66,8 +68,7 @@ class RobosuiteSimEnv(SimEnv):
         self.env = robosuite.make(
             env_name="Lift",
             robots="Panda",
-            has_renderer=True,
-            # has_renderer=False,
+            has_renderer=has_renderer,
             ignore_done=True,
             control_freq=self.control_freq,
             has_offscreen_renderer=True,
@@ -146,7 +147,8 @@ class RobosuiteSimEnv(SimEnv):
         obs, reward, done, info = self.env.step(action)
         self._last_obs = obs
 
-        self.env.render()
+        if self.env.viewer is not None:
+            self.env.render()
 
         # TODO: Hacky enforce control frequency pacing inside the environment wrapper by sleeping.
         time_per_step = 1.0 / self.control_freq
