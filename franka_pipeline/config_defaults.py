@@ -35,10 +35,10 @@ SYNC_RECORDING = False
 # SYNTHETIC DATA RECORDING
 # =============================================================================
 SYNTHETIC_DATA = True
-SYNTHETIC_OUTPUT_DIR = "../Event-Camera-3D-Reconstruction/data/synthetic_data"
+SYNTHETIC_OUTPUT_DIR = "../3d_reconstruction/data/synthetic_data"
 SYNTHETIC_CAMERA_ID = "robot0_eye_in_hand"
-SYNTHETIC_CAMERA_WIDTH = 640
-SYNTHETIC_CAMERA_HEIGHT = 480
+SYNTHETIC_CAMERA_WIDTH = 346
+SYNTHETIC_CAMERA_HEIGHT = 260
 
 # Event camera simulation thresholds
 EVENT_THRESHOLD_POS = 0.25

@@ -548,7 +548,8 @@ class SyntheticDataset(Dataset):
             self.n_frames = f['realsense/depth'].shape[0]
             self.H = f['realsense/depth'].shape[1]
             self.W = f['realsense/depth'].shape[2]
-            self.depth_timestamps = f['realsense/t_sys_ns'][:]
+            # HDF5 timestamps are nanoseconds; event timestamps are microseconds.
+            self.depth_timestamps = f['realsense/t_sys_ns'][:] // 1000
         
         if self.use_precomputed:
             # Count voxel files

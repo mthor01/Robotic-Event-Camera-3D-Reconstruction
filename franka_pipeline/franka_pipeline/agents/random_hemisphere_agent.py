@@ -400,10 +400,10 @@ class RandomHemisphereAgent(Agent):
         current_pos = current_pose[:3]
         
         # Print position every second
-        current_time = time.time()
-        if current_time - self.last_position_print_time >= 1.0:
-            print(f"Robot position: x={current_pos[0]:.3f}, y={current_pos[1]:.3f}, z={current_pos[2]:.3f}")
-            self.last_position_print_time = current_time
+        #current_time = time.time()
+        #if current_time - self.last_position_print_time >= 1.0:
+        #    print(f"Robot position: x={current_pos[0]:.3f}, y={current_pos[1]:.3f}, z={current_pos[2]:.3f}")
+        #    self.last_position_print_time = current_time
 
         if self.osc_controller is None:
             # First call - set up transition to first pose

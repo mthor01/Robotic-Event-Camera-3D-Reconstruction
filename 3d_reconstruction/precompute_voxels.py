@@ -123,6 +123,10 @@ def process_sequence(sequence_dir: Path, num_bins: int = 5, overwrite: bool = Fa
             depth_shape = f['realsense/depth'].shape
             depth_timestamps = f['realsense/t_sys_ns'][:]
         
+        # HDF5 timestamps are in nanoseconds; event timestamps are in microseconds.
+        # Convert to microseconds for consistent comparison.
+        depth_timestamps = depth_timestamps // 1000
+
         n_frames = len(depth_timestamps)
         H, W = depth_shape[1], depth_shape[2]
         

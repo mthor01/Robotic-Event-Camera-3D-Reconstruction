@@ -19,6 +19,7 @@ import os
 import time
 import threading
 from pathlib import Path
+import robosuite
 
 import numpy as np
 import typer
@@ -37,7 +38,6 @@ from franka_pipeline.robot_controllers.controller import (
     SimulatedRobosuiteRobotController,
 )
 from franka_pipeline.sim.robosuite_env import RobosuiteSimEnv
-from franka_pipeline.sim.custom_objects_env import CustomObjectsSimEnv, CustomObjectConfig
 from franka_pipeline.sim.empty_table_env import EmptyTableSimEnv, ObjectConfig
 from franka_pipeline.synthetic_data import SyntheticDataRecorder
 from franka_pipeline.synthetic_data.synthetic_recorder import SyntheticRecorderConfig
@@ -46,187 +46,13 @@ import config_defaults as cfg
 app = typer.Typer(help="Half-sphere recording runner (no cameras) + ZMQ pose stream")
 logger = get_logger(__name__)
 
-# ============================================================================
-# Available objects for multi-object synthetic data generation
-# ============================================================================
-# These are all the object types supported by robosuite/EmptyTableSimEnv
-
-AVAILABLE_OBJECTS = [
-    # Primitive shapes (different sizes)
-    {"name": "cube_small", "type": "cube", "size": 0.015, "rgba": (1.0, 0.0, 0.0, 1.0)},
-    {"name": "cube_medium", "type": "cube", "size": 0.025, "rgba": (1.0, 0.0, 0.0, 1.0)},
-    {"name": "cube_large", "type": "cube", "size": 0.035, "rgba": (1.0, 0.0, 0.0, 1.0)},
-    
-    {"name": "sphere_small", "type": "sphere", "size": [0.015], "rgba": (0.0, 1.0, 0.0, 1.0)},
-    {"name": "sphere_medium", "type": "sphere", "size": [0.025], "rgba": (0.0, 1.0, 0.0, 1.0)},
-    {"name": "sphere_large", "type": "sphere", "size": [0.04], "rgba": (0.0, 1.0, 0.0, 1.0)},
-    
-    {"name": "cylinder_small", "type": "cylinder", "size": [0.015, 0.02], "rgba": (0.0, 0.0, 1.0, 1.0)},
-    {"name": "cylinder_medium", "type": "cylinder", "size": [0.02, 0.03], "rgba": (0.0, 0.0, 1.0, 1.0)},
-    {"name": "cylinder_tall", "type": "cylinder", "size": [0.015, 0.05], "rgba": (0.0, 0.0, 1.0, 1.0)},
-    
-    {"name": "capsule_small", "type": "capsule", "size": [0.012, 0.025], "rgba": (1.0, 1.0, 0.0, 1.0)},
-    {"name": "capsule_medium", "type": "capsule", "size": [0.015, 0.03], "rgba": (1.0, 1.0, 0.0, 1.0)},
-    {"name": "capsule_large", "type": "capsule", "size": [0.02, 0.04], "rgba": (1.0, 1.0, 0.0, 1.0)},
-    
-    # Pre-made XML objects from robosuite
-    {"name": "milk", "type": "milk"},
-    {"name": "bread", "type": "bread"},
-    {"name": "cereal", "type": "cereal"},
-    {"name": "can", "type": "can"},
-    {"name": "bottle", "type": "bottle"},
-    {"name": "lemon", "type": "lemon"},
-    {"name": "square_nut", "type": "square_nut"},
-    {"name": "round_nut", "type": "round_nut"},
-    
-    # Composite objects from robosuite
-    {"name": "pot", "type": "pot"},
-    {"name": "hammer", "type": "hammer"},
-    {"name": "hollow_cylinder", "type": "hollow_cylinder"},
-    {"name": "cone", "type": "cone"},
-]
-
-# Robot base position in world frame (standard robosuite table setup)
-ROBOT_BASE_POS_WORLD = np.array([-0.55, 0.0, 0.9])
-TABLE_HEIGHT = 0.82
-
-# Convert target position from robot base frame to world frame for object spawning
-# Formula: pos_world = robot_base_pos + pos_base_frame
-# Z coordinate uses table height since objects sit on the table
-def get_object_spawn_position():
-    """Calculate object spawn position in world frame from target in base frame."""
-    world_x = ROBOT_BASE_POS_WORLD[0] + cfg.TARGET_X
-    world_y = ROBOT_BASE_POS_WORLD[1] + cfg.TARGET_Y
-    world_z = TABLE_HEIGHT  # Objects spawn on table surface
-    return (world_x, world_y, world_z)
-
-DEFAULT_OBJECT_POSITION = get_object_spawn_position()
-
-
-# Approximate heights for pre-made XML objects (from robosuite)
-# These are rough estimates - actual values may vary
-PREMADE_OBJECT_HEIGHTS = {
-    "milk": 0.14,         # Milk carton ~14cm tall
-    "bread": 0.08,        # Bread loaf ~8cm tall
-    "cereal": 0.22,       # Cereal box ~22cm tall
-    "can": 0.12,          # Can ~12cm tall
-    "bottle": 0.18,       # Bottle ~18cm tall
-    "lemon": 0.05,        # Lemon ~5cm diameter
-    "square_nut": 0.02,   # Square nut ~2cm tall
-    "round_nut": 0.02,    # Round nut ~2cm tall
-    "pot": 0.10,          # Pot ~10cm tall
-    "hammer": 0.04,       # Hammer handle diameter ~4cm
-    "hollow_cylinder": 0.08,  # Hollow cylinder ~8cm tall
-    "cone": 0.08,         # Cone ~8cm tall
-}
-
-
-def get_object_height(obj) -> float:
-    """
-    Get the height of an object based on its type and size.
-    Returns the height in meters.
-    
-    Accepts either a dict or an ObjectConfig instance.
-    
-    For primitive shapes:
-    - cube: size is half-extent, so height = 2 * size
-    - sphere: diameter = 2 * radius, so height = 2 * size[0]
-    - cylinder: size = [radius, half_height], so height = 2 * size[1]
-    - capsule: size = [radius, half_length], total height = 2 * (radius + half_length)
-    
-    For pre-made XML objects, use estimated heights.
-    """
-    # Handle both dict and ObjectConfig
-    if isinstance(obj, dict):
-        obj_type = obj.get("type", "")
-        size = obj.get("size")
-    else:
-        # ObjectConfig dataclass
-        obj_type = obj.type if obj.type else ""
-        size = obj.size
-    
-    # Primitive shapes with explicit size
-    if obj_type == "cube":
-        # size is half-extent for cubes
-        if isinstance(size, (int, float)):
-            return 2 * size
-        elif isinstance(size, (list, tuple)) and len(size) >= 1:
-            return 2 * size[0]
-        return 0.05  # Default cube height
-    
-    elif obj_type in ("sphere", "ball"):
-        # size = [radius]
-        if isinstance(size, (list, tuple)) and len(size) >= 1:
-            return 2 * size[0]  # Diameter
-        elif isinstance(size, (int, float)):
-            return 2 * size
-        return 0.05  # Default sphere diameter
-    
-    elif obj_type == "cylinder":
-        # size = [radius, half_height]
-        if isinstance(size, (list, tuple)) and len(size) >= 2:
-            return 2 * size[1]  # Full height
-        return 0.06  # Default cylinder height
-    
-    elif obj_type == "capsule":
-        # size = [radius, half_length]
-        # Total height = 2 * radius (for the caps) + 2 * half_length (cylinder part)
-        if isinstance(size, (list, tuple)) and len(size) >= 2:
-            radius = size[0]
-            half_length = size[1]
-            return 2 * radius + 2 * half_length
-        return 0.08  # Default capsule height
-    
-    # Pre-made XML objects
-    if obj_type in PREMADE_OBJECT_HEIGHTS:
-        return PREMADE_OBJECT_HEIGHTS[obj_type]
-    
-    # Default fallback
-    return 0.05
-
-
-def create_object_config(obj_dict: dict, position: tuple = DEFAULT_OBJECT_POSITION) -> ObjectConfig:
-    """Create an ObjectConfig from a dictionary definition."""
-    return ObjectConfig(
-        name=obj_dict["name"],
-        type=obj_dict["type"],
-        position=position,
-        rotation=obj_dict.get("rotation"),
-        size=obj_dict.get("size"),
-        scale=obj_dict.get("scale", 1.0),
-        rgba=obj_dict.get("rgba", (1.0, 0.0, 0.0, 1.0)),
-        density=obj_dict.get("density", 1000.0),
-        material=obj_dict.get("material"),
-    )
-
-
-def list_available_objects() -> None:
-    """Print all available objects for synthetic data generation."""
-    print("\n" + "=" * 70)
-    print("AVAILABLE OBJECTS FOR SYNTHETIC DATA GENERATION")
-    print("=" * 70)
-    spawn_pos = get_object_spawn_position()
-    print(f"\nObject spawn position (world frame): {spawn_pos}")
-    print(f"  Calculated from target position (base frame): ({cfg.TARGET_X}, {cfg.TARGET_Y}, {cfg.TARGET_Z})")
-    print("\n--- PRIMITIVE SHAPES (different sizes) ---")
-    primitives = [o for o in AVAILABLE_OBJECTS if o["type"] in ("cube", "box", "sphere", "ball", "cylinder", "capsule")]
-    for obj in primitives:
-        size_str = f", size={obj.get('size', 'default')}" if "size" in obj else ""
-        print(f"  - {obj['name']} (type: {obj['type']}{size_str})")
-    
-    print("\n--- PRE-MADE XML OBJECTS (from robosuite) ---")
-    premade = [o for o in AVAILABLE_OBJECTS if o["type"] in ("milk", "bread", "cereal", "can", "bottle", "lemon", "square_nut", "round_nut")]
-    for obj in premade:
-        print(f"  - {obj['name']} (type: {obj['type']})")
-    
-    print("\n--- COMPOSITE OBJECTS (from robosuite) ---")
-    composite = [o for o in AVAILABLE_OBJECTS if o["type"] in ("pot", "hammer", "hollow_cylinder", "cone")]
-    for obj in composite:
-        print(f"  - {obj['name']} (type: {obj['type']})")
-    
-    print("\n" + "=" * 70)
-    print(f"TOTAL: {len(AVAILABLE_OBJECTS)} objects available")
-    print("=" * 70 + "\n")
+from object_utils import (
+    AVAILABLE_OBJECTS,
+    DEFAULT_OBJECT_POSITION,
+    get_object_height,
+    create_object_config,
+    list_available_objects,
+)
 
 
 class ZMQPosePublisher:
@@ -359,80 +185,11 @@ class ZMQSyncServer:
         self.rep.close()
 
 
-def _load_custom_objects_from_yaml(yaml_path: str) -> list[CustomObjectConfig]:
-    """Load custom object configurations from a YAML file (legacy format)."""
-    import yaml
-    
-    with open(yaml_path) as f:
-        config = yaml.safe_load(f)
-    
-    objects = []
-    for obj_config in config.get("objects", []):
-        # Convert lists to tuples for dataclass
-        if "position" in obj_config and isinstance(obj_config["position"], list):
-            obj_config["position"] = tuple(obj_config["position"])
-        if "rotation" in obj_config and isinstance(obj_config["rotation"], list):
-            obj_config["rotation"] = tuple(obj_config["rotation"])
-        if "rgba" in obj_config and isinstance(obj_config["rgba"], list):
-            obj_config["rgba"] = tuple(obj_config["rgba"])
-        
-        objects.append(CustomObjectConfig(**obj_config))
-    
-    return objects
-
-
-def _load_objects_from_yaml(yaml_path: str) -> list[ObjectConfig]:
-    """Load object configurations from a YAML file (new format with types).
-    
-    YAML format:
-        objects:
-          - name: my_cube
-            type: cube               # box, cube, ball, sphere, cylinder, capsule, milk, bread, cereal, can, bottle
-            position: [0.0, 0.0, 0.82]
-            rotation: [0, 0, 45]     # roll, pitch, yaw in degrees (optional)
-            size: [0.02, 0.02, 0.02] # size params depend on type (optional)
-            scale: 1.0               # for pre-made objects (optional)
-            rgba: [1.0, 0.0, 0.0, 1.0]  # color (optional)
-            density: 1000.0          # kg/m³ (optional)
-            material: "WoodRed"      # texture name (optional)
-    """
-    import yaml
-    
-    with open(yaml_path) as f:
-        config = yaml.safe_load(f)
-    
-    objects = []
-    for obj_config in config.get("objects", []):
-        # Convert lists to tuples for dataclass
-        if "position" in obj_config and isinstance(obj_config["position"], list):
-            obj_config["position"] = tuple(obj_config["position"])
-        if "rotation" in obj_config and isinstance(obj_config["rotation"], list):
-            obj_config["rotation"] = tuple(obj_config["rotation"])
-        if "rgba" in obj_config and isinstance(obj_config["rgba"], list):
-            obj_config["rgba"] = tuple(obj_config["rgba"])
-        
-        objects.append(ObjectConfig(**obj_config))
-    
-    return objects
-
-
-def _has_type_field(yaml_path: str) -> bool:
-    """Check if the YAML config uses the new format with 'type' field."""
-    import yaml
-    with open(yaml_path) as f:
-        config = yaml.safe_load(f)
-    objects = config.get("objects", [])
-    if objects and "type" in objects[0]:
-        return True
-    return False
-
-
 def _run_single_object_recording(
     obj_config: ObjectConfig,
     obj_name: str,
     obj_dict: dict,  # Original object dictionary for getting height
     synthetic_output_dir: str,
-    synthetic_camera_id: str,
     synthetic_camera_width: int,
     synthetic_camera_height: int,
     event_threshold_pos: float,
@@ -453,13 +210,8 @@ def _run_single_object_recording(
     Run a single recording for one object.
     This is called by multi-object recording mode.
     """
-    import robosuite
-    from robosuite.controllers.composite.composite_controller_factory import (
-        refactor_composite_controller_config,
-    )
     
-    cam_width = synthetic_camera_width
-    cam_height = synthetic_camera_height
+
     
     # Create environment with just this one object
     logger.info(f"Creating simulation environment with object: {obj_name}")
@@ -470,8 +222,8 @@ def _run_single_object_recording(
     
     sim_env = EmptyTableSimEnv(
         controller_type="OSC_POSE",
-        camera_width=cam_width,
-        camera_height=cam_height,
+        camera_width=synthetic_camera_width,
+        camera_height=synthetic_camera_height,
         custom_objects=[obj_config],
         has_renderer=not headless,
     )
@@ -495,7 +247,7 @@ def _run_single_object_recording(
     # Synthetic data recorder
     config = SyntheticRecorderConfig(
         output_dir=Path(synthetic_output_dir),
-        camera_id=synthetic_camera_id,
+        camera_id="robot0_eye_in_hand",
         camera_width=synthetic_camera_width,
         camera_height=synthetic_camera_height,
         event_threshold_pos=event_threshold_pos,
@@ -685,10 +437,7 @@ def _run_single_object_recording(
 @app.command()
 def main(
     simulated_robot: bool = typer.Option(
-        cfg.SIMULATED_ROBOT, "--simulated-robot/--no-simulated-robot", help="Run in robosuite sim"
-    ),
-    real_robot: bool = typer.Option(
-        cfg.REAL_ROBOT, "--real-robot/--no-real-robot", help="Run on real robot"
+        False, "--simulated-robot/--real_robot", help="Run in robosuite sim"
     ),
     log_level: str = typer.Option(
         cfg.LOG_LEVEL, "--log-level", help="Logging level (DEBUG, INFO, WARNING, ERROR)"
@@ -730,11 +479,6 @@ def main(
         "--synthetic-output-dir",
         help="Output directory for synthetic data recordings.",
     ),
-    synthetic_camera_id: str = typer.Option(
-        cfg.SYNTHETIC_CAMERA_ID,
-        "--synthetic-camera-id",
-        help="Camera ID to use for synthetic data (e.g., 'robot0_eye_in_hand', 'frontview').",
-    ),
     synthetic_camera_width: int = typer.Option(
         cfg.SYNTHETIC_CAMERA_WIDTH,
         "--synthetic-camera-width",
@@ -759,18 +503,6 @@ def main(
         cfg.FLIP_VERTICAL,
         "--flip-vertical/--no-flip-vertical",
         help="Flip all synthetic data (RGB, depth, events) vertically. Useful for camera mounting orientation.",
-    ),
-    # Custom objects options
-    custom_objects_config: str = typer.Option(
-        cfg.CUSTOM_OBJECTS_CONFIG,
-        "--custom-objects-config",
-        help="Path to YAML file defining custom objects to load (mesh paths, positions, scales).",
-    ),
-    # Multi-object synthetic data recording options
-    multi_object_recording: bool = typer.Option(
-        cfg.MULTI_OBJECT_RECORDING,
-        "--multi-object-recording/--no-multi-object-recording",
-        help="Generate synthetic data for ALL available objects automatically. Each object gets its own recording.",
     ),
     object_filter: str = typer.Option(
         cfg.OBJECT_FILTER,
@@ -843,9 +575,8 @@ def main(
         "--random-seed",
         help="Random seed for reproducible pose generation. Default: None (random)",
     ),
-    # Agent params (you can expand as needed)
-    # NOTE: If your HalfSphereRecordingAgent takes args, add them here.
 ) -> None:
+    
     # Handle --list-objects early
     if list_objects:
         list_available_objects()
@@ -855,28 +586,17 @@ def main(
     log_level = "DEBUG" if verbose else log_level
     setup_logging(level=log_level, deps_level=deps_log_level)
 
-    # Mode selection
-    if not simulated_robot and not real_robot:
-        simulated_robot = True
-        logger.info("No mode specified -> defaulting to simulated robot")
+    # Mode selection: simulation only when explicitly requested.
+    # If `--simulated-robot` is provided we run the simulator; otherwise
+    # default to running on the real robot.
+    if synthetic_data:
+        logger.info("Using simulated robot for synthetic data generation")
+    elif simulated_robot:
+        logger.info("Using simulated robot")
+    else:
+        logger.info("Using real robot")
 
-    if simulated_robot and real_robot:
-        typer.echo("Error: cannot set both --simulated-robot and --real-robot")
-        raise typer.Exit(code=1)
-
-    # Validate synthetic data option
-    if synthetic_data and not simulated_robot:
-        typer.echo("Error: --synthetic-data requires --simulated-robot")
-        raise typer.Exit(code=1)
-
-    # Validate multi-object recording option
-    if multi_object_recording and not synthetic_data:
-        typer.echo("Error: --multi-object-recording requires --synthetic-data")
-        raise typer.Exit(code=1)
     
-    if multi_object_recording and custom_objects_config:
-        typer.echo("Error: cannot use both --multi-object-recording and --custom-objects-config")
-        raise typer.Exit(code=1)
 
     # Filter objects if specified
     objects_to_record = AVAILABLE_OBJECTS.copy()
@@ -892,9 +612,9 @@ def main(
             raise typer.Exit(code=1)
 
     # Multi-object recording mode
-    if multi_object_recording:
+    if synthetic_data:
         logger.info("=" * 70)
-        logger.info("MULTI-OBJECT SYNTHETIC DATA RECORDING MODE")
+        logger.info("SYNTHETIC DATA RECORDING MODE")
         logger.info(f"Will generate synthetic data for {len(objects_to_record)} objects")
         logger.info("=" * 70)
         
@@ -913,7 +633,6 @@ def main(
                 obj_name=obj_dict["name"],
                 obj_dict=obj_dict,  # Pass object dict for height calculation
                 synthetic_output_dir=synthetic_output_dir,
-                synthetic_camera_id=synthetic_camera_id,
                 synthetic_camera_width=synthetic_camera_width,
                 synthetic_camera_height=synthetic_camera_height,
                 event_threshold_pos=event_threshold_pos,
@@ -941,52 +660,11 @@ def main(
 
     # Single object / regular mode
     # Robot controller
-    custom_objects = None  # Will be populated if custom_objects_config is provided
-    if simulated_robot:
-        # Use higher resolution if synthetic data recording is enabled
-        cam_width = synthetic_camera_width if synthetic_data else 64
-        cam_height = synthetic_camera_height if synthetic_data else 64
-        
-        # Check if using custom objects
-        if custom_objects_config:
-            # Check if using new format (with 'type' field) or legacy format
-            if _has_type_field(custom_objects_config):
-                # New format: use EmptyTableSimEnv with proper object types
-                custom_objects = _load_objects_from_yaml(custom_objects_config)
-                logger.info(f"Loading {len(custom_objects)} objects from {custom_objects_config} (new format)")
-                for obj in custom_objects:
-                    logger.info(f"  - {obj.name} ({obj.type}) at {obj.position}")
-                sim_env = EmptyTableSimEnv(
-                    controller_type="OSC_POSE",
-                    camera_width=cam_width,
-                    camera_height=cam_height,
-                    custom_objects=custom_objects,
-                    has_renderer=not headless,
-                )
-            else:
-                # Legacy format: use CustomObjectsSimEnv (just moves the cube)
-                custom_objects = _load_custom_objects_from_yaml(custom_objects_config)
-                logger.info(f"Loading {len(custom_objects)} custom objects from {custom_objects_config} (legacy format)")
-                sim_env = CustomObjectsSimEnv(
-                    controller_type="OSC_POSE",
-                    camera_width=cam_width,
-                    camera_height=cam_height,
-                    custom_objects=custom_objects,
-                    has_renderer=not headless,
-                )
-            # Print coordinate system debug info
-            sim_env.print_coordinate_debug_info()
-            # Log object positions
-            positions = sim_env.get_object_positions()
-            for name, pos in positions.items():
-                logger.info(f"  Object '{name}': x={pos[0]:.3f}, y={pos[1]:.3f}, z={pos[2]:.3f}")
-        else:
-            sim_env = RobosuiteSimEnv(
-                controller_type="OSC_POSE",
-                camera_width=cam_width,
-                camera_height=cam_height,
-                has_renderer=not headless,
-            )
+    if simulated_robot:       
+        sim_env = RobosuiteSimEnv(
+            controller_type="OSC_POSE",
+            has_renderer=not headless,
+        )
         
         robot_controller = SimulatedRobosuiteRobotController(
             sim_env=sim_env, controller_type="OSC_POSE"
@@ -1006,50 +684,20 @@ def main(
         sync_server = ZMQSyncServer(bind_addr=zmq_sync_bind)
         logger.info("Sync recording mode enabled.")
 
-    # Synthetic data recorder (optional)
-    synthetic_recorder = None
-    if synthetic_data:
-        config = SyntheticRecorderConfig(
-            output_dir=Path(synthetic_output_dir),
-            camera_id=synthetic_camera_id,
-            camera_width=synthetic_camera_width,
-            camera_height=synthetic_camera_height,
-            event_threshold_pos=event_threshold_pos,
-            event_threshold_neg=event_threshold_neg,
-            save_rgb=True,
-            save_depth=True,
-            save_events=True,
-            save_poses=True,
-            save_video=True,
-            flip_vertical=flip_vertical,
-        )
-        synthetic_recorder = SyntheticDataRecorder(config)
-        logger.info(f"Synthetic data recording enabled. Output: {synthetic_output_dir}")
-        if flip_vertical:
-            logger.info("Vertical flip enabled for all synthetic data")
 
     # Throttle publishing if desired
     min_period = (1.0 / publish_hz) if publish_hz and publish_hz > 0 else 0.0
 
-    recording_count = 0
     
     # Helper function to create the appropriate agent
     # obj parameter is optional - if provided, target z will be adjusted by half the object height
-    def create_agent(obj=None):
-        # Calculate height adjustment based on object
-        obj_height = get_object_height(obj) if obj else 0.0
-        adjusted_target_z = target_z + obj_height / 2
-        
-        if obj_height > 0:
-            logger.info(f"  Object height: {obj_height:.3f}m, adjusting target z by {obj_height/2:.3f}m")
-            logger.info(f"  Adjusted target z: {target_z:.3f} -> {adjusted_target_z:.3f}")
-        
-        if agent_type.lower() == "hemisphere":
+    def create_agent():
+        if agent_type.lower() == "grid_hemisphere":
             logger.info("Using HemisphereGridAgent")
             return EpisodeControlWrapperAgent(HemisphereGridAgent(wait_time=wait_time))
         elif agent_type.lower() == "random_hemisphere":
             logger.info(f"Using RandomHemisphereAgent with {num_poses} poses")
-            logger.info(f"  Hemisphere center = Target point: ({target_x}, {target_y}, {adjusted_target_z})")
+            logger.info(f"  Hemisphere center = Target point: ({target_x}, {target_y}, {target_z})")
             logger.info(f"  Hemisphere radius: {sphere_radius}")
             logger.info(f"  Inner radius: {cfg.INNER_RADIUS}")
             logger.info(f"  Base exclusion radius: {cfg.BASE_EXCLUSION_RADIUS}")
@@ -1057,13 +705,13 @@ def main(
             # For random_hemisphere, center equals target point
             return EpisodeControlWrapperAgent(
                 RandomHemisphereAgent(
-                    center=np.array([target_x, target_y, adjusted_target_z]),
+                    center=np.array([target_x, target_y, target_z]),
                     radius=sphere_radius,
                     inner_radius=cfg.INNER_RADIUS,
                     num_poses=num_poses,
                     wait_time=wait_time,
                     seed=random_seed,
-                    target_point=np.array([target_x, target_y, adjusted_target_z]),
+                    target_point=np.array([target_x, target_y, target_z]),
                     base_exclusion_radius=cfg.BASE_EXCLUSION_RADIUS,
                     base_max_radius=cfg.BASE_MAX_RADIUS,
                     min_z_height=cfg.MIN_Z_HEIGHT,
@@ -1073,7 +721,7 @@ def main(
         else:  # Default to random_sphere
             logger.info(f"Using RandomSphereAgent with {num_poses} poses")
             logger.info(f"  Sphere center: ({sphere_center_x}, {sphere_center_y}, {sphere_center_z})")
-            logger.info(f"  Target point: ({target_x}, {target_y}, {adjusted_target_z})")
+            logger.info(f"  Target point: ({target_x}, {target_y}, {target_z})")
             logger.info(f"  Sphere radius: {sphere_radius}")
             return EpisodeControlWrapperAgent(
                 RandomSphereAgent(
@@ -1082,16 +730,16 @@ def main(
                     num_poses=num_poses,
                     wait_time=wait_time,
                     seed=random_seed,
-                    target_point=np.array([target_x, target_y, adjusted_target_z]),
+                    target_point=np.array([target_x, target_y, target_z]),
                 )
             )
+        
+    recording_count = 0
     
     # Outer loop for multiple recordings
     while True:
         # Create fresh agent for each recording
-        # Pass first object if available for height adjustment
-        first_obj = custom_objects[0] if custom_objects else None
-        agent = create_agent(first_obj)
+        agent = create_agent()
         
         # Wait for recording script to be ready (if in sync mode)
         if sync_server is not None:
@@ -1110,12 +758,6 @@ def main(
         step_count = 0
         ep_count = 0
         next_pub_t = 0.0
-
-        # Start synthetic recording for this session
-        if synthetic_recorder is not None:
-            recording_id = "synthetic"
-            synthetic_recorder.start_recording(recording_id)
-            logger.info(f"Started synthetic recording: {recording_id}")
 
         pub.publish_event("episode_start", ep=ep_count)
 
@@ -1137,19 +779,6 @@ def main(
                 instruction=instruction,
             )
             robot_controller.control(command=action, controller_type=agent.action_type)
-
-            # Record synthetic data (if enabled)
-            if synthetic_recorder is not None and synthetic_recorder.is_recording:
-                try:
-                    stats = synthetic_recorder.record_frame(
-                        sim_env=sim_env,
-                        robot_state=robot_state,
-                        timestamp_ns=time.time_ns(),
-                    )
-                    if step_count % 100 == 0:
-                        logger.debug(f"Synthetic recording step {step_count}: {stats.get('num_events', 0)} events")
-                except Exception as e:
-                    logger.warning(f"Failed to record synthetic frame: {e}")
 
             # Publish pose at most publish_hz (or every loop if publish_hz=0)
             now = time.time()
@@ -1212,13 +841,6 @@ def main(
                     "total_poses": metadata.get("total_poses", 0),
                 })
 
-                # Stop synthetic recording and save data
-                if synthetic_recorder is not None and synthetic_recorder.is_recording:
-                    summary = synthetic_recorder.stop_recording()
-                    logger.info(f"Synthetic recording saved: {summary.get('output_path')}")
-                    logger.info(f"  - Frames: {summary.get('num_frames', 0)}")
-                    logger.info(f"  - Events: {summary.get('total_events', 0)}")
-
                 robot_controller.reset_robot_joints()
                 if hasattr(agent, "stop"):
                     agent.stop()
@@ -1236,11 +858,6 @@ def main(
             if metadata.get("quit", False):
                 logger.info("Ending run, as per agent request (keyboard quit).")
                 pub.publish_event("quit", ep=ep_count, extra={"step": step_count})
-
-                # Stop synthetic recording if active
-                if synthetic_recorder is not None and synthetic_recorder.is_recording:
-                    summary = synthetic_recorder.stop_recording()
-                    logger.info(f"Synthetic recording saved on quit: {summary.get('output_path')}")
 
                 robot_controller.reset_robot_joints()
                 if hasattr(agent, "stop"):
