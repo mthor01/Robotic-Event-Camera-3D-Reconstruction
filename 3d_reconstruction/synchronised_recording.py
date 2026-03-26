@@ -27,10 +27,11 @@ import msgpack
 
 from metavision_hal import DeviceDiscovery
 from metavision_core.event_io import EventsIterator
+from metavision_sdk_core import PeriodicFrameGenerationAlgorithm
 
 
 # ================= CONFIG =================
-TARGET_SECONDS = 10
+TARGET_SECONDS = 20
 FPS = 30
 
 DATA_DIR = Path("data")
@@ -53,8 +54,8 @@ BIAS_HPF = 50
 BIAS_REFR = 150
 
 # ZMQ addresses
-ZMQ_SYNC_ADDR = "tcp://localhost:5557"  # REQ/REP for sync handshake
-ZMQ_POSE_ADDR = "tcp://localhost:5556"  # PUB/SUB for pose streaming (from my_main)
+ZMQ_SYNC_ADDR = "tcp://localhost:6001"  # REQ/REP for sync handshake
+ZMQ_POSE_ADDR = "tcp://localhost:6000"  # PUB/SUB for pose streaming (from my_main)
 # =========================================
 
 
@@ -153,15 +154,19 @@ class ZMQPoseReceiver:
                 msg = msgpack.unpackb(payload, raw=False)
 
                 with self.lock:
-                    if topic == b"pose":
-                        self.poses.append(msg)
-                    elif topic == b"event":
+                    print(topic)
+                    if topic == b"event":
+                        print(2)
                         self.events.append(msg)
-                        # Check for stop signals
+                        # Check for stop signals — include events published by my_main
                         event_type = msg.get("type", "")
-                        if event_type in ("hemisphere_complete", "quit"):
+                        print(event_type)
+                        if event_type in ("hemisphere_complete", "agent_complete", "episode_end", "quit"):
                             print(f"[PoseReceiver] Received '{event_type}' event - signaling stop")
                             self.stop_recording_event.set()
+                    elif topic == b"pose":
+                        #print(1)
+                        self.poses.append(msg)
             except zmq.error.Again:
                 # Timeout, check if we should keep running
                 continue
@@ -361,6 +366,7 @@ def record_single_object(
     pose_receiver: "ZMQPoseReceiver",
     sync_client: "ZMQSyncClient",
     target_seconds: float,
+    num_event_cams: int = 1,
 ) -> bool:
     """
     Record a single object. Returns True if successful, False if should abort.
@@ -378,43 +384,58 @@ def record_single_object(
     # Define output files for this object
     event0_raw_file = object_raw_dir / "events_cam0.raw"
     event1_raw_file = object_raw_dir / "events_cam1.raw"
-    rs_video_file = object_video_dir / "realsense.mp4"
+    rs_video_file = object_video_dir / "realsense_depth.mp4"
+    rs_rgb_video_file = object_video_dir / "realsense_rgb.mp4"
     rs_h5_file = object_hdf5_dir / "synchronized_recording.h5"
     
     print(f"\n[Recording] Starting recording for object: {object_name}")
     print(f"[Recording] Output directory: {object_dir}")
     
-    # Initialize event cameras (in subprocess)
-    stop_acquire_event = MPEvent()
-    event_done_event = MPEvent()
-    event_ready_event = MPEvent()
-    
-    event_proc = Process(
-        target=event_drain_process_with_paths,
-        args=(stop_acquire_event, event_done_event, event_ready_event, 
-              str(event0_raw_file), str(event1_raw_file))
-    )
-    event_proc.start()
-    
-    # Wait for event cameras to be ready
-    print("[Recording] Waiting for event cameras...")
-    event_ready_event.wait()
-    print("[Recording] Event cameras ready")
+    # Initialize event cameras (in subprocess) if enabled
+    event_proc = None
+    stop_acquire_event = None
+    event_done_event = None
+    event_ready_event = None
+
+    if num_event_cams > 0:
+        stop_acquire_event = MPEvent()
+        event_done_event = MPEvent()
+        event_ready_event = MPEvent()
+
+        event_proc = Process(
+            target=event_drain_process_with_paths,
+            args=(stop_acquire_event, event_done_event, event_ready_event,
+                  str(event0_raw_file), str(event1_raw_file), num_event_cams)
+        )
+        event_proc.start()
+
+        # Wait for event cameras to be ready
+        print(f"[Recording] Waiting for {num_event_cams} event camera(s)...")
+        event_ready_event.wait()
+        print(f"[Recording] {num_event_cams} event camera(s) ready")
+    else:
+        print("[Recording] Event recording disabled for this run")
     
     # Send "ready" signal and wait for "start"
+    # Reset and start pose receiver BEFORE the sync handshake so the ZMQ
+    # subscription is fully established by the time my_main.py starts
+    # publishing after "start" (avoids the ZMQ slow-joiner problem where
+    # agent_complete is published before the SUB socket has connected).
+    pose_receiver.stop_recording_event.clear()
+    pose_receiver.start()
+
     print("[Recording] Sending ready signal to robot controller...")
     if not sync_client.send_ready_wait_start(timeout_sec=120.0):
         print("[Recording] ERROR: Did not receive start signal, aborting")
-        stop_acquire_event.set()
-        event_done_event.wait()
-        event_proc.join()
+        pose_receiver.stop()
+        # Only attempt to stop event acquisition if it was started
+        if stop_acquire_event is not None and event_done_event is not None and event_proc is not None:
+            stop_acquire_event.set()
+            event_done_event.wait()
+            event_proc.join()
         return False
     
-    # Reset pose receiver for new recording
-    pose_receiver.stop_recording_event.clear()
-    pose_receiver.start()
-    
-    # Initialize video writer and HDF5
+    # Initialize video writers and HDF5
     rs_video = cv2.VideoWriter(
         str(rs_video_file),
         cv2.VideoWriter_fourcc(*"mp4v"),
@@ -422,9 +443,16 @@ def record_single_object(
         (RS_WIDTH, RS_HEIGHT),
         isColor=False
     )
-    
+    rs_rgb_video = cv2.VideoWriter(
+        str(rs_rgb_video_file),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        FPS,
+        (RS_WIDTH, RS_HEIGHT),
+        isColor=True
+    )
+
     rs_h5 = h5py.File(rs_h5_file, "w")
-    
+
     # Create realsense group
     rs_grp = rs_h5.create_group("realsense")
     depth_ds = rs_grp.create_dataset(
@@ -432,6 +460,13 @@ def record_single_object(
         shape=(0, RS_HEIGHT, RS_WIDTH),
         maxshape=(None, RS_HEIGHT, RS_WIDTH),
         dtype=np.uint16,
+        chunks=True
+    )
+    rgb_ds = rs_grp.create_dataset(
+        "rgb",
+        shape=(0, RS_HEIGHT, RS_WIDTH, 3),
+        maxshape=(None, RS_HEIGHT, RS_WIDTH, 3),
+        dtype=np.uint8,
         chunks=True
     )
     t_sys_ds = rs_grp.create_dataset(
@@ -462,31 +497,37 @@ def record_single_object(
                 stop_reason = "hemisphere_complete"
                 print("[Recording] Received stop signal from robot - ending recording")
                 break
-            
-            # Capture depth frame
-            frames = pipeline.poll_for_frames()
-            if not frames:
+
+            # Capture depth + color frame (blocking, 100 ms timeout)
+            try:
+                frames = pipeline.wait_for_frames(timeout_ms=100)
+            except RuntimeError:
                 new_poses = pose_receiver.get_all_poses()
                 accumulated_poses.extend(new_poses)
                 continue
-            
+
             depth = frames.get_depth_frame()
-            if not depth:
+            color = frames.get_color_frame()
+            if not depth or not color:
                 new_poses = pose_receiver.get_all_poses()
                 accumulated_poses.extend(new_poses)
                 continue
-            
+
             depth_img = np.asanyarray(depth.get_data())
-            
+            color_img = np.asanyarray(color.get_data())
+
             # Resize HDF5 datasets
             depth_ds.resize(rs_idx + 1, axis=0)
+            rgb_ds.resize(rs_idx + 1, axis=0)
             t_sys_ds.resize(rs_idx + 1, axis=0)
-            
+
             # Store data
             depth_ds[rs_idx] = depth_img
+            rgb_ds[rs_idx] = color_img
             t_sys_ds[rs_idx] = time.time_ns()
-            
+
             rs_video.write(cv2.convertScaleAbs(depth_img, alpha=0.03))
+            rs_rgb_video.write(color_img)
             rs_idx += 1
             
             # Collect poses periodically
@@ -499,10 +540,11 @@ def record_single_object(
                 accumulated_poses.clear()
     
     finally:
-        # Stop event camera acquisition
-        stop_acquire_event.set()
-        event_done_event.wait()
-        event_proc.join()
+        # Stop event camera acquisition (only if we started it)
+        if event_proc is not None and stop_acquire_event is not None and event_done_event is not None:
+            stop_acquire_event.set()
+            event_done_event.wait()
+            event_proc.join()
         
         # Get remaining poses
         pose_receiver.stop()
@@ -525,17 +567,98 @@ def record_single_object(
         
         # Cleanup
         rs_video.release()
+        rs_rgb_video.release()
         rs_h5.close()
-        
+
         # Notify robot controller that recording is done
         sync_client.send_done()
-    
+
     print(f"\n[Recording] Finished '{object_name}'! (stop reason: {stop_reason})")
     print(f"  RealSense frames: {rs_idx}")
     print(f"  Robot poses: {poses_recorded}")
     print(f"  Output directory: {object_dir}")
-    
+
+    # Generate event videos from raw files
+    if num_event_cams > 0:
+        print("[Recording] Generating event camera video(s) from raw data...")
+        generate_event_videos(object_raw_dir, object_video_dir, object_hdf5_dir, num_event_cams)
+
     return True
+
+
+def generate_event_videos(
+    object_raw_dir: Path,
+    object_video_dir: Path,
+    object_hdf5_dir: Path,
+    num_cameras: int,
+) -> None:
+    """Generate event frame MP4 videos and HDF5 files from raw event recordings."""
+    delta_t_us = int(1e6 / FPS)
+
+    for cam_idx in range(num_cameras):
+        raw_file = object_raw_dir / f"events_cam{cam_idx}.raw"
+        video_file = object_video_dir / f"events_cam{cam_idx}.mp4"
+        h5_file = object_hdf5_dir / f"events_cam{cam_idx}.h5"
+
+        if not raw_file.exists():
+            print(f"[EventVideo] Raw file not found: {raw_file}, skipping")
+            continue
+
+        print(f"[EventVideo] Processing cam{cam_idx}: {raw_file} ...")
+        ev_it = EventsIterator(input_path=str(raw_file), delta_t=delta_t_us)
+        height, width = ev_it.get_size()
+
+        video = cv2.VideoWriter(
+            str(video_file),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            FPS,
+            (width, height),
+            isColor=False
+        )
+
+        h5 = h5py.File(h5_file, "w")
+        grp = h5.create_group("events")
+        frames_ds = grp.create_dataset(
+            "frames",
+            shape=(0, height, width),
+            maxshape=(None, height, width),
+            dtype=np.uint8,
+            chunks=True
+        )
+        t_start_ds = grp.create_dataset(
+            "t_ev_start_us", shape=(0,), maxshape=(None,), dtype=np.int64
+        )
+        t_end_ds = grp.create_dataset(
+            "t_ev_end_us", shape=(0,), maxshape=(None,), dtype=np.int64
+        )
+        grp.attrs.update({"fps": FPS, "delta_t_us": delta_t_us, "width": width, "height": height})
+
+        frame_gen = PeriodicFrameGenerationAlgorithm(width, height, delta_t_us)
+        idx = 0
+
+        def on_frame(ts, frame):
+            nonlocal idx
+            # Rotate 180 degrees so output videos/frames are upright
+            # (rotation is the correct fix when the video is upside-down,
+            # instead of mirroring/flipping vertically)
+            rotated = cv2.rotate(frame, cv2.ROTATE_180)
+            gray = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
+            frames_ds.resize(idx + 1, axis=0)
+            t_start_ds.resize(idx + 1, axis=0)
+            t_end_ds.resize(idx + 1, axis=0)
+            frames_ds[idx] = gray
+            t_start_ds[idx] = ts - delta_t_us
+            t_end_ds[idx] = ts
+            video.write(gray)
+            idx += 1
+
+        frame_gen.set_output_callback(on_frame)
+        for evs in ev_it:
+            frame_gen.process_events(evs)
+
+        video.release()
+        h5.close()
+        print(f"[EventVideo] cam{cam_idx}: {idx} frames written to {video_file}")
 
 
 def event_drain_process_with_paths(
@@ -544,15 +667,16 @@ def event_drain_process_with_paths(
     ready_event,
     event0_path: str,
     event1_path: str,
+    num_cameras: int = 1,
     flush_seconds: float = 0.5
 ) -> None:
     """Process that handles event camera acquisition with custom output paths."""
     devices = DeviceDiscovery.list()
     device0 = DeviceDiscovery.open(devices[0])
-    device1 = DeviceDiscovery.open(devices[1])
+    device1 = DeviceDiscovery.open(devices[1]) if num_cameras >= 2 else None
 
     # Apply biases
-    for device in (device0, device1):
+    for device in filter(None, (device0, device1)):
         biases = device.get_i_ll_biases()
         biases.set("bias_diff_on", BIAS_DIFF_ON)
         biases.set("bias_diff_off", BIAS_DIFF_OFF)
@@ -561,33 +685,38 @@ def event_drain_process_with_paths(
         biases.set("bias_refr", BIAS_REFR)
 
     raw0 = device0.get_i_events_stream()
-    raw1 = device1.get_i_events_stream()
-
     raw0.start()
-    raw1.start()
-
     raw0.log_raw_data(event0_path)
-    raw1.log_raw_data(event1_path)
+
+    if device1 is not None:
+        raw1 = device1.get_i_events_stream()
+        raw1.start()
+        raw1.log_raw_data(event1_path)
+    else:
+        raw1 = None
 
     it0 = iter(EventsIterator.from_device(device0))
-    it1 = iter(EventsIterator.from_device(device1))
+    it1 = iter(EventsIterator.from_device(device1)) if device1 is not None else None
 
     ready_event.set()
 
     try:
         while not stop_acquire_event.is_set():
             next(it0)
-            next(it1)
+            if it1 is not None:
+                next(it1)
 
         # Flush remaining events
         flush_start = time.time()
         while time.time() - flush_start < flush_seconds:
             next(it0)
-            next(it1)
+            if it1 is not None:
+                next(it1)
 
     finally:
         raw0.stop_log_raw_data()
-        raw1.stop_log_raw_data()
+        if raw1 is not None:
+            raw1.stop_log_raw_data()
         done_event.set()
 
 
@@ -595,6 +724,7 @@ def main(
     zmq_sync_addr: str = ZMQ_SYNC_ADDR,
     zmq_pose_addr: str = ZMQ_POSE_ADDR,
     target_seconds: float = TARGET_SECONDS,
+    num_event_cams: int = 1,
 ) -> None:
     """
     Main synchronized recording function with multi-object support.
@@ -616,16 +746,58 @@ def main(
     pose_receiver = ZMQPoseReceiver(zmq_pose_addr)
     
     # Initialize RealSense (keep running across recordings)
+    pipeline = None
+    cfg = None
+    profile = None
+    depth_sensor = None
+
     print("[Recording] Initializing RealSense...")
     pipeline = rs.pipeline()
     cfg = rs.config()
     cfg.disable_all_streams()
     cfg.enable_stream(rs.stream.depth, RS_WIDTH, RS_HEIGHT, rs.format.z16, FPS)
-    pipeline.start(cfg)
-    
-    profile = pipeline.get_active_profile()
-    depth_sensor = profile.get_device().first_depth_sensor()
-    depth_sensor.set_option(rs.option.laser_power, 360)
+    cfg.enable_stream(rs.stream.color, RS_WIDTH, RS_HEIGHT, rs.format.bgr8, FPS)
+
+    try:
+        profile = pipeline.start(cfg)
+        depth_sensor = profile.get_device().first_depth_sensor()
+        depth_sensor.set_option(rs.option.laser_power, 360)
+
+        print("[Recording] Warming up RealSense...")
+        for _ in range(30):
+            pipeline.wait_for_frames(timeout_ms=1000)
+
+    except Exception as e:
+        print(f"[Recording] RealSense startup failed: {e}")
+
+        try:
+            pipeline.stop()
+        except Exception:
+            pass
+
+        # Hardware reset
+        ctx = rs.context()
+        for dev in ctx.query_devices():
+            print(f"[Recording] Resetting device: {dev.get_info(rs.camera_info.name)}")
+            dev.hardware_reset()
+
+        time.sleep(3.0)
+
+        # Retry once
+        pipeline = rs.pipeline()
+        cfg = rs.config()
+        cfg.disable_all_streams()
+        cfg.enable_stream(rs.stream.depth, RS_WIDTH, RS_HEIGHT, rs.format.z16, FPS)
+        cfg.enable_stream(rs.stream.color, RS_WIDTH, RS_HEIGHT, rs.format.bgr8, FPS)
+
+        profile = pipeline.start(cfg)
+        depth_sensor = profile.get_device().first_depth_sensor()
+        depth_sensor.set_option(rs.option.laser_power, 360)
+
+        print("[Recording] Warming up RealSense after reset...")
+        for _ in range(30):
+            pipeline.wait_for_frames(timeout_ms=1000)
+
     print("[Recording] RealSense initialized")
     
     recording_count = 0
@@ -647,6 +819,7 @@ def main(
                 pose_receiver=pose_receiver,
                 sync_client=sync_client,
                 target_seconds=target_seconds,
+                num_event_cams=num_event_cams,
             )
             
             if success:
@@ -657,7 +830,35 @@ def main(
                 break
     
     finally:
-        pipeline.stop()
+        print("[Recording] Shutting down RealSense...")
+        try:
+            pipeline.stop()
+        except Exception as e:
+            print(f"[Recording] Warning during pipeline.stop(): {e}")
+
+        # Explicitly release SDK objects
+        try:
+            del depth_sensor
+        except Exception:
+            pass
+        try:
+            del profile
+        except Exception:
+            pass
+        try:
+            del cfg
+        except Exception:
+            pass
+        try:
+            del pipeline
+        except Exception:
+            pass
+
+        # Give librealsense / USB stack a moment to settle
+        import gc
+        gc.collect()
+        time.sleep(1.0)
+
         sync_client.close()
         print(f"\n[Recording] Session complete. Total recordings: {recording_count}")
 
@@ -682,6 +883,13 @@ if __name__ == "__main__":
         default=TARGET_SECONDS,
         help=f"Recording duration in seconds (default: {TARGET_SECONDS})"
     )
+    parser.add_argument(
+        "--event-cameras",
+        type=int,
+        default=1,
+        choices=[0, 1, 2],
+        help="Number of event cameras to use: 0 (disabled), 1 (default), or 2"
+    )
 
     args = parser.parse_args()
 
@@ -689,4 +897,5 @@ if __name__ == "__main__":
         zmq_sync_addr=args.zmq_sync_addr,
         zmq_pose_addr=args.zmq_pose_addr,
         target_seconds=args.duration,
+        num_event_cams=args.event_cameras,
     )

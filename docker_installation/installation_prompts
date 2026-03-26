@@ -4,10 +4,10 @@ Start a terminal and cd into the docker_installation
 cd docker_installation
 
 # Backend for robot
-docker build -t deoxys_autostart backend/
+docker build -t deoxys_autostart_mika backend/
 
 # Frontend for robot
-DOCKER_BUILDKIT=1 docker build --ssh default -t openvla ./frontend
+DOCKER_BUILDKIT=1 docker build --ssh default -t openvla_mika ./frontend
 
 # Main project
-docker build -t metavision-462 working_meta_462
+docker build -t meta_and_pytorch working_meta_462 

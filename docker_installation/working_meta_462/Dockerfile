@@ -5,9 +5,20 @@ WORKDIR /work
 
 # Basic tools + deps mentioned in the 4.6.2 Linux install doc
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl gnupg \
+    ca-certificates curl gnupg lsb-release \
+    usbutils libusb-1.0-0 \
     libcanberra-gtk-module mesa-utils ffmpeg \
     python3-pip python3-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# RealSense repository + packages
+RUN mkdir -p /etc/apt/keyrings && \
+    curl -sSf https://librealsense.realsenseai.com/Debian/librealsenseai.asc | gpg --dearmor > /etc/apt/keyrings/librealsenseai.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/librealsenseai.gpg] https://librealsense.realsenseai.com/Debian/apt-repo $(lsb_release -cs) main" > /etc/apt/sources.list.d/librealsense.list
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    librealsense2-utils \
+    librealsense2-dev \
  && rm -rf /var/lib/apt/lists/*
 
 # 1) Add Prophesee APT repo list (this is your downloaded file)
@@ -53,3 +64,15 @@ RUN python3 -m pip install --upgrade pip \
 # Optional: HDF5 plugin path for Ubuntu 22.04 (doc gives this exact path)
 ENV HDF5_PLUGIN_PATH=${HDF5_PLUGIN_PATH:-}:/usr/lib/x86_64-linux-gnu/hdf5/serial/plugins
 
+ARG UID=101403
+ARG GID=5018
+
+RUN groupadd -g $GID cs_stud || true && \
+    useradd -m -u $UID -g $GID mthormann || true
+
+RUN chown root:root /usr/share/metavision/apps/metavision_studio/internal/client/chrome-sandbox \
+ && chmod 4755 /usr/share/metavision/apps/metavision_studio/internal/client/chrome-sandbox
+
+USER mthormann
+
+RUN chown mthormann:cs_stud /home/mthormann/.bashrc

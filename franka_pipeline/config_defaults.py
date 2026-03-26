@@ -22,19 +22,19 @@ DEPS_LOG_LEVEL = "INFO"
 # =============================================================================
 # ZMQ COMMUNICATION
 # =============================================================================
-ZMQ_BIND = os.getenv("POSE_PUB_BIND", "tcp://0.0.0.0:5556")
-ZMQ_SYNC_BIND = os.getenv("SYNC_BIND", "tcp://0.0.0.0:5557")
+ZMQ_BIND = os.getenv("POSE_PUB_BIND", "tcp://0.0.0.0:6000")
+ZMQ_SYNC_BIND = os.getenv("SYNC_BIND", "tcp://0.0.0.0:6001")
 PUBLISH_HZ = 60.0
 
 # =============================================================================
 # SYNC RECORDING
 # =============================================================================
-SYNC_RECORDING = False
+SYNC_RECORDING = True
 
 # =============================================================================
 # SYNTHETIC DATA RECORDING
 # =============================================================================
-SYNTHETIC_DATA = True
+SYNTHETIC_DATA = False
 SYNTHETIC_OUTPUT_DIR = "../3d_reconstruction/data/synthetic_data"
 SYNTHETIC_CAMERA_ID = "robot0_eye_in_hand"
 SYNTHETIC_CAMERA_WIDTH = 346
@@ -55,7 +55,6 @@ CUSTOM_OBJECTS_CONFIG = None  # Path to YAML file, or None
 # =============================================================================
 # MULTI-OBJECT RECORDING
 # =============================================================================
-MULTI_OBJECT_RECORDING = False
 OBJECT_FILTER = None  # Comma-separated string like "cube,sphere,milk", or None for all
 
 # =============================================================================
@@ -79,7 +78,7 @@ SPHERE_CENTER_Z = 0.4
 # For RandomHemisphereAgent, this is also the center of the hemisphere
 TARGET_X = 0.35
 TARGET_Y = 0.0
-TARGET_Z = -0.05
+TARGET_Z = 0.15
 
 # Sphere/Hemisphere radius
 SPHERE_RADIUS = 0.3
@@ -88,7 +87,7 @@ SPHERE_RADIUS = 0.3
 INNER_RADIUS = 0.05
 
 # Number of random poses to generate
-NUM_POSES = 50
+NUM_POSES = 5
 
 # Time to wait at each pose (seconds)
 WAIT_TIME = 0.0
@@ -106,13 +105,13 @@ BASE_EXCLUSION_RADIUS = 0.35
 BASE_MAX_RADIUS = 0.5
 
 # Minimum z-height for poses (table level)
-MIN_Z_HEIGHT = 0.0
+MIN_Z_HEIGHT = 0.2
 
 # =============================================================================
 # WAYPOINT INTERPOLATION
 # =============================================================================
 # Number of intermediate waypoints between main poses
-WAYPOINTS_PER_TRANSITION = 2
+WAYPOINTS_PER_TRANSITION = 10
 
 # =============================================================================
 # ROTATION CONTROL

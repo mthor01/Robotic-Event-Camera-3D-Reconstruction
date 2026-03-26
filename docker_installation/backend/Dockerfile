@@ -127,7 +127,15 @@ ENTRYPOINT tmux new-session -d -s deoxys_autostart \; \
 
 
 
+#ARG UID=101403
+#ARG GID=5018
 
+#RUN groupadd -g $GID cs_stud || true && \
+  #  useradd -m -u $UID -g $GID mthormann || true
+    
+#USER mthormann
 
-
-
+#RUN echo "source /opt/miniconda3/etc/profile.d/conda.sh" >> /home/mthormann/.bashrc && \
+ #   echo "conda activate deoxys" >> /home/mthormann/.bashrc && \
+  #  echo "export PYTHONPATH=/workspace/deoxys_control/deoxys:$PYTHONPATH" >> /home/mthormann/.bashrc && \
+   # chown mthormann:cs_stud /home/mthormann/.bashrc

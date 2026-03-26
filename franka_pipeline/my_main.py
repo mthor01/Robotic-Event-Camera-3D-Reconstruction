@@ -66,7 +66,7 @@ class ZMQPosePublisher:
         self.ctx = zmq.Context.instance()
         self.pub = self.ctx.socket(zmq.PUB)
         # Keep latest if receiver is slow (live alignment use-case)
-        self.pub.setsockopt(zmq.SNDHWM, 1)
+        #self.pub.setsockopt(zmq.SNDHWM, 1)
         self.pub.bind(bind_addr)
         logger.info(f"ZMQ PUB bound at {bind_addr}")
 
@@ -95,12 +95,14 @@ class ZMQPosePublisher:
 
         payload = msgpack.packb(msg, use_bin_type=True)
         self.pub.send_multipart([b"pose", payload])
+        print(time.time_ns())  # Debug print for events
 
     def publish_event(self, event_type: str, ep: int, extra: dict | None = None) -> None:
         msg = {"t_ns": time.time_ns(), "type": event_type, "ep": int(ep)}
         if extra:
             msg.update(extra)
         payload = msgpack.packb(msg, use_bin_type=True)
+        print(event_type, time.time_ns())  # Debug print for events
         self.pub.send_multipart([b"event", payload])
 
 
@@ -437,7 +439,7 @@ def _run_single_object_recording(
 @app.command()
 def main(
     simulated_robot: bool = typer.Option(
-        False, "--simulated-robot/--real_robot", help="Run in robosuite sim"
+        False, "--simulated-robot/--real-robot", help="Run in robosuite sim"
     ),
     log_level: str = typer.Option(
         cfg.LOG_LEVEL, "--log-level", help="Logging level (DEBUG, INFO, WARNING, ERROR)"
