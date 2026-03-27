@@ -154,18 +154,15 @@ class ZMQPoseReceiver:
                 msg = msgpack.unpackb(payload, raw=False)
 
                 with self.lock:
-                    print(topic)
                     if topic == b"event":
-                        print(2)
                         self.events.append(msg)
                         # Check for stop signals — include events published by my_main
                         event_type = msg.get("type", "")
                         print(event_type)
-                        if event_type in ("hemisphere_complete", "agent_complete", "episode_end", "quit"):
+                        if event_type in ("agent_complete"):
                             print(f"[PoseReceiver] Received '{event_type}' event - signaling stop")
                             self.stop_recording_event.set()
                     elif topic == b"pose":
-                        #print(1)
                         self.poses.append(msg)
             except zmq.error.Again:
                 # Timeout, check if we should keep running
@@ -416,14 +413,16 @@ def record_single_object(
     else:
         print("[Recording] Event recording disabled for this run")
     
-    # Send "ready" signal and wait for "start"
+    
     # Reset and start pose receiver BEFORE the sync handshake so the ZMQ
     # subscription is fully established by the time my_main.py starts
     # publishing after "start" (avoids the ZMQ slow-joiner problem where
     # agent_complete is published before the SUB socket has connected).
     pose_receiver.stop_recording_event.clear()
+    
     pose_receiver.start()
 
+    # Send "ready" signal and wait for "start"
     print("[Recording] Sending ready signal to robot controller...")
     if not sync_client.send_ready_wait_start(timeout_sec=120.0):
         print("[Recording] ERROR: Did not receive start signal, aborting")

@@ -12,7 +12,8 @@ docker run -it --rm --runtime=nvidia --gpus all \
   -v "$(pwd):/workspace/project" \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
   --net=host --privileged \
-  openvla_mika
+  openvla_mika\
+  bash -c "cd /workspace/project/franka_pipeline && exec bash"
 
 docker run --gpus all -it --rm \
   --shm-size=8g \
@@ -27,7 +28,7 @@ docker run --gpus all -it --rm \
   -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
   -v "$XAUTHORITY:$XAUTHORITY:ro" \
   meta_and_pytorch \
-  bash
+  bash -c "cd /workspace/project/3d_reconstruction && exec bash"
 
 
 # testing

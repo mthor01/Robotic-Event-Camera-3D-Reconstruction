@@ -87,7 +87,7 @@ SPHERE_RADIUS = 0.3
 INNER_RADIUS = 0.05
 
 # Number of random poses to generate
-NUM_POSES = 5
+NUM_POSES = 15
 
 # Time to wait at each pose (seconds)
 WAIT_TIME = 0.0
@@ -111,7 +111,7 @@ MIN_Z_HEIGHT = 0.2
 # WAYPOINT INTERPOLATION
 # =============================================================================
 # Number of intermediate waypoints between main poses
-WAYPOINTS_PER_TRANSITION = 10
+WAYPOINTS_PER_TRANSITION = 1
 
 # =============================================================================
 # ROTATION CONTROL

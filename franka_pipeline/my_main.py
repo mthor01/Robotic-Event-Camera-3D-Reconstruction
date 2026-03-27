@@ -95,14 +95,12 @@ class ZMQPosePublisher:
 
         payload = msgpack.packb(msg, use_bin_type=True)
         self.pub.send_multipart([b"pose", payload])
-        print(time.time_ns())  # Debug print for events
 
     def publish_event(self, event_type: str, ep: int, extra: dict | None = None) -> None:
         msg = {"t_ns": time.time_ns(), "type": event_type, "ep": int(ep)}
         if extra:
             msg.update(extra)
         payload = msgpack.packb(msg, use_bin_type=True)
-        print(event_type, time.time_ns())  # Debug print for events
         self.pub.send_multipart([b"event", payload])
 
 
@@ -577,6 +575,11 @@ def main(
         "--random-seed",
         help="Random seed for reproducible pose generation. Default: None (random)",
     ),
+    calibration_poses: str = typer.Option(
+        "",
+        "--calibration-poses",
+        help="Path to .npy file with calibration poses (for multi_cam_calibrate agent type)",
+    ),
 ) -> None:
     
     # Handle --list-objects early
@@ -619,6 +622,7 @@ def main(
         logger.info("SYNTHETIC DATA RECORDING MODE")
         logger.info(f"Will generate synthetic data for {len(objects_to_record)} objects")
         logger.info("=" * 70)
+        target_z = -0.1
         
         for obj_idx, obj_dict in enumerate(objects_to_record):
             logger.info("")
@@ -735,9 +739,61 @@ def main(
                     target_point=np.array([target_x, target_y, target_z]),
                 )
             )
-        
-    recording_count = 0
-    
+
+    # Special case: multi-camera calibration agent (own control loop)
+    if agent_type.lower() == "multi_cam_calibrate":
+        from franka_pipeline.agents import (
+            MultiCameraCalibrationAgent,
+            MultiCameraCalibrationConfig,
+        )
+
+        logger.info("Using MultiCameraCalibrationAgent")
+        config = MultiCameraCalibrationConfig()
+        calib_agent = MultiCameraCalibrationAgent(
+            config=config,
+            poses_file=calibration_poses if calibration_poses else None,
+        )
+        calib_agent.start()
+
+        step_count = 0
+        next_pub_t = 0.0
+
+        while True:
+            robot_state, valid = robot_controller.get_state()
+            if not valid:
+                continue
+
+            action, metadata = calib_agent.act(
+                robot_state=robot_state,
+                observation={},
+                instruction="",
+            )
+            robot_controller.control(
+                command=action, controller_type=calib_agent.action_type
+            )
+
+            now = time.time()
+            if min_period == 0.0 or now >= next_pub_t:
+                ee_pose = robot_state.get("osc_pose", None)
+                q = robot_state.get("joint_position", None)
+                try:
+                    pub.publish_pose(
+                        ep=0, step=step_count, ee_T=ee_pose, q=q, gripper_q=None
+                    )
+                except Exception:
+                    pass
+                next_pub_t = now + min_period
+
+            step_count += 1
+
+            if metadata.get("quit", False):
+                logger.info("Multi-camera calibration finished.")
+                robot_controller.reset_robot_joints()
+                calib_agent.stop()
+                break
+
+        return
+
     # Outer loop for multiple recordings
     while True:
         # Create fresh agent for each recording
