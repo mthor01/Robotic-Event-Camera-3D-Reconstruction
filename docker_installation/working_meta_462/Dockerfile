@@ -58,7 +58,9 @@ RUN python3 -m pip install --upgrade pip \
     torchvision \
     pillow \
     tensorboard \
-    tqdm
+    tqdm \
+    matplotlib \
+    scipy
 
 
 # Optional: HDF5 plugin path for Ubuntu 22.04 (doc gives this exact path)

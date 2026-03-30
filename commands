@@ -28,7 +28,7 @@ docker run --gpus all -it --rm \
   -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
   -v "$XAUTHORITY:$XAUTHORITY:ro" \
   meta_and_pytorch \
-  bash -c "cd /workspace/project/3d_reconstruction && exec bash"
+  bash -c "cd /work/project/3d_reconstruction && exec bash"
 
 
 # testing
@@ -60,3 +60,22 @@ docker run --rm -it \
   -v "$PWD:/work" \
   openvla \
   bash -lc "chown -R 101403:5018 /work"
+  
+  
+  
+  
+  e2vid
+  
+xhost +local:docker
+docker run --rm -it --gpus all \
+  -e DISPLAY=$DISPLAY \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -v "$(pwd):/workspace/project" \
+  e2vid 
+
+python3 run_reconstruction.py \
+  -c pretrained/E2VID_lightweight.pth.tar \
+  -i data/dynamic_6dof.zip \
+  --auto_hdr \
+  --output_folder output \
+  --show_events

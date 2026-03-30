@@ -580,6 +580,11 @@ def main(
         "--calibration-poses",
         help="Path to .npy file with calibration poses (for multi_cam_calibrate agent type)",
     ),
+    no_wiggle: bool = typer.Option(
+        False,
+        "--no-wiggle",
+        help="Skip robot wiggling; record events for a short static window instead",
+    ),
 ) -> None:
     
     # Handle --list-objects early
@@ -693,6 +698,7 @@ def main(
 
     # Throttle publishing if desired
     min_period = (1.0 / publish_hz) if publish_hz and publish_hz > 0 else 0.0
+    recording_count = 0
 
     
     # Helper function to create the appropriate agent
@@ -741,14 +747,14 @@ def main(
             )
 
     # Special case: multi-camera calibration agent (own control loop)
-    if agent_type.lower() == "multi_cam_calibrate":
+    if calibration_poses or agent_type.lower() == "multi_cam_calibrate":
         from franka_pipeline.agents import (
             MultiCameraCalibrationAgent,
             MultiCameraCalibrationConfig,
         )
 
         logger.info("Using MultiCameraCalibrationAgent")
-        config = MultiCameraCalibrationConfig()
+        config = MultiCameraCalibrationConfig(wiggle=not no_wiggle)
         calib_agent = MultiCameraCalibrationAgent(
             config=config,
             poses_file=calibration_poses if calibration_poses else None,
