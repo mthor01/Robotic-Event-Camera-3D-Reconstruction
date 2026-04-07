@@ -10,7 +10,8 @@ This script:
 
 Run this script first, then start my_main.py with --sync-recording flag.
 """
-
+import argparse
+import gc
 import time
 import threading
 import cv2
@@ -31,19 +32,9 @@ from metavision_sdk_core import PeriodicFrameGenerationAlgorithm
 
 
 # ================= CONFIG =================
-TARGET_SECONDS = 20
 FPS = 30
 
 DATA_DIR = Path("data")
-VIDEO_DIR = DATA_DIR / "videos"
-RAW_DIR = DATA_DIR / "raw_event_data"
-HDF5_DIR = DATA_DIR / "hdf5"
-
-EVENT0_RAW_FILE = RAW_DIR / "events_cam0.raw"
-EVENT1_RAW_FILE = RAW_DIR / "events_cam1.raw"
-
-RS_VIDEO_FILE = VIDEO_DIR / "realsense.mp4"
-RS_H5_FILE = HDF5_DIR / "synchronized_recording.h5"
 
 RS_WIDTH, RS_HEIGHT = 640, 480
 
@@ -57,57 +48,6 @@ BIAS_REFR = 150
 ZMQ_SYNC_ADDR = "tcp://localhost:6001"  # REQ/REP for sync handshake
 ZMQ_POSE_ADDR = "tcp://localhost:6000"  # PUB/SUB for pose streaming (from my_main)
 # =========================================
-
-
-def event_drain_process(
-    stop_acquire_event: MPEvent,
-    done_event: MPEvent,
-    ready_event: MPEvent,
-    flush_seconds: float = 0.5
-) -> None:
-    """Process that handles event camera acquisition."""
-    devices = DeviceDiscovery.list()
-    device0 = DeviceDiscovery.open(devices[0])
-    device1 = DeviceDiscovery.open(devices[1])
-
-    # Apply biases
-    for device in (device0, device1):
-        biases = device.get_i_ll_biases()
-        biases.set("bias_diff_on", BIAS_DIFF_ON)
-        biases.set("bias_diff_off", BIAS_DIFF_OFF)
-        biases.set("bias_fo", BIAS_FO)
-        biases.set("bias_hpf", BIAS_HPF)
-        biases.set("bias_refr", BIAS_REFR)
-
-    raw0 = device0.get_i_events_stream()
-    raw1 = device1.get_i_events_stream()
-
-    raw0.start()
-    raw1.start()
-
-    raw0.log_raw_data(str(EVENT0_RAW_FILE))
-    raw1.log_raw_data(str(EVENT1_RAW_FILE))
-
-    it0 = iter(EventsIterator.from_device(device0))
-    it1 = iter(EventsIterator.from_device(device1))
-
-    ready_event.set()
-
-    try:
-        while not stop_acquire_event.is_set():
-            next(it0)
-            next(it1)
-
-        # Flush remaining events
-        flush_start = time.time()
-        while time.time() - flush_start < flush_seconds:
-            next(it0)
-            next(it1)
-
-    finally:
-        raw0.stop_log_raw_data()
-        raw1.stop_log_raw_data()
-        done_event.set()
 
 
 class ZMQPoseReceiver:
@@ -126,7 +66,6 @@ class ZMQPoseReceiver:
 
         # Thread-safe storage for pose data
         self.poses: deque = deque(maxlen=100000)  # Large buffer
-        self.events: deque = deque(maxlen=1000)
         self.lock = threading.Lock()
         
         # Event to signal that recording should stop
@@ -151,18 +90,17 @@ class ZMQPoseReceiver:
         while self.running:
             try:
                 topic, payload = self.sub.recv_multipart()
+                t_recv = time.time_ns()
                 msg = msgpack.unpackb(payload, raw=False)
 
                 with self.lock:
                     if topic == b"event":
-                        self.events.append(msg)
-                        # Check for stop signals — include events published by my_main
                         event_type = msg.get("type", "")
-                        print(event_type)
-                        if event_type in ("agent_complete"):
+                        if event_type == "agent_complete":
                             print(f"[PoseReceiver] Received '{event_type}' event - signaling stop")
                             self.stop_recording_event.set()
                     elif topic == b"pose":
+                        msg["t_recv_ns"] = t_recv
                         self.poses.append(msg)
             except zmq.error.Again:
                 # Timeout, check if we should keep running
@@ -178,6 +116,7 @@ class ZMQPoseReceiver:
             self.thread.join(timeout=2.0)
         if self.sub:
             self.sub.close()
+            self.sub = None
         print("[PoseReceiver] Stopped")
 
     def should_stop_recording(self) -> bool:
@@ -190,13 +129,6 @@ class ZMQPoseReceiver:
             poses = list(self.poses)
             self.poses.clear()
             return poses
-
-    def get_all_events(self) -> list:
-        """Get all received events and clear the buffer."""
-        with self.lock:
-            events = list(self.events)
-            self.events.clear()
-            return events
 
 
 class ZMQSyncClient:
@@ -213,7 +145,6 @@ class ZMQSyncClient:
     def connect(self) -> None:
         """Connect to the sync server (my_main.py)."""
         self.req = self.ctx.socket(zmq.REQ)
-        self.req.setsockopt(zmq.RCVTIMEO, 60000)  # 60s timeout for waiting
         self.req.connect(self.connect_addr)
         print(f"[SyncClient] Connected to {self.connect_addr}")
 
@@ -222,6 +153,7 @@ class ZMQSyncClient:
         Send 'ready' signal and wait for 'start' response.
         Returns True if start signal received, False on timeout.
         """
+        self.req.setsockopt(zmq.RCVTIMEO, int(timeout_sec * 1000))
         msg = {"type": "ready", "t_ns": time.time_ns()}
         self.req.send(msgpack.packb(msg, use_bin_type=True))
         print("[SyncClient] Sent 'ready', waiting for 'start'...")
@@ -240,6 +172,7 @@ class ZMQSyncClient:
 
     def send_done(self) -> None:
         """Notify my_main.py that recording is complete."""
+        self.req.setsockopt(zmq.RCVTIMEO, 5000)  # 5s is plenty for done ack
         msg = {"type": "done", "t_ns": time.time_ns()}
         self.req.send(msgpack.packb(msg, use_bin_type=True))
         try:
@@ -254,67 +187,121 @@ class ZMQSyncClient:
             self.req.close()
 
 
-def save_poses_to_hdf5(h5_file: h5py.File, poses: list) -> None:
-    """Save accumulated pose data to HDF5."""
-    if not poses:
-        return
-
-    # Create poses group if it doesn't exist
-    if "poses" not in h5_file:
-        poses_grp = h5_file.create_group("poses")
-
-        # Create datasets
-        poses_grp.create_dataset(
-            "t_ns", shape=(0,), maxshape=(None,), dtype=np.int64
-        )
-        poses_grp.create_dataset(
-            "episode", shape=(0,), maxshape=(None,), dtype=np.int32
-        )
-        poses_grp.create_dataset(
-            "step", shape=(0,), maxshape=(None,), dtype=np.int32
-        )
-        poses_grp.create_dataset(
-            "ee_T", shape=(0, 4, 4), maxshape=(None, 4, 4), dtype=np.float64
-        )
-        poses_grp.create_dataset(
-            "joint_positions", shape=(0, 7), maxshape=(None, 7), dtype=np.float64
-        )
-        poses_grp.create_dataset(
-            "gripper_q", shape=(0,), maxshape=(None,), dtype=np.float64
-        )
-    else:
-        poses_grp = h5_file["poses"]
-
-    # Append poses
-    current_len = poses_grp["t_ns"].shape[0]
-    new_len = current_len + len(poses)
-
-    # Resize all datasets
-    for key in ["t_ns", "episode", "step", "ee_T", "joint_positions", "gripper_q"]:
-        poses_grp[key].resize(new_len, axis=0)
+def parse_raw_poses(poses: list) -> dict:
+    """Parse a list of raw pose dicts (from ZMQ) into numpy arrays."""
+    n = len(poses)
+    t_ns = np.zeros(n, dtype=np.int64)
+    ee_T = np.zeros((n, 4, 4), dtype=np.float64)
+    joint_positions = np.zeros((n, 7), dtype=np.float64)
+    gripper_q = np.zeros(n, dtype=np.float64)
 
     for i, pose in enumerate(poses):
-        idx = current_len + i
-        poses_grp["t_ns"][idx] = pose.get("t_ns", 0)
-        poses_grp["episode"][idx] = pose.get("ep", 0)
-        poses_grp["step"][idx] = pose.get("step", 0)
+        t_ns[i] = pose.get("t_ns", 0)
 
         if "ee_T" in pose:
-            ee_T = np.array(pose["ee_T"]).reshape(4, 4)
-            poses_grp["ee_T"][idx] = ee_T
+            ee_T[i] = np.array(pose["ee_T"]).reshape(4, 4)
         else:
-            poses_grp["ee_T"][idx] = np.eye(4)
+            ee_T[i] = np.eye(4)
 
         if "q" in pose:
             q = np.array(pose["q"])
             if len(q) >= 7:
-                poses_grp["joint_positions"][idx] = q[:7]
-            else:
-                poses_grp["joint_positions"][idx] = np.zeros(7)
-        else:
-            poses_grp["joint_positions"][idx] = np.zeros(7)
+                joint_positions[i] = q[:7]
 
-        poses_grp["gripper_q"][idx] = pose.get("gripper_q", 0.0)
+        gripper_q[i] = pose.get("gripper_q", 0.0)
+
+    return {
+        "t_ns": t_ns,
+        "ee_T": ee_T,
+        "joint_positions": joint_positions,
+        "gripper_q": gripper_q,
+    }
+
+
+def interpolate_poses_for_frames(
+    frame_times_ns: np.ndarray,
+    pose_times_ns: np.ndarray,
+    pose_ee_T: np.ndarray,
+    pose_joint_pos: np.ndarray,
+    pose_gripper_q: np.ndarray,
+) -> dict:
+    """
+    Interpolate robot poses to match each depth-frame timestamp.
+
+    For each depth frame we find the two bracketing poses and linearly
+    interpolate translation, joint positions, and gripper opening.
+    Rotation matrices are blended linearly then re-orthogonalised via SVD
+    (equivalent to SLERP for the small inter-pose angles typical of a
+    robot control loop).
+
+    Returns a dict of arrays aligned 1-to-1 with *frame_times_ns*:
+        ee_T              (N, 4, 4) float64
+        joint_positions   (N, 7)    float64
+        gripper_q         (N,)      float64
+        nearest_offset_ms (N,)      float64 – temporal gap to closest raw pose
+    """
+    N = len(frame_times_ns)
+    interp_ee_T = np.zeros((N, 4, 4), dtype=np.float64)
+    interp_joints = np.zeros((N, 7), dtype=np.float64)
+    interp_gripper = np.zeros((N,), dtype=np.float64)
+    nearest_offset_ms = np.zeros((N,), dtype=np.float64)
+
+    # Sort poses by time (they should already be, but be safe)
+    order = np.argsort(pose_times_ns)
+    pose_times_ns = pose_times_ns[order]
+    pose_ee_T = pose_ee_T[order]
+    pose_joint_pos = pose_joint_pos[order]
+    pose_gripper_q = pose_gripper_q[order]
+
+    for i in range(N):
+        t = frame_times_ns[i]
+        idx = np.searchsorted(pose_times_ns, t)
+
+        if idx == 0:
+            # Frame is before first pose – use first pose
+            interp_ee_T[i] = pose_ee_T[0]
+            interp_joints[i] = pose_joint_pos[0]
+            interp_gripper[i] = pose_gripper_q[0]
+            nearest_offset_ms[i] = (t - pose_times_ns[0]) / 1e6
+        elif idx >= len(pose_times_ns):
+            # Frame is after last pose – use last pose
+            interp_ee_T[i] = pose_ee_T[-1]
+            interp_joints[i] = pose_joint_pos[-1]
+            interp_gripper[i] = pose_gripper_q[-1]
+            nearest_offset_ms[i] = (t - pose_times_ns[-1]) / 1e6
+        else:
+            t0, t1 = pose_times_ns[idx - 1], pose_times_ns[idx]
+            alpha = float(t - t0) / float(t1 - t0) if t1 != t0 else 0.0
+
+            T0, T1 = pose_ee_T[idx - 1], pose_ee_T[idx]
+
+            # Translation: linear interpolation
+            trans = (1.0 - alpha) * T0[:3, 3] + alpha * T1[:3, 3]
+
+            # Rotation: linear blend + SVD re-orthogonalisation
+            R_blend = (1.0 - alpha) * T0[:3, :3] + alpha * T1[:3, :3]
+            U, _, Vt = np.linalg.svd(R_blend)
+            # Ensure proper rotation (det = +1)
+            S = np.eye(3)
+            S[2, 2] = np.linalg.det(U @ Vt)
+            R_interp = U @ S @ Vt
+
+            interp_ee_T[i, :3, :3] = R_interp
+            interp_ee_T[i, :3, 3] = trans
+            interp_ee_T[i, 3, 3] = 1.0
+
+            # Joints & gripper: linear interpolation
+            interp_joints[i] = (1.0 - alpha) * pose_joint_pos[idx - 1] + alpha * pose_joint_pos[idx]
+            interp_gripper[i] = (1.0 - alpha) * pose_gripper_q[idx - 1] + alpha * pose_gripper_q[idx]
+
+            nearest_offset_ms[i] = min(abs(t - t0), abs(t - t1)) / 1e6
+
+    return {
+        "ee_T": interp_ee_T,
+        "joint_positions": interp_joints,
+        "gripper_q": interp_gripper,
+        "nearest_offset_ms": nearest_offset_ms,
+    }
 
 
 def get_object_name() -> str | None:
@@ -362,7 +349,6 @@ def record_single_object(
     pipeline: rs.pipeline,
     pose_receiver: "ZMQPoseReceiver",
     sync_client: "ZMQSyncClient",
-    target_seconds: float,
     num_event_cams: int = 1,
 ) -> bool:
     """
@@ -383,7 +369,9 @@ def record_single_object(
     event1_raw_file = object_raw_dir / "events_cam1.raw"
     rs_video_file = object_video_dir / "realsense_depth.mp4"
     rs_rgb_video_file = object_video_dir / "realsense_rgb.mp4"
-    rs_h5_file = object_hdf5_dir / "synchronized_recording.h5"
+    rs_h5_file = object_hdf5_dir / "realsense.h5"
+    poses_h5_file = object_hdf5_dir / "poses.h5"
+    metadata_h5_file = object_hdf5_dir / "metadata.h5"
     
     print(f"\n[Recording] Starting recording for object: {object_name}")
     print(f"[Recording] Output directory: {object_dir}")
@@ -393,22 +381,29 @@ def record_single_object(
     stop_acquire_event = None
     event_done_event = None
     event_ready_event = None
+    event_device_open_ns = 0  # system time when event sensor opened (clock origin)
 
     if num_event_cams > 0:
         stop_acquire_event = MPEvent()
         event_done_event = MPEvent()
         event_ready_event = MPEvent()
+        clock_sync_queue = Queue()
 
         event_proc = Process(
-            target=event_drain_process_with_paths,
+            target=event_drain_process,
             args=(stop_acquire_event, event_done_event, event_ready_event,
-                  str(event0_raw_file), str(event1_raw_file), num_event_cams)
+                  str(event0_raw_file), str(event1_raw_file), num_event_cams),
+            kwargs={"clock_sync_queue": clock_sync_queue},
         )
         event_proc.start()
 
         # Wait for event cameras to be ready
         print(f"[Recording] Waiting for {num_event_cams} event camera(s)...")
         event_ready_event.wait()
+        try:
+            event_device_open_ns = clock_sync_queue.get(timeout=5.0)
+        except Exception:
+            event_device_open_ns = 0
         print(f"[Recording] {num_event_cams} event camera(s) ready")
     else:
         print("[Recording] Event recording disabled for this run")
@@ -451,49 +446,52 @@ def record_single_object(
     )
 
     rs_h5 = h5py.File(rs_h5_file, "w")
-
-    # Create realsense group
-    rs_grp = rs_h5.create_group("realsense")
-    depth_ds = rs_grp.create_dataset(
+    depth_ds = rs_h5.create_dataset(
         "depth",
         shape=(0, RS_HEIGHT, RS_WIDTH),
         maxshape=(None, RS_HEIGHT, RS_WIDTH),
         dtype=np.uint16,
         chunks=True
     )
-    rgb_ds = rs_grp.create_dataset(
+    rgb_ds = rs_h5.create_dataset(
         "rgb",
         shape=(0, RS_HEIGHT, RS_WIDTH, 3),
         maxshape=(None, RS_HEIGHT, RS_WIDTH, 3),
         dtype=np.uint8,
         chunks=True
     )
-    t_sys_ds = rs_grp.create_dataset(
+    t_sys_ds = rs_h5.create_dataset(
         "t_sys_ns",
         shape=(0,),
         maxshape=(None,),
         dtype=np.int64
     )
+    t_hw_ds = rs_h5.create_dataset(
+        "t_hw_ms",
+        shape=(0,),
+        maxshape=(None,),
+        dtype=np.float64
+    )
+    frame_num_ds = rs_h5.create_dataset(
+        "frame_number",
+        shape=(0,),
+        maxshape=(None,),
+        dtype=np.int64
+    )
     
-    # Recording metadata
-    meta_grp = rs_h5.create_group("metadata")
-    meta_grp.attrs["object_name"] = object_name
-    meta_grp.attrs["recording_start_ns"] = time.time_ns()
-    meta_grp.attrs["target_seconds"] = target_seconds
-    meta_grp.attrs["fps"] = FPS
-    
+    recording_start_ns = time.time_ns()
     rs_idx = 0
     accumulated_poses = []
+    frame_times_ns_list = []
+    rs_timestamp_domain = ""
+    timestamp_domain_recorded = False
     
-    print(f"[Recording] Recording '{object_name}' (max {target_seconds}s, or until hemisphere complete)...")
-    start_time = time.time()
-    stop_reason = "timeout"
+    print(f"[Recording] Recording '{object_name}' (waiting for agent_complete signal)...")
     
     try:
-        while time.time() - start_time < target_seconds:
-            # Check if robot signaled stop (hemisphere complete or quit)
+        while True:
+            # Stop when robot signals completion
             if pose_receiver.should_stop_recording():
-                stop_reason = "hemisphere_complete"
                 print("[Recording] Received stop signal from robot - ending recording")
                 break
 
@@ -519,24 +517,29 @@ def record_single_object(
             depth_ds.resize(rs_idx + 1, axis=0)
             rgb_ds.resize(rs_idx + 1, axis=0)
             t_sys_ds.resize(rs_idx + 1, axis=0)
+            t_hw_ds.resize(rs_idx + 1, axis=0)
+            frame_num_ds.resize(rs_idx + 1, axis=0)
 
             # Store data
+            t_ns = time.time_ns()
             depth_ds[rs_idx] = depth_img
             rgb_ds[rs_idx] = color_img
-            t_sys_ds[rs_idx] = time.time_ns()
+            t_sys_ds[rs_idx] = t_ns
+            t_hw_ds[rs_idx] = depth.get_timestamp()
+            frame_num_ds[rs_idx] = depth.get_frame_number()
+            frame_times_ns_list.append(t_ns)
+
+            # Record RealSense timestamp domain once for diagnostics
+            if not timestamp_domain_recorded:
+                rs_timestamp_domain = str(depth.get_frame_timestamp_domain())
+                timestamp_domain_recorded = True
 
             rs_video.write(cv2.convertScaleAbs(depth_img, alpha=0.03))
             rs_rgb_video.write(color_img)
             rs_idx += 1
             
-            # Collect poses periodically
-            new_poses = pose_receiver.get_all_poses()
-            accumulated_poses.extend(new_poses)
-            
-            # Save poses to HDF5 in batches
-            if len(accumulated_poses) >= 100:
-                save_poses_to_hdf5(rs_h5, accumulated_poses)
-                accumulated_poses.clear()
+            # Collect poses
+            accumulated_poses.extend(pose_receiver.get_all_poses())
     
     finally:
         # Stop event camera acquisition (only if we started it)
@@ -547,40 +550,72 @@ def record_single_object(
         
         # Get remaining poses
         pose_receiver.stop()
-        remaining_poses = pose_receiver.get_all_poses()
-        accumulated_poses.extend(remaining_poses)
+        accumulated_poses.extend(pose_receiver.get_all_poses())
         
-        # Save final poses
-        save_poses_to_hdf5(rs_h5, accumulated_poses)
+        recording_end_ns = time.time_ns()
+        raw_poses_received = len(accumulated_poses)
         
-        # Update metadata
-        meta_grp.attrs["recording_end_ns"] = time.time_ns()
-        meta_grp.attrs["depth_frames_recorded"] = rs_idx
-        meta_grp.attrs["stop_reason"] = stop_reason
-        if "poses" in rs_h5:
-            poses_recorded = rs_h5["poses"]["t_ns"].shape[0]
-            meta_grp.attrs["poses_recorded"] = poses_recorded
-        else:
-            poses_recorded = 0
-            meta_grp.attrs["poses_recorded"] = 0
-        
-        # Cleanup
+        # Close realsense HDF5 and video writers
         rs_video.release()
         rs_rgb_video.release()
         rs_h5.close()
+        
+        # Interpolate raw poses to per-depth-frame timestamps → poses.h5
+        frame_times_ns = np.array(frame_times_ns_list, dtype=np.int64)
+        
+        if raw_poses_received > 1 and rs_idx > 0:
+            try:
+                parsed = parse_raw_poses(accumulated_poses)
+                interp = interpolate_poses_for_frames(
+                    frame_times_ns=frame_times_ns,
+                    pose_times_ns=parsed["t_ns"],
+                    pose_ee_T=parsed["ee_T"],
+                    pose_joint_pos=parsed["joint_positions"],
+                    pose_gripper_q=parsed["gripper_q"],
+                )
+                with h5py.File(poses_h5_file, "w") as pf:
+                    pf.create_dataset("ee_T", data=interp["ee_T"])
+                    pf.create_dataset("joint_positions", data=interp["joint_positions"])
+                    pf.create_dataset("gripper_q", data=interp["gripper_q"])
+                    pf.create_dataset("nearest_offset_ms", data=interp["nearest_offset_ms"])
+                median_off = np.median(interp["nearest_offset_ms"])
+                max_off = np.max(interp["nearest_offset_ms"])
+                print(
+                    f"[Recording] Per-frame pose interpolation: "
+                    f"median offset {median_off:.1f} ms, max {max_off:.1f} ms"
+                )
+            except Exception as e:
+                print(f"[Recording] Warning: per-frame pose interpolation failed: {e}")
+        else:
+            print(f"[Recording] Warning: not enough poses ({raw_poses_received}) to interpolate")
+        
+        # Write metadata
+        with h5py.File(metadata_h5_file, "w") as mf:
+            mf.attrs["object_name"] = object_name
+            mf.attrs["recording_start_ns"] = recording_start_ns
+            mf.attrs["recording_end_ns"] = recording_end_ns
+            mf.attrs["fps"] = FPS
+            mf.attrs["event_device_open_ns"] = event_device_open_ns
+            mf.attrs["rs_timestamp_domain"] = rs_timestamp_domain
+            mf.attrs["depth_frames_recorded"] = rs_idx
+            mf.attrs["raw_poses_received"] = raw_poses_received
 
         # Notify robot controller that recording is done
         sync_client.send_done()
 
-    print(f"\n[Recording] Finished '{object_name}'! (stop reason: {stop_reason})")
+    print(f"\n[Recording] Finished '{object_name}'!")
     print(f"  RealSense frames: {rs_idx}")
-    print(f"  Robot poses: {poses_recorded}")
+    print(f"  Raw poses received: {raw_poses_received}")
     print(f"  Output directory: {object_dir}")
 
-    # Generate event videos from raw files
+    # Generate event videos from raw files, then align to depth frames
     if num_event_cams > 0:
         print("[Recording] Generating event camera video(s) from raw data...")
         generate_event_videos(object_raw_dir, object_video_dir, object_hdf5_dir, num_event_cams)
+        print("[Recording] Aligning event frames to depth timestamps...")
+        align_event_frames_to_depth(
+            object_hdf5_dir, num_event_cams, frame_times_ns, event_device_open_ns
+        )
 
     return True
 
@@ -660,18 +695,97 @@ def generate_event_videos(
         print(f"[EventVideo] cam{cam_idx}: {idx} frames written to {video_file}")
 
 
-def event_drain_process_with_paths(
+def align_event_frames_to_depth(
+    hdf5_dir: Path,
+    num_cameras: int,
+    depth_times_ns: np.ndarray,
+    event_device_open_ns: int,
+) -> None:
+    """
+    Align event camera HDF5 frames to depth frame timestamps.
+
+    For each depth frame, we find the nearest event frame by converting the
+    event camera's internal microsecond clock to system nanoseconds via:
+        t_event_sys_ns = t_event_us * 1000 + event_device_open_ns
+
+    The unaligned events_cam{i}.h5 (M frames) is replaced with an aligned
+    version (N frames) where N = len(depth_times_ns), so that
+    events[i] corresponds to depth[i] and poses[i].
+    """
+    N = len(depth_times_ns)
+    if N == 0:
+        return
+
+    for cam_idx in range(num_cameras):
+        h5_path = hdf5_dir / f"events_cam{cam_idx}.h5"
+        if not h5_path.exists():
+            print(f"[Align] events_cam{cam_idx}.h5 not found, skipping")
+            continue
+
+        # Read the unaligned event frames and timestamps
+        with h5py.File(h5_path, "r") as f:
+            ev_frames = f["events/frames"][:]        # (M, H, W)
+            ev_t_end_us = f["events/t_ev_end_us"][:]  # (M,)
+            ev_t_start_us = f["events/t_ev_start_us"][:]
+            attrs = dict(f["events"].attrs)
+
+        M = len(ev_t_end_us)
+        if M == 0:
+            print(f"[Align] cam{cam_idx}: no event frames, skipping")
+            continue
+
+        # Convert event timestamps to system nanoseconds
+        ev_t_sys_ns = ev_t_end_us.astype(np.int64) * 1000 + event_device_open_ns
+
+        # For each depth frame, find the nearest event frame
+        indices = np.searchsorted(ev_t_sys_ns, depth_times_ns, side="left")
+        indices = np.clip(indices, 0, M - 1)
+
+        # Check if the left neighbour is actually closer
+        left = np.clip(indices - 1, 0, M - 1)
+        d_right = np.abs(ev_t_sys_ns[indices] - depth_times_ns)
+        d_left = np.abs(ev_t_sys_ns[left] - depth_times_ns)
+        use_left = d_left < d_right
+        indices[use_left] = left[use_left]
+
+        offset_ms = np.abs(ev_t_sys_ns[indices] - depth_times_ns) / 1e6
+
+        # Select the aligned frames
+        aligned_frames = ev_frames[indices]          # (N, H, W)
+        aligned_t_start = ev_t_start_us[indices]
+        aligned_t_end = ev_t_end_us[indices]
+
+        # Overwrite the events .h5 with the aligned version
+        with h5py.File(h5_path, "w") as f:
+            grp = f.create_group("events")
+            grp.create_dataset("frames", data=aligned_frames)
+            grp.create_dataset("t_ev_start_us", data=aligned_t_start)
+            grp.create_dataset("t_ev_end_us", data=aligned_t_end)
+            grp.create_dataset("alignment_offset_ms", data=offset_ms)
+            for k, v in attrs.items():
+                grp.attrs[k] = v
+
+        print(
+            f"[Align] cam{cam_idx}: {M} → {N} frames, "
+            f"median offset {np.median(offset_ms):.1f} ms, "
+            f"max {np.max(offset_ms):.1f} ms"
+        )
+
+
+def event_drain_process(
     stop_acquire_event,
     done_event,
     ready_event,
     event0_path: str,
     event1_path: str,
     num_cameras: int = 1,
-    flush_seconds: float = 0.5
+    flush_seconds: float = 0.5,
+    clock_sync_queue: Optional[Queue] = None,
 ) -> None:
     """Process that handles event camera acquisition with custom output paths."""
     devices = DeviceDiscovery.list()
     device0 = DeviceDiscovery.open(devices[0])
+    device_open_ns = time.time_ns()  # system time ≈ camera-clock origin
     device1 = DeviceDiscovery.open(devices[1]) if num_cameras >= 2 else None
 
     # Apply biases
@@ -699,6 +813,11 @@ def event_drain_process_with_paths(
 
     ready_event.set()
 
+    # Report device-open system timestamp so the main process can map
+    # event-camera microseconds → system nanoseconds
+    if clock_sync_queue is not None:
+        clock_sync_queue.put(device_open_ns)
+
     try:
         while not stop_acquire_event.is_set():
             next(it0)
@@ -722,7 +841,6 @@ def event_drain_process_with_paths(
 def main(
     zmq_sync_addr: str = ZMQ_SYNC_ADDR,
     zmq_pose_addr: str = ZMQ_POSE_ADDR,
-    target_seconds: float = TARGET_SECONDS,
     num_event_cams: int = 1,
 ) -> None:
     """
@@ -808,7 +926,6 @@ def main(
             
             if object_name is None:
                 print("\n[Recording] User requested quit. Exiting...")
-                # Send a quit signal to my_main if it's waiting
                 break
             
             # Record this object
@@ -817,7 +934,6 @@ def main(
                 pipeline=pipeline,
                 pose_receiver=pose_receiver,
                 sync_client=sync_client,
-                target_seconds=target_seconds,
                 num_event_cams=num_event_cams,
             )
             
@@ -854,7 +970,6 @@ def main(
             pass
 
         # Give librealsense / USB stack a moment to settle
-        import gc
         gc.collect()
         time.sleep(1.0)
 
@@ -863,8 +978,6 @@ def main(
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description="Synchronized multi-camera recording")
     parser.add_argument(
         "--zmq-sync-addr",
@@ -875,12 +988,6 @@ if __name__ == "__main__":
         "--zmq-pose-addr",
         default=ZMQ_POSE_ADDR,
         help=f"ZMQ pose subscription address (default: {ZMQ_POSE_ADDR})"
-    )
-    parser.add_argument(
-        "--duration",
-        type=float,
-        default=TARGET_SECONDS,
-        help=f"Recording duration in seconds (default: {TARGET_SECONDS})"
     )
     parser.add_argument(
         "--event-cameras",
@@ -895,6 +1002,5 @@ if __name__ == "__main__":
     main(
         zmq_sync_addr=args.zmq_sync_addr,
         zmq_pose_addr=args.zmq_pose_addr,
-        target_seconds=args.duration,
         num_event_cams=args.event_cameras,
     )

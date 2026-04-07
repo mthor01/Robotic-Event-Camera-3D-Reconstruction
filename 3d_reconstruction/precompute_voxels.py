@@ -81,104 +81,141 @@ def events_to_voxel_grid(
     return voxel
 
 
+def load_events_from_raw(raw_path: Path) -> np.ndarray:
+    """
+    Load all events from a Metavision .raw file into a sorted structured array.
+
+    Returns a numpy structured array with fields (x, y, p, t) where t is in
+    microseconds (event-camera internal clock, origin = device open time).
+    """
+    from metavision_core.event_io import EventsIterator
+
+    chunks = []
+    for ev_batch in EventsIterator(str(raw_path), delta_t=1_000_000):  # 1 s chunks
+        if len(ev_batch) > 0:
+            chunks.append(ev_batch.copy())
+
+    if not chunks:
+        return np.array([], dtype=np.dtype([
+            ('x', '<u2'), ('y', '<u2'), ('p', 'u1'), ('t', '<i8')
+        ]))
+
+    events = np.concatenate(chunks)
+    sort_idx = np.argsort(events['t'], kind='stable')
+    return events[sort_idx]
+
+
 def process_sequence(sequence_dir: Path, num_bins: int = 5, overwrite: bool = False) -> dict:
-    """Process a single sequence directory."""
+    """
+    Process a single sequence directory.
+
+    Reads depth timestamps from hdf5/realsense.h5 and raw events from
+    raw/event_cam*.raw.  For each depth frame i the events in the half-open
+    interval [t_depth[i], t_depth[i+1]) are accumulated into a voxel grid
+    with `num_bins` temporal bins and saved to
+    events/voxels_cam{k}/voxel_{i:06d}.npy.
+    """
     sequence_dir = Path(sequence_dir)
-    
-    # Paths
-    depth_h5_path = sequence_dir / "hdf5" / "depth.h5"
-    events_path = sequence_dir / "events" / "events.npy"
-    voxels_dir = sequence_dir / "events" / "voxels"
-    
+
+    realsense_h5_path = sequence_dir / "hdf5" / "realsense.h5"
+    metadata_h5_path  = sequence_dir / "hdf5" / "metadata.h5"
+    raw_dir           = sequence_dir / "raw"
+
     result = {
         "name": sequence_dir.name,
         "success": False,
         "n_frames": 0,
         "error": None,
     }
-    
-    # Check input files
-    if not depth_h5_path.exists():
-        result["error"] = f"Depth HDF5 not found: {depth_h5_path}"
+
+    if not realsense_h5_path.exists():
+        result["error"] = f"realsense.h5 not found: {realsense_h5_path}"
         return result
-    if not events_path.exists():
-        result["error"] = f"Events file not found: {events_path}"
+
+    # Discover raw event files (event_cam0.raw, event_cam1.raw, ...)
+    raw_event_files = sorted(raw_dir.glob("event_cam*.raw")) if raw_dir.exists() else []
+    if not raw_event_files:
+        result["error"] = f"No raw event files found in {raw_dir}"
         return result
-    
-    # Check if already processed
-    if voxels_dir.exists() and not overwrite:
-        existing = list(voxels_dir.glob("voxel_*.npy"))
-        if len(existing) > 0:
+
+    # Load depth shape and system-clock timestamps (nanoseconds)
+    with h5py.File(realsense_h5_path, 'r') as f:
+        depth_shape = f['depth'].shape   # (N, H, W)
+        depth_t_ns  = f['t_sys_ns'][:]   # (N,) nanoseconds
+
+    n_frames = len(depth_t_ns)
+    H, W = depth_shape[1], depth_shape[2]
+
+    # Fast-path: all cameras already processed
+    if not overwrite:
+        all_done = all(
+            len(list((sequence_dir / "events" / f"voxels_cam{i}").glob("voxel_*.npy"))) >= n_frames
+            for i in range(len(raw_event_files))
+        )
+        if all_done:
             result["success"] = True
-            result["n_frames"] = len(existing)
+            result["n_frames"] = n_frames
             result["error"] = "Already processed (use --overwrite to reprocess)"
             return result
-    
-    # Create output directory
-    voxels_dir.mkdir(parents=True, exist_ok=True)
-    
-    try:
-        # Load depth timestamps
-        with h5py.File(depth_h5_path, 'r') as f:
-            depth_shape = f['realsense/depth'].shape
-            depth_timestamps = f['realsense/t_sys_ns'][:]
-        
-        # HDF5 timestamps are in nanoseconds; event timestamps are in microseconds.
-        # Convert to microseconds for consistent comparison.
-        depth_timestamps = depth_timestamps // 1000
 
-        n_frames = len(depth_timestamps)
-        H, W = depth_shape[1], depth_shape[2]
-        
-        # Load all events
-        events = np.load(events_path)
-        n_events = len(events)
-        
-        # Sort events by timestamp for efficient slicing
-        event_times = events['t']
-        sort_idx = np.argsort(event_times)
-        events = events[sort_idx]
-        event_times = event_times[sort_idx]
-        
-        # Process each frame
-        for frame_idx in range(n_frames):
-            # Get time window
-            t_start = depth_timestamps[frame_idx]
-            if frame_idx < n_frames - 1:
-                t_end = depth_timestamps[frame_idx + 1]
-            else:
-                t_end = event_times[-1] + 1 if len(event_times) > 0 else t_start + 1
-            
-            # Find events in time window using binary search
-            idx_start = np.searchsorted(event_times, t_start, side='left')
-            idx_end = np.searchsorted(event_times, t_end, side='left')
-            
-            frame_events = events[idx_start:idx_end]
-            
-            # Convert to voxel grid
-            voxel = events_to_voxel_grid(frame_events, H, W, num_bins)
-            
-            # Save
-            voxel_path = voxels_dir / f"voxel_{frame_idx:06d}.npy"
-            np.save(voxel_path, voxel)
-        
+    # Clock-domain conversion:
+    #   event camera uses an internal µs counter that starts at device-open time.
+    #   t_sys_ns = t_event_us * 1000 + event_device_open_ns
+    #   → t_event_us = (t_sys_ns - event_device_open_ns) / 1000
+    event_device_open_ns = 0
+    if metadata_h5_path.exists():
+        with h5py.File(metadata_h5_path, 'r') as f:
+            event_device_open_ns = int(f.attrs.get('event_device_open_ns', 0))
+
+    # Depth timestamps expressed in event-camera µs for direct comparison
+    depth_t_us = (depth_t_ns.astype(np.int64) - event_device_open_ns) // 1000
+
+    try:
+        for cam_idx, raw_path in enumerate(raw_event_files):
+            voxels_dir = sequence_dir / "events" / f"voxels_cam{cam_idx}"
+
+            # Skip if this camera is already done
+            if not overwrite and voxels_dir.exists():
+                if len(list(voxels_dir.glob("voxel_*.npy"))) >= n_frames:
+                    continue
+
+            voxels_dir.mkdir(parents=True, exist_ok=True)
+
+            # Load all raw events for this camera into memory
+            events = load_events_from_raw(raw_path)
+            event_t_us = events['t'].astype(np.int64)
+
+            for frame_idx in tqdm(range(n_frames), desc=f"  cam{cam_idx}", leave=False):
+                t_start = depth_t_us[frame_idx]
+                if frame_idx < n_frames - 1:
+                    t_end = depth_t_us[frame_idx + 1]
+                else:
+                    t_end = event_t_us[-1] + 1 if len(event_t_us) > 0 else t_start + 1
+
+                i0 = np.searchsorted(event_t_us, t_start, side='left')
+                i1 = np.searchsorted(event_t_us, t_end,   side='left')
+
+                voxel = events_to_voxel_grid(events[i0:i1], H, W, num_bins)
+                np.save(voxels_dir / f"voxel_{frame_idx:06d}.npy", voxel)
+
         result["success"] = True
         result["n_frames"] = n_frames
-        
+
     except Exception as e:
         result["error"] = str(e)
-    
+
     return result
 
 
 def find_sequence_dirs(data_root: Path) -> List[Path]:
-    """Find valid sequence directories."""
+    """Find valid sequence directories that contain the new data structure."""
     sequence_dirs = []
     for d in data_root.iterdir():
         if d.is_dir():
-            depth_h5 = d / "hdf5" / "depth.h5"
-            events_npy = d / "events" / "events.npy"
-            if depth_h5.exists() and events_npy.exists():
+            realsense_h5 = d / "hdf5" / "realsense.h5"
+            raw_dir = d / "raw"
+            has_raw = raw_dir.exists() and len(list(raw_dir.glob("event_cam*.raw"))) > 0
+            if realsense_h5.exists() and has_raw:
                 sequence_dirs.append(d)
     return sorted(sequence_dirs)
 
