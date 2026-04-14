@@ -49,6 +49,11 @@ def events_to_voxel_grid(
     p = events['p'].astype(np.float32)  # 0 or 1
     t = events['t'].astype(np.float64)
     
+    # Apply 180° rotation to match the HDF5 event frames
+    # (generate_event_videos applies cv2.ROTATE_180)
+    x = (width  - 1) - x
+    y = (height - 1) - y
+    
     # Convert polarity: 0 -> -1, 1 -> +1
     p = p * 2 - 1
     
@@ -118,8 +123,7 @@ def process_sequence(sequence_dir: Path, num_bins: int = 5, overwrite: bool = Fa
     sequence_dir = Path(sequence_dir)
 
     realsense_h5_path = sequence_dir / "hdf5" / "realsense.h5"
-    metadata_h5_path  = sequence_dir / "hdf5" / "metadata.h5"
-    raw_dir           = sequence_dir / "raw"
+    raw_dir           = sequence_dir / "raw_event_data"
 
     result = {
         "name": sequence_dir.name,
@@ -132,8 +136,8 @@ def process_sequence(sequence_dir: Path, num_bins: int = 5, overwrite: bool = Fa
         result["error"] = f"realsense.h5 not found: {realsense_h5_path}"
         return result
 
-    # Discover raw event files (event_cam0.raw, event_cam1.raw, ...)
-    raw_event_files = sorted(raw_dir.glob("event_cam*.raw")) if raw_dir.exists() else []
+    # Discover raw event files (events_cam0.raw, events_cam1.raw, ...)
+    raw_event_files = sorted(raw_dir.glob("events_cam*.raw")) if raw_dir.exists() else []
     if not raw_event_files:
         result["error"] = f"No raw event files found in {raw_dir}"
         return result
@@ -144,7 +148,21 @@ def process_sequence(sequence_dir: Path, num_bins: int = 5, overwrite: bool = Fa
         depth_t_ns  = f['t_sys_ns'][:]   # (N,) nanoseconds
 
     n_frames = len(depth_t_ns)
-    H, W = depth_shape[1], depth_shape[2]
+
+    # Event camera native resolution (read from the aligned HDF5 file)
+    # We must NOT use the RealSense depth resolution here — raw event
+    # x/y are in the event camera's own coordinate system.
+    ev_h5_path = sequence_dir / "hdf5" / "events_cam0.h5"
+    if ev_h5_path.exists():
+        with h5py.File(ev_h5_path, 'r') as f:
+            EV_H = int(f["events"].attrs["height"])
+            EV_W = int(f["events"].attrs["width"])
+    else:
+        # Fallback: read from raw file via EventsIterator
+        from metavision_core.event_io import EventsIterator as _EI
+        _it = _EI(str(raw_event_files[0]), delta_t=1_000_000)
+        EV_H, EV_W = _it.get_size()
+        del _it
 
     # Fast-path: all cameras already processed
     if not overwrite:
@@ -158,17 +176,13 @@ def process_sequence(sequence_dir: Path, num_bins: int = 5, overwrite: bool = Fa
             result["error"] = "Already processed (use --overwrite to reprocess)"
             return result
 
-    # Clock-domain conversion:
-    #   event camera uses an internal µs counter that starts at device-open time.
-    #   t_sys_ns = t_event_us * 1000 + event_device_open_ns
-    #   → t_event_us = (t_sys_ns - event_device_open_ns) / 1000
-    event_device_open_ns = 0
-    if metadata_h5_path.exists():
-        with h5py.File(metadata_h5_path, 'r') as f:
-            event_device_open_ns = int(f.attrs.get('event_device_open_ns', 0))
-
-    # Depth timestamps expressed in event-camera µs for direct comparison
-    depth_t_us = (depth_t_ns.astype(np.int64) - event_device_open_ns) // 1000
+    # Time alignment strategy:
+    #   The aligned events_cam{k}.h5 already has per-frame timestamps
+    #   (t_ev_start_us, t_ev_end_us) in event-camera internal µs — the
+    #   exact same clock domain as the raw .raw file.  We read those
+    #   timestamps and use them directly to slice the raw event stream.
+    #   This avoids any fragile cross-clock (system ↔ event-camera)
+    #   conversion entirely.
 
     try:
         for cam_idx, raw_path in enumerate(raw_event_files):
@@ -179,23 +193,33 @@ def process_sequence(sequence_dir: Path, num_bins: int = 5, overwrite: bool = Fa
                 if len(list(voxels_dir.glob("voxel_*.npy"))) >= n_frames:
                     continue
 
+            # Read per-frame time windows from the aligned HDF5
+            aligned_h5 = sequence_dir / "hdf5" / f"events_cam{cam_idx}.h5"
+            if not aligned_h5.exists():
+                print(f"  [cam{cam_idx}] aligned HDF5 not found: {aligned_h5}")
+                continue
+            with h5py.File(aligned_h5, 'r') as f:
+                ev_t_start_us = f['events/t_ev_start_us'][:]  # (N,) int64
+                ev_t_end_us   = f['events/t_ev_end_us'][:]    # (N,) int64
+
+            if len(ev_t_start_us) != n_frames:
+                print(f"  [cam{cam_idx}] WARNING: HDF5 has {len(ev_t_start_us)} frames "
+                      f"but depth has {n_frames}")
+
             voxels_dir.mkdir(parents=True, exist_ok=True)
 
             # Load all raw events for this camera into memory
             events = load_events_from_raw(raw_path)
-            event_t_us = events['t'].astype(np.int64)
+            raw_t = events['t'].astype(np.int64)
 
             for frame_idx in tqdm(range(n_frames), desc=f"  cam{cam_idx}", leave=False):
-                t_start = depth_t_us[frame_idx]
-                if frame_idx < n_frames - 1:
-                    t_end = depth_t_us[frame_idx + 1]
-                else:
-                    t_end = event_t_us[-1] + 1 if len(event_t_us) > 0 else t_start + 1
+                t_start = int(ev_t_start_us[frame_idx])
+                t_end   = int(ev_t_end_us[frame_idx])
 
-                i0 = np.searchsorted(event_t_us, t_start, side='left')
-                i1 = np.searchsorted(event_t_us, t_end,   side='left')
+                i0 = np.searchsorted(raw_t, t_start, side='left')
+                i1 = np.searchsorted(raw_t, t_end,   side='right')
 
-                voxel = events_to_voxel_grid(events[i0:i1], H, W, num_bins)
+                voxel = events_to_voxel_grid(events[i0:i1], EV_H, EV_W, num_bins)
                 np.save(voxels_dir / f"voxel_{frame_idx:06d}.npy", voxel)
 
         result["success"] = True
@@ -213,8 +237,8 @@ def find_sequence_dirs(data_root: Path) -> List[Path]:
     for d in data_root.iterdir():
         if d.is_dir():
             realsense_h5 = d / "hdf5" / "realsense.h5"
-            raw_dir = d / "raw"
-            has_raw = raw_dir.exists() and len(list(raw_dir.glob("event_cam*.raw"))) > 0
+            raw_dir = d / "raw_event_data"
+            has_raw = raw_dir.exists() and len(list(raw_dir.glob("events_cam*.raw"))) > 0
             if realsense_h5.exists() and has_raw:
                 sequence_dirs.append(d)
     return sorted(sequence_dirs)
@@ -227,7 +251,7 @@ def main():
     )
     parser.add_argument("--data_dir", nargs="+", type=str, default=None,
                        help="Sequence directory(ies) to process")
-    parser.add_argument("--data_root", type=str, default="data/synthetic_data",
+    parser.add_argument("--data_root", type=str, default="data/real",
                        help="Root data directory (will process all subdirs)")
     parser.add_argument("--num_bins", type=int, default=5,
                        help="Number of temporal bins for voxel grid")

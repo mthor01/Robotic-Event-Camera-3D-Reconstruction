@@ -11,22 +11,30 @@ Key differences from standard UNet:
 - Scale-invariant + multi-scale gradient loss
 - Bilinear upsampling in decoder
 
-Expected folder structure (synthetic data from franka_pipeline):
-    data/synthetic_data/
-        bottle/
+Expected folder structure (real data):
+    data/real/
+        <object_name>/
             hdf5/
-                depth.h5    # realsense/depth (N, H, W) uint16 mm, realsense/t_sys_ns
-                rgb.h5      # rgb (N, H, W, 3), t_sys_ns
+                realsense.h5              # depth (N, H, W) uint16 mm, t_sys_ns
+                depth_in_event_frame.h5   # depth (N, H, W) float32 metres (preferred)
+                rgb_in_event_frame.h5     # rgb (N, H, W, 3) uint8 (for --rgb_mask)
+                poses.h5                  # ee_T (N, 4, 4), joint_positions, gripper_q
             events/
-                events.npy  # structured array (x, y, p, t)
-        cube_medium/
-            ...
+                voxels_cam0/              # precomputed voxel_NNNNNN.npy files
 
 Usage:
-    python train_e2depth.py --data_root data/synthetic_data
+    python real_train.py --data_root data/real
 
     # With specific objects:
-    python train_e2depth.py --data_dir data/synthetic_data/bottle data/synthetic_data/cube_medium
+    python3 real_train.py --data_dir data/real/bottle data/real/cube_medium
+
+    # With pose input (requires precomputed pose voxels):
+    python3 precompute_pose_depth.py --data_root data/real
+    python3 real_train.py --data_root data/real --use_pose
+
+    # With RGB white-pixel masking (requires projected RGB):
+    python3 project_realsense_to_event.py --data_root data/real
+    python3 real_train.py --data_root data/real --rgb_mask
 
 TensorBoard:
     tensorboard --logdir checkpoints_e2depth/runs
@@ -34,6 +42,7 @@ TensorBoard:
 
 import argparse
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict
 from pathlib import Path
@@ -48,19 +57,28 @@ import h5py
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    _NVML_AVAILABLE = True
+except Exception:
+    _NVML_AVAILABLE = False
+
 
 # ================= DEFAULT PATHS =================
-DATA_ROOT = Path("data/synthetic_data")
+DATA_ROOT = Path("data/real")
 DEFAULT_OUT_DIR = Path("checkpoints_e2depth")
 # =================================================
 
 # ================= DEPTH PARAMETERS (tabletop scene) =================
-D_MAX = 2.0   # Maximum depth in meters (tabletop range)
-ALPHA = 3.7   # Log depth parameter
+D_MAX = 0.6   # Maximum depth in meters (tabletop range)
+ALPHA = 2.5   # Log depth parameter
 # D_metric = D_MAX * exp(-ALPHA * (1 - D_pred))
 # At D_pred=0: D_metric = D_MAX * exp(-ALPHA) ≈ 0.05m (5cm minimum)
-# At D_pred=1: D_metric = D_MAX = 2.0m
+# At D_pred=1: D_metric = D_MAX = 0.6m
 # =====================================================================
+
+
 
 
 # -----------------------------
@@ -438,83 +456,28 @@ def log_normalized_to_depth(pred: torch.Tensor, d_max: float = D_MAX, alpha: flo
 class DataConfig:
     """Configuration for dataset loading and preprocessing."""
     seq_len: int = 1  # Sequence length for recurrent training
-    crop_size: Optional[Tuple[int, int]] = None  # (H, W) for random crop
+    crop_size: Optional[Tuple[int, int]] = None  # (H, W) center crop applied after resize
+    resize_hw: Optional[Tuple[int, int]] = None  # (H, W) resize before crop/augmentation
     depth_max: float = D_MAX  # Maximum depth in meters
     depth_min: float = 0.05   # Minimum depth in meters (5cm for tabletop)
     augment: bool = True  # Apply data augmentation during training
     num_bins: int = 5  # Number of temporal bins for voxel grid
+    use_pose: bool = False  # Use precomputed pose depth channel (from voxels_pose_cam0/)
+    rgb_mask: bool = False  # Mask out white pixels using projected RGB
 
 
-def events_to_voxel_grid(
-    events: np.ndarray,
-    height: int,
-    width: int,
-    num_bins: int = 5,
-) -> np.ndarray:
+class RealDataset(Dataset):
     """
-    Convert raw events to a voxel grid representation.
-    
-    Args:
-        events: Structured array with fields (x, y, p, t)
-        height: Image height
-        width: Image width
-        num_bins: Number of temporal bins
-        
-    Returns:
-        Voxel grid of shape (num_bins, height, width)
-    """
-    voxel = np.zeros((num_bins, height, width), dtype=np.float32)
-    
-    if len(events) == 0:
-        return voxel
-    
-    # Extract event fields
-    x = events['x'].astype(np.int32)
-    y = events['y'].astype(np.int32)
-    p = events['p'].astype(np.float32)  # 0 or 1
-    t = events['t'].astype(np.float64)
-    
-    # Convert polarity: 0 -> -1, 1 -> +1
-    p = p * 2 - 1
-    
-    # Normalize timestamps to [0, num_bins-1]
-    t_min, t_max = t.min(), t.max()
-    if t_max > t_min:
-        t_norm = (t - t_min) / (t_max - t_min) * (num_bins - 1)
-    else:
-        t_norm = np.zeros_like(t)
-    
-    # Bilinear interpolation across time bins
-    t_floor = np.floor(t_norm).astype(np.int32)
-    t_ceil = np.minimum(t_floor + 1, num_bins - 1)
-    t_frac = t_norm - t_floor
-    
-    # Accumulate events into voxel grid
-    for i in range(len(events)):
-        if 0 <= x[i] < width and 0 <= y[i] < height:
-            voxel[t_floor[i], y[i], x[i]] += p[i] * (1 - t_frac[i])
-            voxel[t_ceil[i], y[i], x[i]] += p[i] * t_frac[i]
-    
-    # Normalize voxel grid
-    nonzero_mask = voxel != 0
-    if nonzero_mask.any():
-        mean = voxel[nonzero_mask].mean()
-        std = voxel[nonzero_mask].std()
-        if std > 0:
-            voxel = (voxel - mean) / std
-    
-    return voxel
+    Dataset for real data recorded with franka_pipeline + synchronised_recording.
 
+    Requires precomputed voxels (run precompute_voxels.py first).
+    When ``cfg.use_pose`` is ``True``, loads from voxels_pose_cam0/
+    (run precompute_pose_depth.py first) which has the pose depth
+    channel already baked in as the last channel.
 
-class SyntheticDataset(Dataset):
-    """
-    Dataset for synthetic data from franka_pipeline.
-    
-    Supports two modes:
-    1. Precomputed voxels (fast, low memory) - uses events/voxels/*.npy
-    2. Raw events (slow, high memory) - uses events/events.npy
-    
-    Run precompute_voxels.py first for best performance.
+    When ``cfg.rgb_mask`` is ``True``, additionally masks out white pixels
+    in the projected RGB (from rgb_in_event_frame.h5, run
+    project_realsense_to_event.py first).
     """
     def __init__(
         self,
@@ -529,50 +492,76 @@ class SyntheticDataset(Dataset):
         self.cfg = cfg
         self.split = split
         
-        # Paths
-        self.depth_h5_path = self.sequence_dir / "hdf5" / "depth.h5"
-        self.voxels_dir = self.sequence_dir / "events" / "voxels"
-        self.events_path = self.sequence_dir / "events" / "events.npy"
-        
-        # Check for precomputed voxels
-        self.use_precomputed = self.voxels_dir.exists() and len(list(self.voxels_dir.glob("voxel_*.npy"))) > 0
+        # --- Depth ---
+        projected = self.sequence_dir / "hdf5" / "depth_in_event_frame.h5"
+        if projected.exists():
+            self.depth_h5_path = projected
+            self._depth_key = "depth"
+            self._depth_is_metric = True   # already float32 metres
+        else:
+            self.depth_h5_path = self.sequence_dir / "hdf5" / "realsense.h5"
+            self._depth_key = "depth"
+            self._depth_is_metric = False  # uint16 mm
+        self._ts_h5_path = self.sequence_dir / "hdf5" / "realsense.h5"
+        self._ts_key = "t_sys_ns"
+
+        # --- Voxels (precomputed) ---
+        self.use_pose = cfg.use_pose
+        if self.use_pose:
+            # Prefer voxels_pose_cam0 (has pose depth channel appended)
+            if (self.sequence_dir / "events" / "voxels_pose_cam0").exists():
+                self.voxels_dir = self.sequence_dir / "events" / "voxels_pose_cam0"
+            else:
+                raise FileNotFoundError(
+                    f"--use_pose requires precomputed pose voxels. "
+                    f"Run: python precompute_pose_depth.py --data_dir {self.sequence_dir}"
+                )
+        elif (self.sequence_dir / "events" / "voxels_cam0").exists():
+            self.voxels_dir = self.sequence_dir / "events" / "voxels_cam0"
+        else:
+            self.voxels_dir = self.sequence_dir / "events" / "voxels"
         
         # Verify files exist
         if not self.depth_h5_path.exists():
             raise FileNotFoundError(f"Depth HDF5 not found: {self.depth_h5_path}")
-        if not self.use_precomputed and not self.events_path.exists():
-            raise FileNotFoundError(f"Neither voxels nor events found in {self.sequence_dir}")
         
-        # Load depth metadata only (not full data)
+        self.voxel_files = sorted(self.voxels_dir.glob("voxel_*.npy")) if self.voxels_dir.exists() else []
+        if not self.voxel_files:
+            raise FileNotFoundError(f"No precomputed voxels in {self.voxels_dir}")
+        
+        # --- Metadata ---
         with h5py.File(self.depth_h5_path, 'r') as f:
-            self.n_frames = f['realsense/depth'].shape[0]
-            self.H = f['realsense/depth'].shape[1]
-            self.W = f['realsense/depth'].shape[2]
-            # HDF5 timestamps are nanoseconds; event timestamps are microseconds.
-            self.depth_timestamps = f['realsense/t_sys_ns'][:] // 1000
+            self.n_frames = f[self._depth_key].shape[0]
+            self.H = f[self._depth_key].shape[1]
+            self.W = f[self._depth_key].shape[2]
+        with h5py.File(self._ts_h5_path, 'r') as f:
+            self.depth_timestamps = f[self._ts_key][:] // 1000
         
-        if self.use_precomputed:
-            # Count voxel files
-            self.voxel_files = sorted(self.voxels_dir.glob("voxel_*.npy"))
-            n_voxels = len(self.voxel_files)
-            if n_voxels != self.n_frames:
-                print(f"Warning: {n_voxels} voxels != {self.n_frames} frames")
-                self.n_frames = min(n_voxels, self.n_frames)
-            self.events = None
-            self.n_events = 0
-        else:
-            # Fall back to loading raw events (high memory!)
-            print(f"[{self.sequence_dir.name}] Warning: No precomputed voxels, loading raw events...")
-            self.events = np.load(self.events_path)
-            self.n_events = len(self.events)
-            self.voxel_files = None
+        n_voxels = len(self.voxel_files)
+        if n_voxels != self.n_frames:
+            print(f"Warning: {n_voxels} voxels != {self.n_frames} frames")
+            self.n_frames = min(n_voxels, self.n_frames)
         
-        # Compute valid indices
+        # --- RGB mask (optional) ---
+        self.rgb_mask = cfg.rgb_mask
+        self._rgb_h5_path = None
+        if self.rgb_mask:
+            rgb_proj = self.sequence_dir / "hdf5" / "rgb_in_event_frame.h5"
+            if not rgb_proj.exists():
+                raise FileNotFoundError(
+                    f"--rgb_mask requires projected RGB. "
+                    f"Run: python project_realsense_to_event.py --data_dir {self.sequence_dir}"
+                )
+            self._rgb_h5_path = rgb_proj
+        
+        # --- Train / val split ---
         self._compute_valid_indices(val_ratio, seed)
         
-        mode = "precomputed" if self.use_precomputed else f"raw ({self.n_events:,} events)"
+        depth_src = "projected" if self._depth_is_metric else "raw realsense"
+        pose_str = "with pose" if self.use_pose else "no pose"
+        rgb_str = ", rgb_mask" if self.rgb_mask else ""
         print(f"[{self.sequence_dir.name}] {split}: {len(self.indices)} samples "
-              f"(frames: {self.n_frames}, mode: {mode}, res: {self.W}x{self.H})")
+              f"(frames: {self.n_frames}, depth: {depth_src}, {pose_str}{rgb_str}, res: {self.W}x{self.H})")
     
     def _compute_valid_indices(self, val_ratio: float, seed: int):
         """Compute valid starting indices for sequences."""
@@ -611,30 +600,17 @@ class SyntheticDataset(Dataset):
             self.indices = all_indices[val_mask]
     
     def _get_voxel(self, frame_idx: int) -> np.ndarray:
-        """Get voxel grid for a frame."""
-        if self.use_precomputed:
-            voxel_path = self.voxels_dir / f"voxel_{frame_idx:06d}.npy"
-            return np.load(voxel_path)
-        else:
-            # Compute on the fly (slow)
-            frame_events = self._get_events_for_frame(frame_idx)
-            return events_to_voxel_grid(frame_events, self.H, self.W, self.cfg.num_bins)
-    
-    def _get_events_for_frame(self, frame_idx: int) -> np.ndarray:
-        """Get events between frame_idx and frame_idx+1 timestamps."""
-        if frame_idx >= len(self.depth_timestamps) - 1:
-            t_start = self.depth_timestamps[frame_idx]
-            mask = self.events['t'] >= t_start
-        else:
-            t_start = self.depth_timestamps[frame_idx]
-            t_end = self.depth_timestamps[frame_idx + 1]
-            mask = (self.events['t'] >= t_start) & (self.events['t'] < t_end)
-        return self.events[mask]
+        """Get precomputed voxel grid for a frame."""
+        voxel_path = self.voxels_dir / f"voxel_{frame_idx:06d}.npy"
+        return np.load(voxel_path)
     
     def _get_depth(self, frame_idx: int) -> np.ndarray:
         """Get depth frame (lazy load from HDF5)."""
         with h5py.File(self.depth_h5_path, 'r') as f:
-            depth = f['realsense/depth'][frame_idx].astype(np.float32) / 1000.0
+            if self._depth_is_metric:
+                depth = f[self._depth_key][frame_idx].astype(np.float32)
+            else:
+                depth = f[self._depth_key][frame_idx].astype(np.float32) / 1000.0
         return depth
     
     def __len__(self):
@@ -657,8 +633,16 @@ class SyntheticDataset(Dataset):
             # Get depth frame (lazy load)
             depth = self._get_depth(idx)
             
-            # Create validity mask
+            # Create validity mask (depth range)
             mask = ((depth > self.cfg.depth_min) & (depth < self.cfg.depth_max)).astype(np.float32)
+            
+            # Mask out white pixels from projected RGB
+            if self.rgb_mask:
+                with h5py.File(self._rgb_h5_path, 'r') as rf:
+                    rgb = rf["rgb"][idx]  # (H, W, 3) uint8
+                # White = all channels above threshold
+                white = np.all(rgb > 200, axis=-1)  # (H, W)
+                mask[white] = 0.0
             
             # Convert depth to log normalized [0, 1]
             depth = np.clip(depth, self.cfg.depth_min, self.cfg.depth_max)
@@ -673,16 +657,30 @@ class SyntheticDataset(Dataset):
         events = np.stack(events_seq, axis=0)
         depths = np.stack(depth_seq, axis=0)
         masks = np.stack(mask_seq, axis=0)
-        
-        # Random crop (training)
-        if self.cfg.crop_size is not None and self.cfg.augment and self.split == "train":
+
+        # Resize to target resolution (applied before crop/augmentation)
+        if self.cfg.resize_hw is not None:
+            rh, rw = self.cfg.resize_hw
+            events = F.interpolate(torch.from_numpy(events), size=(rh, rw), mode="bilinear", align_corners=False).numpy()
+            depths = F.interpolate(torch.from_numpy(depths), size=(rh, rw), mode="bilinear", align_corners=False).numpy()
+            masks = F.interpolate(torch.from_numpy(masks), size=(rh, rw), mode="nearest").numpy()
+
+        # Spatial dims after optional resize (used for crop bounds)
+        cur_H = events.shape[2]
+        cur_W = events.shape[3]
+
+        # Center crop (applied to both train and val whenever crop_size is set)
+        if self.cfg.crop_size is not None:
             ch, cw = self.cfg.crop_size
-            if self.H > ch and self.W > cw:
-                y0 = np.random.randint(0, self.H - ch + 1)
-                x0 = np.random.randint(0, self.W - cw + 1)
-                events = events[:, :, y0:y0+ch, x0:x0+cw]
-                depths = depths[:, :, y0:y0+ch, x0:x0+cw]
-                masks = masks[:, :, y0:y0+ch, x0:x0+cw]
+            if cur_H < ch or cur_W < cw:
+                raise ValueError(
+                    f"Center crop {cw}x{ch} larger than image {cur_W}x{cur_H}"
+                )
+            y0 = (cur_H - ch) // 2
+            x0 = (cur_W - cw) // 2
+            events = events[:, :, y0:y0+ch, x0:x0+cw]
+            depths = depths[:, :, y0:y0+ch, x0:x0+cw]
+            masks = masks[:, :, y0:y0+ch, x0:x0+cw]
         
         # Horizontal flip (training)
         if self.cfg.augment and self.split == "train" and np.random.rand() > 0.5:
@@ -707,7 +705,7 @@ def create_multi_sequence_dataset(
     datasets = []
     for seq_dir in sequence_dirs:
         try:
-            ds = SyntheticDataset(seq_dir, cfg, split=split, val_ratio=val_ratio)
+            ds = RealDataset(seq_dir, cfg, split=split, val_ratio=val_ratio)
             datasets.append(ds)
         except (FileNotFoundError, RuntimeError) as e:
             print(f"Warning: Skipping {seq_dir}: {e}")
@@ -720,20 +718,425 @@ def create_multi_sequence_dataset(
 
 def find_sequence_dirs(data_root: Path) -> List[Path]:
     """
-    Find valid synthetic data directories.
-    
-    Each valid directory should have:
-    - hdf5/depth.h5
-    - events/events.npy
+    Find valid real data sequence directories.
+
+    Required layout:
+        hdf5/realsense.h5  (or depth_in_event_frame.h5)
+        events/voxels_cam0/*.npy  (or events/voxels/*.npy)
     """
     sequence_dirs = []
     for d in data_root.iterdir():
-        if d.is_dir():
-            depth_h5 = d / "hdf5" / "depth.h5"
-            events_npy = d / "events" / "events.npy"
-            if depth_h5.exists() and events_npy.exists():
-                sequence_dirs.append(d)
+        if not d.is_dir():
+            continue
+        has_depth = (
+            (d / "hdf5" / "depth_in_event_frame.h5").exists()
+            or (d / "hdf5" / "realsense.h5").exists()
+        )
+        has_voxels = (
+            (d / "events" / "voxels_cam0").exists()
+            or (d / "events" / "voxels").exists()
+        )
+        if has_depth and has_voxels:
+            sequence_dirs.append(d)
     return sorted(sequence_dirs)
+
+
+# -----------------------------
+# Debug Visualization
+# -----------------------------
+def debug_visualize(
+    sequence_dir: str,
+    n_samples: int = 3,
+    out_path: str = "debug_viz.png",
+    num_bins: int = 5,
+    seed: int = None,
+    resize_hw: Optional[Tuple[int, int]] = None,
+    crop_size: Optional[Tuple[int, int]] = None,
+    use_pose: bool = False,
+    rgb_mask: bool = False,
+) -> None:
+    """
+    Save a debug PNG with n_samples × 2 rows (raw + preprocessed per timestamp).
+
+    RAW row columns:
+      1. Depth – Realsense raw            (plasma, metres)
+      2. Depth Mask                        (gray)
+      3. Projected Depth – event plane     (plasma, metres)  [N/A if absent]
+      4. Event Plane Mask                  (gray)            [N/A if absent]
+      5. Events Accumulated – sum of bins  (gray)
+      6. RGB (Realsense raw)               [N/A if absent]
+      7. Projected RGB – event plane       [N/A if absent]
+
+    PREPROCESSED row columns (after resize then center-crop):
+      1. Projected Depth – preprocessed    (plasma)
+      2. Event Plane Mask – preprocessed   (gray)
+      3. Events Accumulated – preprocessed (gray)
+      4. RGB – preprocessed                [N/A if absent]
+      5. Pose Depth – raw event resolution (viridis)  [N/A if --use_pose off]
+      6. Pose Depth – preprocessed         (viridis)  [N/A if --use_pose off]
+      7. Total Mask – preprocessed         (gray)     [N/A if no depth projected]
+
+    Resolution (W×H) is annotated in the top-left corner of every panel.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    seq_dir = Path(sequence_dir)
+    rng = np.random.default_rng(seed)
+
+    # ---- Locate raw depth & timestamps ----
+    realsense_path = seq_dir / "hdf5" / "realsense.h5"
+    projected_path = seq_dir / "hdf5" / "depth_in_event_frame.h5"
+
+    if not realsense_path.exists():
+        raise FileNotFoundError(f"No realsense.h5 found in {seq_dir / 'hdf5'}")
+    raw_depth_path = realsense_path
+    raw_depth_key = "depth"
+    ts_key = "t_sys_ns"
+
+    # ---- Locate RGB ----
+    rgb_path: Optional[Path] = None
+    rgb_key: Optional[str] = None
+    for _rp, _rk in [
+        (seq_dir / "hdf5" / "realsense.h5", "rgb"),
+        (seq_dir / "hdf5" / "rgb.h5", "rgb"),
+    ]:
+        if _rp.exists():
+            with h5py.File(_rp, "r") as _f:
+                if _rk in _f:
+                    rgb_path, rgb_key = _rp, _rk
+                    break
+
+    # ---- Locate precomputed voxels ----
+    voxels_dir: Optional[Path] = None
+    for _vd in [
+        seq_dir / "events" / "voxels_cam0",
+        seq_dir / "events" / "voxels",
+    ]:
+        if _vd.exists() and list(_vd.glob("voxel_*.npy")):
+            voxels_dir = _vd
+            break
+    # ---- Load metadata ----
+    with h5py.File(raw_depth_path, "r") as _f:
+        n_frames   = _f[raw_depth_key].shape[0]
+        depth_H    = int(_f[raw_depth_key].shape[1])
+        depth_W    = int(_f[raw_depth_key].shape[2])
+
+    proj_H: Optional[int] = None
+    proj_W: Optional[int] = None
+    if projected_path.exists():
+        with h5py.File(projected_path, "r") as _f:
+            proj_H = int(_f["depth"].shape[1])
+            proj_W = int(_f["depth"].shape[2])
+
+    # ---- Pose voxels (precomputed, optional) ----
+    pose_voxels_dir: Optional[Path] = None
+    if use_pose:
+        _pvd = seq_dir / "events" / "voxels_pose_cam0"
+        if _pvd.exists() and list(_pvd.glob("voxel_*.npy")):
+            pose_voxels_dir = _pvd
+        else:
+            print("[debug_viz] Warning: voxels_pose_cam0 not found, skipping pose depth")
+
+    # ---- Projected RGB (for rgb_mask visualisation) ----
+    proj_rgb_path: Optional[Path] = seq_dir / "hdf5" / "rgb_in_event_frame.h5"
+    if not proj_rgb_path.exists():
+        proj_rgb_path = None
+        if rgb_mask:
+            print("[debug_viz] Warning: rgb_in_event_frame.h5 not found, skipping RGB mask")
+
+    # ---- Sample random frame indices ----
+    n_samples = min(n_samples, n_frames)
+    frame_indices: List[int] = sorted(
+        rng.choice(n_frames, size=n_samples, replace=False).tolist()
+    )
+
+    # ---- Helpers ----
+    def _apply_resize_crop(img: np.ndarray) -> np.ndarray:
+        """img: (H, W) or (H, W, C) — returns resized+cropped numpy array."""
+        is_rgb = img.ndim == 3
+        # add batch+channel dims expected by F.interpolate: (1, C, H, W)
+        if is_rgb:
+            t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).float()
+        else:
+            t = torch.from_numpy(img).unsqueeze(0).unsqueeze(0).float()
+        if resize_hw is not None:
+            mode = "bilinear" if is_rgb or img.dtype != bool else "nearest"
+            t = F.interpolate(t, size=resize_hw, mode=mode, align_corners=False if mode == "bilinear" else None)
+        if crop_size is not None:
+            ch, cw = crop_size
+            cur_H2, cur_W2 = t.shape[2], t.shape[3]
+            y0 = (cur_H2 - ch) // 2
+            x0 = (cur_W2 - cw) // 2
+            t = t[:, :, y0:y0 + ch, x0:x0 + cw]
+        out = t.squeeze(0).numpy()
+        if is_rgb:
+            out = np.clip(out.transpose(1, 2, 0), 0, 255).astype(np.uint8)
+        else:
+            out = out.squeeze(0)
+        return out
+
+    # ---- Layout ----
+    # Each sample occupies 2 rows: raw (top) + preprocessed (bottom)
+    N_COLS = 7
+    N_ROWS = n_samples * 2
+    row_h = 3.5
+    fig, axes = plt.subplots(N_ROWS, N_COLS, figsize=(N_COLS * 4.2, N_ROWS * row_h))
+    if N_ROWS == 1:
+        axes = axes[np.newaxis, :]
+
+    preproc_label = ""
+    if resize_hw is not None:
+        preproc_label += f"resize→{resize_hw[1]}×{resize_hw[0]}"
+    if crop_size is not None:
+        if preproc_label:
+            preproc_label += " + "
+        preproc_label += f"center-crop→{crop_size[1]}×{crop_size[0]}"
+    if not preproc_label:
+        preproc_label = "no resize/crop"
+
+    def _annotate(ax, W: int, H: int, title: str, frame_idx: Optional[int] = None) -> None:
+        full_title = f"[HDF idx {frame_idx}]  {title}" if frame_idx is not None else title
+        ax.set_title(full_title, fontsize=8, pad=3)
+        ax.text(
+            0.01, 0.99, f"{W}×{H}",
+            color="white", fontsize=7, fontweight="bold",
+            transform=ax.transAxes, va="top", ha="left",
+            bbox=dict(boxstyle="round,pad=0.15", facecolor="black", alpha=0.65),
+        )
+        ax.axis("off")
+
+    def _na(ax, title: str) -> None:
+        ax.set_title(title, fontsize=8, pad=3)
+        ax.text(0.5, 0.5, "N/A", ha="center", va="center",
+                transform=ax.transAxes, fontsize=12, color="gray")
+        ax.axis("off")
+
+    def _blank(ax) -> None:
+        ax.axis("off")
+
+    for sample_i, frame_idx in enumerate(frame_indices):
+        raw_row = sample_i * 2          # top row  — raw data
+        pre_row = sample_i * 2 + 1     # bottom row — after preprocessing
+
+        # ================================================================
+        # RAW ROW
+        # ================================================================
+
+        # --- 1. Raw depth ---
+        with h5py.File(raw_depth_path, "r") as _f:
+            raw_d = _f[raw_depth_key][frame_idx].astype(np.float32)
+        raw_d_m = raw_d / 1000.0 if raw_d.max() > 100.0 else raw_d
+        ax = axes[raw_row, 0]
+        ax.imshow(raw_d_m, cmap="plasma", vmin=0.0, vmax=2.5)
+        _annotate(ax, depth_W, depth_H, "Depth (Realsense)", frame_idx=frame_idx)
+
+        # --- 2. Raw depth mask ---
+        raw_mask_arr = ((raw_d_m > 0.01) & (raw_d_m < 5.0)).astype(np.float32)
+        ax = axes[raw_row, 1]
+        ax.imshow(raw_mask_arr, cmap="gray", vmin=0, vmax=1)
+        _annotate(ax, depth_W, depth_H, "Depth Mask")
+
+        # --- 3. Projected depth (event plane) ---
+        proj_d: Optional[np.ndarray] = None
+        ax = axes[raw_row, 2]
+        if projected_path.exists():
+            with h5py.File(projected_path, "r") as _f:
+                proj_d = _f["depth"][frame_idx].astype(np.float32)
+            ax.imshow(proj_d, cmap="plasma", vmin=0.0, vmax=2.5)
+            _annotate(ax, proj_W, proj_H, "Projected Depth")
+        else:
+            _na(ax, "Projected Depth")
+
+        # --- 4. Event plane mask ---
+        ax = axes[raw_row, 3]
+        proj_mask_arr: Optional[np.ndarray] = None
+        if proj_d is not None:
+            proj_mask_arr = ((proj_d > 0.01) & (proj_d < 5.0)).astype(np.float32)
+            ax.imshow(proj_mask_arr, cmap="gray", vmin=0, vmax=1)
+            _annotate(ax, proj_W, proj_H, "Event Plane Mask")
+        else:
+            _na(ax, "Event Plane Mask")
+
+        # --- 5. Accumulated events ---
+        voxel: Optional[np.ndarray] = None
+        ax = axes[raw_row, 4]
+        if voxels_dir is not None:
+            vp = voxels_dir / f"voxel_{frame_idx:06d}.npy"
+            if vp.exists():
+                voxel = np.load(vp)
+        if voxel is not None:
+            accum = voxel.sum(axis=0)
+            ev_H_v, ev_W_v = accum.shape
+            vmax_ev = float(max(np.abs(accum).max(), 1e-6))
+            ax.imshow(accum, cmap="gray", vmin=-vmax_ev, vmax=vmax_ev)
+            _annotate(ax, ev_W_v, ev_H_v, "Events (Accumulated)")
+        else:
+            _na(ax, "Events (Accumulated)")
+
+        # --- 6. RGB (Realsense raw) ---
+        rgb_frame_raw: Optional[np.ndarray] = None
+        ax = axes[raw_row, 5]
+        if rgb_path is not None:
+            with h5py.File(rgb_path, "r") as _f:
+                rgb_frame_raw = _f[rgb_key][frame_idx]
+            if rgb_frame_raw.dtype != np.uint8:
+                rgb_frame_raw = np.clip(rgb_frame_raw, 0, 255).astype(np.uint8)
+            rgb_H2, rgb_W2 = int(rgb_frame_raw.shape[0]), int(rgb_frame_raw.shape[1])
+            ax.imshow(rgb_frame_raw)
+            _annotate(ax, rgb_W2, rgb_H2, "RGB")
+        else:
+            _na(ax, "RGB")
+
+        # --- 7. Projected RGB (event plane) ---
+        proj_rgb_frame: Optional[np.ndarray] = None
+        ax = axes[raw_row, 6]
+        if proj_rgb_path is not None:
+            with h5py.File(proj_rgb_path, "r") as _f:
+                proj_rgb_frame = _f["rgb"][frame_idx]  # (EH, EW, 3) uint8
+            prh, prw = int(proj_rgb_frame.shape[0]), int(proj_rgb_frame.shape[1])
+            ax.imshow(proj_rgb_frame)
+            _annotate(ax, prw, prh, "Projected RGB")
+        else:
+            _na(ax, "Projected RGB")
+
+        # Row label on the left
+        axes[raw_row, 0].set_ylabel(
+            f"sample {sample_i}  |  RAW", fontsize=9, rotation=90, labelpad=6
+        )
+        axes[raw_row, 0].axis("off")  # restore after set_ylabel touched it
+        _annotate(axes[raw_row, 0], depth_W, depth_H, "Depth (Realsense)", frame_idx=frame_idx)
+
+        # ================================================================
+        # PREPROCESSED ROW  (resize → center-crop applied to event-space data)
+        # ================================================================
+
+        # --- col 0: projected depth after preprocessing ---
+        ax = axes[pre_row, 0]
+        if proj_d is not None:
+            pd_pre = _apply_resize_crop(proj_d)
+            ph, pw = pd_pre.shape
+            ax.imshow(pd_pre, cmap="plasma", vmin=0.0, vmax=2.5)
+            _annotate(ax, pw, ph, f"Proj Depth  [{preproc_label}]")
+        else:
+            _na(ax, f"Proj Depth  [{preproc_label}]")
+
+        # --- col 1: event plane mask after preprocessing ---
+        ax = axes[pre_row, 1]
+        if proj_mask_arr is not None:
+            pm_pre = _apply_resize_crop(proj_mask_arr)
+            ph, pw = pm_pre.shape
+            ax.imshow(pm_pre, cmap="gray", vmin=0, vmax=1)
+            _annotate(ax, pw, ph, f"Event Mask  [{preproc_label}]")
+        else:
+            _na(ax, f"Event Mask  [{preproc_label}]")
+
+        # --- col 2: accumulated events after preprocessing ---
+        ax = axes[pre_row, 2]
+        if voxel is not None:
+            accum_pre = _apply_resize_crop(voxel.sum(axis=0))
+            eh, ew = accum_pre.shape
+            vmax_ev2 = float(max(np.abs(accum_pre).max(), 1e-6))
+            ax.imshow(accum_pre, cmap="gray", vmin=-vmax_ev2, vmax=vmax_ev2)
+            _annotate(ax, ew, eh, f"Events  [{preproc_label}]")
+        else:
+            _na(ax, f"Events  [{preproc_label}]")
+
+        # --- col 3: RGB after preprocessing ---
+        ax = axes[pre_row, 3]
+        if rgb_frame_raw is not None:
+            rgb_pre = _apply_resize_crop(rgb_frame_raw)
+            rh2, rw2 = int(rgb_pre.shape[0]), int(rgb_pre.shape[1])
+            ax.imshow(rgb_pre)
+            _annotate(ax, rw2, rh2, f"RGB  [{preproc_label}]")
+        else:
+            _na(ax, f"RGB  [{preproc_label}]")
+
+        # --- col 4: pose depth (raw, event resolution) ---
+        ax = axes[pre_row, 4]
+        pose_depth_raw: Optional[np.ndarray] = None
+        if pose_voxels_dir is not None:
+            pvp = pose_voxels_dir / f"voxel_{frame_idx:06d}.npy"
+            if pvp.exists():
+                pose_voxel = np.load(pvp)
+                pose_depth_raw = pose_voxel[-1]  # last channel is pose depth
+                pdh0, pdw0 = pose_depth_raw.shape
+                ax.imshow(pose_depth_raw, cmap="viridis", vmin=0, vmax=1)
+                _annotate(ax, pdw0, pdh0, "Pose Depth (raw)")
+            else:
+                _na(ax, "Pose Depth (raw)")
+        else:
+            _na(ax, "Pose Depth (raw)")
+
+        # --- col 5: pose depth (preprocessed) ---
+        ax = axes[pre_row, 5]
+        if pose_depth_raw is not None:
+            pd_pre2 = _apply_resize_crop(pose_depth_raw)
+            pdh, pdw = pd_pre2.shape
+            ax.imshow(pd_pre2, cmap="viridis", vmin=0, vmax=1)
+            _annotate(ax, pdw, pdh, f"Pose Depth  [{preproc_label}]")
+        else:
+            _na(ax, f"Pose Depth  [{preproc_label}]")
+
+        axes[pre_row, 0].set_ylabel(
+            f"sample {sample_i}  |  PREPROCESSED", fontsize=9, rotation=90, labelpad=6
+        )
+        axes[pre_row, 0].axis("off")
+        if proj_d is not None:
+            _annotate(axes[pre_row, 0], pw, ph, f"Proj Depth  [{preproc_label}]")
+        else:
+            _na(axes[pre_row, 0], f"Proj Depth  [{preproc_label}]")
+
+        # --- col 6: total mask (depth mask & ~white RGB mask) after preprocessing ---
+        ax = axes[pre_row, 6]
+        if proj_mask_arr is not None:
+            total_mask = proj_mask_arr.copy()  # depth range mask
+            if rgb_mask and proj_rgb_frame is not None:
+                white_mask = np.all(proj_rgb_frame > 200, axis=-1)  # (H, W)
+                total_mask[white_mask] = 0.0
+            tm_pre = _apply_resize_crop(total_mask)
+            tmh, tmw = tm_pre.shape
+            ax.imshow(tm_pre, cmap="gray", vmin=0, vmax=1)
+            label = "Total Mask (depth + RGB)" if (rgb_mask and proj_rgb_frame is not None) else "Total Mask (depth only)"
+            _annotate(ax, tmw, tmh, f"{label}  [{preproc_label}]")
+        else:
+            _na(ax, f"Total Mask  [{preproc_label}]")
+
+    fig.suptitle(
+        f"Debug — {seq_dir.name}   "
+        f"(HDF frame indices: {', '.join(str(i) for i in frame_indices)})  "
+        f"— preprocessing: {preproc_label}",
+        fontsize=11, fontweight="bold",
+    )
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[debug_viz] Saved → {out_path}")
+
+
+# -----------------------------
+# GPU Monitoring
+# -----------------------------
+def get_gpu_stats(device: torch.device) -> Dict[str, float]:
+    """Return GPU utilization (%) and VRAM usage (MB) for the given device."""
+    stats: Dict[str, float] = {}
+    if device.type != "cuda":
+        return stats
+
+    gpu_idx = device.index if device.index is not None else torch.cuda.current_device()
+
+    # VRAM via PyTorch (always available)
+    stats["vram_used_mb"] = torch.cuda.memory_allocated(gpu_idx) / 1024 ** 2
+    stats["vram_reserved_mb"] = torch.cuda.memory_reserved(gpu_idx) / 1024 ** 2
+
+    # GPU utilization via pynvml (optional)
+    if _NVML_AVAILABLE:
+        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_idx)
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        stats["gpu_util_pct"] = float(util.gpu)
+
+    return stats
 
 
 # -----------------------------
@@ -745,6 +1148,8 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     lambda_grad: float = 0.5,
+    epoch: int = 0,
+    log_interval: float = 10.0,
 ) -> Dict[str, float]:
     """Train for one epoch with sequence processing."""
     model.train()
@@ -753,7 +1158,11 @@ def train_one_epoch(
     total_si = 0.0
     total_grad = 0.0
     n_batches = 0
-    
+    n_total = len(loader)
+
+    last_log_time = time.time()
+    epoch_start = time.time()
+
     for events, depths, masks in loader:
         # events: (B, T, C, H, W)
         # depths: (B, T, 1, H, W)
@@ -788,7 +1197,22 @@ def train_one_epoch(
         total_si += batch_si / T
         total_grad += batch_grad / T
         n_batches += 1
-    
+
+        now = time.time()
+        if now - last_log_time >= log_interval:
+            elapsed = now - epoch_start
+            batches_per_sec = n_batches / elapsed if elapsed > 0 else 0
+            eta_sec = (n_total - n_batches) / batches_per_sec if batches_per_sec > 0 else 0
+            avg_loss = total_loss / n_batches
+            print(
+                f"  [Epoch {epoch:03d}] {n_batches}/{n_total} batches "
+                f"| loss: {avg_loss:.5f} "
+                f"| {batches_per_sec:.1f} batch/s "
+                f"| ETA: {int(eta_sec // 60):02d}:{int(eta_sec % 60):02d}",
+                flush=True,
+            )
+            last_log_time = now
+
     return {
         "total": total_loss / max(1, n_batches),
         "si": total_si / max(1, n_batches),
@@ -866,44 +1290,57 @@ def log_images(
     loader: DataLoader,
     device: torch.device,
     epoch: int,
-    max_images: int = 4,
+    split: str = "val",
+    n_images: int = 3,
 ):
-    """Log sample predictions to TensorBoard."""
+    """Log n_images sample predictions to TensorBoard under '<split>/sample_N/…'."""
+    from torch.utils.data import Subset
+
     model.eval()
-    
+
+    dataset = loader.dataset
+    n = len(dataset)
+    indices = torch.randperm(n)[:n_images].tolist()
+    subset_loader = DataLoader(
+        Subset(dataset, indices),
+        batch_size=n_images,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=loader.collate_fn if hasattr(loader, "collate_fn") and loader.collate_fn is not None else None,
+    )
+
     with torch.no_grad():
-        for i, (events, depths, masks) in enumerate(loader):
-            if i >= 1:
-                break
-            
+        for events, depths, masks in subset_loader:
             B, T = events.shape[:2]
             events = events.to(device)
             depths = depths.to(device)
             masks = masks.to(device)
-            
+
             # Process full sequence
             states = None
             for t in range(T):
                 pred, states = model(events[:, t], states)
-            
+
             # Log last frame predictions
-            for j in range(min(max_images, B)):
+            for j in range(B):
                 ev_img = events[j, -1]
                 if ev_img.shape[0] >= 3:
                     ev_img = ev_img[:3]
                 else:
                     ev_img = ev_img[0:1]
-                
-                # Normalize for display
+
                 ev_img = (ev_img - ev_img.min()) / (ev_img.max() - ev_img.min() + 1e-6)
-                gt_img = depths[j, -1]
-                pred_img = pred[j]
-                err_img = torch.abs(pred[j] - depths[j, -1]) * masks[j, -1]
-                
-                writer.add_image(f"sample_{j}/input_events", ev_img, epoch)
-                writer.add_image(f"sample_{j}/gt_log_depth", gt_img, epoch)
-                writer.add_image(f"sample_{j}/pred_log_depth", pred_img, epoch)
-                writer.add_image(f"sample_{j}/error", err_img / (err_img.max() + 1e-6), epoch)
+                mask_img = masks[j, -1]          # total mask (depth + rgb if enabled)
+                gt_img = depths[j, -1] * mask_img
+                pred_img = pred[j] * mask_img
+                err_img = torch.abs(pred[j] - depths[j, -1]) * mask_img
+
+                tag = f"{split}/sample_{j}"
+                writer.add_image(f"{tag}/input_events", ev_img, epoch)
+                writer.add_image(f"{tag}/gt_log_depth", gt_img, epoch)
+                writer.add_image(f"{tag}/pred_log_depth", pred_img, epoch)
+                writer.add_image(f"{tag}/total_mask", mask_img, epoch)
+                writer.add_image(f"{tag}/error", err_img / (err_img.max() + 1e-6), epoch)
 
 
 # -----------------------------
@@ -929,6 +1366,10 @@ def main():
                            help="Maximum depth in meters")
     data_group.add_argument("--depth_min", type=float, default=0.05,
                            help="Minimum depth in meters")
+    data_group.add_argument("--use_pose", action="store_true",
+                           help="Use precomputed pose depth channel (from voxels_pose_cam0/)")
+    data_group.add_argument("--rgb_mask", action="store_true",
+                           help="Mask out white pixels using projected RGB (from rgb_in_event_frame.h5)")
     
     # Model (paper defaults)
     model_group = parser.add_argument_group("Model")
@@ -943,19 +1384,23 @@ def main():
     train_group = parser.add_argument_group("Training")
     train_group.add_argument("--epochs", type=int, default=300,
                             help="Number of epochs")
-    train_group.add_argument("--batch", type=int, default=8,
+    train_group.add_argument("--batch", type=int, default=10,
                             help="Batch size")
-    train_group.add_argument("--seq_len", type=int, default=8,
+    train_group.add_argument("--seq_len", type=int, default=10,
                             help="Sequence length for recurrent training")
     train_group.add_argument("--lr", type=float, default=1e-4,
                             help="Learning rate")
     train_group.add_argument("--lambda_grad", type=float, default=0.5,
                             help="Weight for gradient loss (λ in paper)")
     train_group.add_argument("--num_workers", type=int, default=4)
-    train_group.add_argument("--crop_h", type=int, default=0,
-                            help="Random crop height (0=no crop)")
-    train_group.add_argument("--crop_w", type=int, default=0,
-                            help="Random crop width (0=no crop)")
+    train_group.add_argument("--crop_h", type=int, default=240,
+                            help="Center crop height in pixels (0=no crop)")
+    train_group.add_argument("--crop_w", type=int, default=320,
+                            help="Center crop width in pixels (0=no crop)")
+    train_group.add_argument("--resize_h", type=int, default=288,
+                            help="Resize height before crop/augmentation (0=no resize)")
+    train_group.add_argument("--resize_w", type=int, default=384,
+                            help="Resize width before crop/augmentation (0=no resize)")
     
     # Output
     out_group = parser.add_argument_group("Output")
@@ -964,7 +1409,21 @@ def main():
                           help="Save checkpoint every N epochs")
     out_group.add_argument("--resume", type=str, default=None,
                           help="Path to checkpoint to resume from")
-    
+
+    # Debug
+    dbg_group = parser.add_argument_group("Debug")
+    dbg_group.add_argument("--debug_viz", action="store_true",
+                           help="Generate a debug PNG of sample inputs and exit (no training)")
+    dbg_group.add_argument("--debug_n", type=int, default=3,
+                           help="Number of random timestamps shown in debug PNG")
+    dbg_group.add_argument("--debug_out", type=str, default="debug_viz.png",
+                           help="Output path for the debug PNG")
+    dbg_group.add_argument("--debug_seed", type=int, default=None,
+                           help="Random seed for timestamp sampling in debug mode")
+    dbg_group.add_argument("--debug_seq", type=str, default=None,
+                           help="Specific sequence directory to visualize "
+                                "(default: first found via --data_dir / --data_root)")
+
     args = parser.parse_args()
     
     # Find sequences
@@ -974,35 +1433,70 @@ def main():
         sequence_dirs = find_sequence_dirs(Path(args.data_root))
         if not sequence_dirs:
             print(f"No valid sequences found in {args.data_root}")
-            print("Expected structure: <dir>/hdf5/depth.h5 and <dir>/events/events.npy")
+            print("Expected: <dir>/hdf5/realsense.h5 + <dir>/events/voxels_cam0/")
             return
     
     print(f"Found {len(sequence_dirs)} sequences:")
     for d in sequence_dirs:
         print(f"  - {d.name}")
-    
+
+    # Debug visualization mode — generate PNG and exit
+    if args.debug_viz:
+        if args.debug_seq:
+            dbg_seq = Path(args.debug_seq)
+        else:
+            dbg_seq = sequence_dirs[0]
+        dbg_resize_hw = None
+        if args.resize_h > 0 and args.resize_w > 0:
+            dbg_resize_hw = (args.resize_h, args.resize_w)
+        dbg_crop_size = None
+        if args.crop_h > 0 and args.crop_w > 0:
+            dbg_crop_size = (args.crop_h, args.crop_w)
+        debug_visualize(
+            str(dbg_seq),
+            n_samples=args.debug_n,
+            out_path=args.debug_out,
+            num_bins=args.num_bins,
+            seed=args.debug_seed,
+            resize_hw=dbg_resize_hw,
+            crop_size=dbg_crop_size,
+            use_pose=args.use_pose,
+            rgb_mask=args.rgb_mask,
+        )
+        return
+
     # Config
     crop_size = None
     if args.crop_h > 0 and args.crop_w > 0:
         crop_size = (args.crop_h, args.crop_w)
+
+    resize_hw = None
+    if args.resize_h > 0 and args.resize_w > 0:
+        resize_hw = (args.resize_h, args.resize_w)
     
     cfg = DataConfig(
         seq_len=args.seq_len,
         crop_size=crop_size,
+        resize_hw=resize_hw,
         depth_max=args.depth_max,
         depth_min=args.depth_min,
         augment=True,
         num_bins=args.num_bins,
+        use_pose=args.use_pose,
+        rgb_mask=args.rgb_mask,
     )
     
     # Create config without augmentation for validation
     cfg_val = DataConfig(
         seq_len=args.seq_len,
         crop_size=crop_size,
+        resize_hw=resize_hw,
         depth_max=args.depth_max,
         depth_min=args.depth_min,
         augment=False,
         num_bins=args.num_bins,
+        use_pose=args.use_pose,
+        rgb_mask=args.rgb_mask,
     )
     
     # Datasets (split each sequence into train/val)
@@ -1021,15 +1515,17 @@ def main():
     print(f"  Valid samples: {len(val_ds)}")
     print(f"  Depth range: {args.depth_min:.2f}m - {args.depth_max:.2f}m")
     print(f"  Voxel bins: {args.num_bins}")
+    print(f"  Use pose: {args.use_pose}")
+    print(f"  RGB mask: {args.rgb_mask}")
     print(f"{'='*60}\n")
     
     train_loader = DataLoader(
         train_ds, batch_size=args.batch, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        num_workers=args.num_workers, pin_memory=True, drop_last=True, persistent_workers=True
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True,
+        num_workers=args.num_workers, pin_memory=True, persistent_workers=True
     )
     
     # Device
@@ -1038,9 +1534,9 @@ def main():
     if device.type == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
     
-    # Input channels = num_bins
-    in_channels = args.num_bins
-    print(f"Input channels: {in_channels}")
+    # Input channels = num_bins (+ 1 if using pose)
+    in_channels = args.num_bins + (1 if args.use_pose else 0)
+    print(f"Input channels: {in_channels} (bins={args.num_bins}, pose={'yes' if args.use_pose else 'no'})")
     
     # Model
     model = E2DepthNet(
@@ -1049,6 +1545,8 @@ def main():
         num_encoders=args.num_encoders,
         num_residuals=args.num_residuals,
     ).to(device)
+
+    #model = torch.compile(model)
     
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
@@ -1081,7 +1579,7 @@ def main():
     # Training loop
     for epoch in range(start_epoch, args.epochs + 1):
         train_metrics = train_one_epoch(
-            model, train_loader, optimizer, device, lambda_grad=args.lambda_grad
+            model, train_loader, optimizer, device, lambda_grad=args.lambda_grad, epoch=epoch
         )
         val_metrics = validate(model, val_loader, device)
         
@@ -1096,12 +1594,23 @@ def main():
         writer.add_scalar("loss/val_l1_metric", val_metrics["l1_metric"], epoch)
         writer.add_scalar("loss/val_abs_rel", val_metrics["abs_rel"], epoch)
         writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch)
-        
+
+        # GPU stats
+        gpu_stats = get_gpu_stats(device)
+        if gpu_stats:
+            writer.add_scalar("gpu/vram_used_mb", gpu_stats["vram_used_mb"], epoch)
+            writer.add_scalar("gpu/vram_reserved_mb", gpu_stats["vram_reserved_mb"], epoch)
+            if "gpu_util_pct" in gpu_stats:
+                writer.add_scalar("gpu/utilization_pct", gpu_stats["gpu_util_pct"], epoch)
+
         print(f"Epoch {epoch:03d} | train: {train_metrics['total']:.5f} "
               f"| val SI: {val_metrics['si']:.5f} | val L1: {val_metrics['l1_metric']:.3f}m "
               f"| val AbsRel: {val_metrics['abs_rel']:.4f}")
         print(f"          | pred_log: {val_metrics['pred_log_mean']:.3f} vs gt_log: {val_metrics['gt_log_mean']:.3f} "
               f"| pred_m: {val_metrics['pred_metric_mean']:.3f}m vs gt_m: {val_metrics['gt_metric_mean']:.3f}m")
+        if gpu_stats:
+            util_str = f" | GPU util: {gpu_stats['gpu_util_pct']:.0f}%" if "gpu_util_pct" in gpu_stats else ""
+            print(f"          | VRAM: {gpu_stats['vram_used_mb']:.0f}/{gpu_stats['vram_reserved_mb']:.0f} MB (used/reserved){util_str}")
         
         # Save best
         if val_metrics["si"] < best_val_loss:
@@ -1118,6 +1627,7 @@ def main():
                     "num_residuals": args.num_residuals,
                     "depth_max": args.depth_max,
                     "depth_min": args.depth_min,
+                    "use_pose": args.use_pose,
                 },
             }, os.path.join(args.out_dir, "best.pt"))
             print(f"  -> Saved best model (val SI: {best_val_loss:.5f})")
@@ -1133,7 +1643,8 @@ def main():
         
         # Log images
         if epoch % 5 == 0 or epoch == 1:
-            log_images(writer, model, val_loader, device, epoch)
+            log_images(writer, model, val_loader, device, epoch, split="val", n_images=3)
+            log_images(writer, model, train_loader, device, epoch, split="train", n_images=3)
     
     writer.close()
     print(f"\nTraining complete! Best val SI: {best_val_loss:.5f}")

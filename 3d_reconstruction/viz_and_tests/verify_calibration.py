@@ -68,7 +68,7 @@ def _make_charuco():
 def _detect(image, detector):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     corners, ids, _, _ = detector.detectBoard(gray)
-    if corners is not None and len(corners) >= 4:
+    if corners is not None and len(corners) >= 8:
         return corners, ids
     return None, None
 
@@ -458,7 +458,7 @@ def _project_and_draw(src_img, tgt_img, src_K, src_dist, tgt_K, tgt_dist,
 
         # Cross-camera reprojection error for common corner IDs
         common = np.intersect1d(sids.flatten(), tids.flatten())
-        if len(common) >= 4:
+        if len(common) >= 8:
             proj_common = proj[common]          # proj indexed by global corner id
             tm = np.isin(tids.flatten(), common)
             t_order = np.argsort(tids.flatten()[tm])

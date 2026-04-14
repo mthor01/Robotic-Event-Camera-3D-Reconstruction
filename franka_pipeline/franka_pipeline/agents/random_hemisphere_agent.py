@@ -1,5 +1,6 @@
 # Random Hemisphere Agent - samples random poses inside a hemisphere, always looking at target point
 
+import os
 import time
 from typing import Any, Dict, Tuple
 
@@ -21,11 +22,12 @@ class RandomHemisphereAgent(Agent):
     Agent that moves to random positions inside a hemisphere (upper half of sphere),
     always looking at a target point.
     
-    The camera (end-effector z-axis) always points toward the target point,
-    which is where the object should be placed.
+    The depth camera's optical axis (z-axis) always points toward the target point,
+    using extrinsic calibration data to account for the offset between the
+    end-effector frame and the depth camera frame.
     
     During transitions between poses, intermediate waypoints are generated to keep
-    the camera continuously pointing at the target.
+    the depth camera continuously pointing at the target.
     """
 
     def __init__(
@@ -43,6 +45,7 @@ class RandomHemisphereAgent(Agent):
         base_max_radius: float = 0.65,
         min_z_height: float = 0.1,
         lock_rotation_horizontal: bool = True,
+        calibration_dir: str = None,
     ) -> None:
         """
         Args:
@@ -53,12 +56,14 @@ class RandomHemisphereAgent(Agent):
             wait_time: Time to wait at each pose in seconds. Default: 0.0
             seed: Random seed for reproducibility. Default: None
             loop: If True, loop forever; if False, stop after visiting all poses.
-            target_point: Point the camera looks at [x, y, z]. Default: [0.35, 0, -0.1]
+            target_point: Point the depth camera looks at [x, y, z]. Default: [0.35, 0, -0.1]
             waypoints_per_transition: Number of intermediate waypoints between main poses. Default: 5
             base_exclusion_radius: Exclude poses within this x,y radius of robot base (0,0). Default: 0.35
             base_max_radius: Exclude poses beyond this x,y radius of robot base (0,0). Default: 0.65
             min_z_height: Minimum z-height for poses (table level). Default: 0.1
-            lock_rotation_horizontal: If True, keep Y-axis parallel to table. If False, allow random roll. Default: True
+            lock_rotation_horizontal: If True, keep depth camera image upright. If False, allow random roll. Default: True
+            calibration_dir: Path to directory containing T_rgb_from_ee.npz and T_color_from_depth.npz.
+                Default: 3d_reconstruction/camera_data/ relative to the project root.
         """
         super().__init__(action_type="OSC_POSE")
         
@@ -80,6 +85,18 @@ class RandomHemisphereAgent(Agent):
         self.base_max_radius = base_max_radius
         self.min_z_height = min_z_height
         self.lock_rotation_horizontal = lock_rotation_horizontal
+        
+        # Load calibration data: compute T_depth_from_ee
+        if calibration_dir is None:
+            calibration_dir = os.path.join(
+                os.path.dirname(__file__), '..', '..', '..',
+                '3d_reconstruction', 'camera_data'
+            )
+        T_rgb_from_ee = np.load(os.path.join(calibration_dir, 'T_rgb_from_ee.npz'))['T']
+        T_color_from_depth = np.load(os.path.join(calibration_dir, 'T_color_from_depth.npz'))['T']
+        T_depth_from_ee = np.linalg.inv(T_color_from_depth) @ T_rgb_from_ee
+        self.R_depth_from_ee = T_depth_from_ee[:3, :3]
+        logger.info(f"Loaded depth camera calibration from {calibration_dir}")
         
         # Set random seed if provided
         if seed is not None:
@@ -264,53 +281,55 @@ class RandomHemisphereAgent(Agent):
 
     def _quat_from_z_direction(self, z_dir: np.ndarray) -> np.ndarray:
         """
-        Create a quaternion where the z-axis points in the given direction.
-        Uses the same convention as HemisphereGridAgent to ensure reachable orientations.
+        Create a quaternion for the EE such that the depth camera's optical
+        axis (z-axis) points in the given direction.
+        
+        Uses the extrinsic calibration (R_depth_from_ee) to compute the
+        required EE orientation from the desired depth camera pointing direction.
         
         Args:
-            z_dir: Unit vector for the desired z-axis direction
+            z_dir: Unit vector for the desired depth camera z-axis direction
             
         Returns:
             Quaternion [qx, qy, qz, qw]
         """
         z = z_dir / np.linalg.norm(z_dir)
         
+        # Build desired depth camera rotation in world frame:
+        # z_cam = desired direction, keep image upright
+        # Camera convention: x = image right, y = image down, z = forward
+        # For a horizontally-aligned image, x (image right) must be horizontal.
         if self.lock_rotation_horizontal:
-            # Use world up to keep y-axis horizontal (same as HemisphereGridAgent)
             world_up = np.array([0.0, 0.0, 1.0])
             
-            # Make EE y-axis horizontal and perpendicular to z
-            y = np.cross(z, world_up)
-            if np.linalg.norm(y) < 1e-8:
-                y = np.array([0.0, 1.0, 0.0])
+            # Depth camera x-axis (image right) horizontal and perpendicular to z
+            x = np.cross(z, world_up)
+            if np.linalg.norm(x) < 1e-8:
+                x = np.array([0.0, 1.0, 0.0])
+            x = x / np.linalg.norm(x)
+            y = np.cross(z, x)
             y = y / np.linalg.norm(y)
         else:
-            # Allow random roll: pick a random vector perpendicular to z
-            # Generate a random vector not parallel to z
+            # Allow random roll
             random_vec = np.random.randn(3)
             random_vec = random_vec / np.linalg.norm(random_vec)
             
-            # Make it perpendicular to z using Gram-Schmidt
-            y = random_vec - np.dot(random_vec, z) * z
-            if np.linalg.norm(y) < 1e-8:
-                # If random vector was parallel to z, use a fallback
-                y = np.array([0.0, 1.0, 0.0]) - np.dot(np.array([0.0, 1.0, 0.0]), z) * z
+            x = random_vec - np.dot(random_vec, z) * z
+            if np.linalg.norm(x) < 1e-8:
+                x = np.array([0.0, 1.0, 0.0]) - np.dot(np.array([0.0, 1.0, 0.0]), z) * z
+            x = x / np.linalg.norm(x)
+            y = np.cross(z, x)
             y = y / np.linalg.norm(y)
         
-        # Right-hand rule to get x
-        x = np.cross(y, z)
-        x = x / np.linalg.norm(x)
+        # R_world_from_depth: desired depth camera orientation in world frame
+        R_world_from_depth = np.column_stack([x, y, z])
         
-        # Build rotation matrix [x, y, z] as columns
-        R = np.column_stack([x, y, z])
-        
-        # CRITICAL: Apply the same axis flips as HemisphereGridAgent
-        # This matches the Franka end-effector coordinate convention
-        R[:, 0] *= -1
-        R[:, 1] *= -1
+        # Compute required EE orientation using calibration:
+        # R_world_from_ee = R_world_from_depth @ R_depth_from_ee
+        R_world_from_ee = R_world_from_depth @ self.R_depth_from_ee
         
         # Convert to quaternion
-        quat = Rotation.from_matrix(R).as_quat()  # [qx, qy, qz, qw]
+        quat = Rotation.from_matrix(R_world_from_ee).as_quat()  # [qx, qy, qz, qw]
         
         # Normalize and ensure consistent hemisphere
         quat = quat / np.linalg.norm(quat)

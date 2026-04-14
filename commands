@@ -24,9 +24,9 @@ docker run --gpus all -it --rm \
   -v "$(pwd):/work/project" \
   -e POSE_PUB_BIND=tcp://0.0.0.0:6000 \
   -e DISPLAY=$DISPLAY \
-  -e XAUTHORITY=$XAUTHORITY \
+  -e XAUTHORITY=${XAUTHORITY:-$HOME/.Xauthority} \
   -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-  -v "$XAUTHORITY:$XAUTHORITY:ro" \
+  -v "${XAUTHORITY:-$HOME/.Xauthority}:${XAUTHORITY:-$HOME/.Xauthority}:ro" \
   meta_and_pytorch \
   bash -c "cd /work/project/3d_reconstruction && exec bash"
 
@@ -52,7 +52,6 @@ python3 train_e2depth.py --data_dir test_data --batch 4 --seq_len 4 --all_sequen
 sudo chown -R $USER:$USER *
 sudo chown -R mthormann:cs_stud *
 
-cd project/franka_pipeline
 python3 my_main.py --synthetic-data --object-filter "cube,milk,bottle" --headless
 
 
@@ -63,19 +62,16 @@ docker run --rm -it \
   
   
   
-  
-  e2vid
-  
-xhost +local:docker
-docker run --rm -it --gpus all \
-  -e DISPLAY=$DISPLAY \
-  -v /tmp/.X11-unix:/tmp/.X11-unix \
-  -v "$(pwd):/workspace/project" \
-  e2vid 
+##########Calibration############
+python my_main.py --real-robot --calibration-poses calibration_poses.npy --agent-type multi_cam_calibrate --no-wiggle
 
-python3 run_reconstruction.py \
-  -c pretrained/E2VID_lightweight.pth.tar \
-  -i data/dynamic_6dof.zip \
-  --auto_hdr \
-  --output_folder output \
-  --show_events
+python3 calibration_recording_and_calibration.py --output-dir camera_data
+
+python3 verify_calibration.py --data-dir camera_data
+
+python 3d_reconstruction/projection_check.py --data-dir camera_data --out-dir proj_vis
+
+##########Training################
+python3 project_realsense_to_event.py --data_dir data/real/1 
+
+tensorboard --logdir=checkpoints_e2depth

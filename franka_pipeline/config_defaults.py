@@ -24,7 +24,7 @@ DEPS_LOG_LEVEL = "INFO"
 # =============================================================================
 ZMQ_BIND = os.getenv("POSE_PUB_BIND", "tcp://0.0.0.0:6000")
 ZMQ_SYNC_BIND = os.getenv("SYNC_BIND", "tcp://0.0.0.0:6001")
-PUBLISH_HZ = 60.0
+PUBLISH_HZ = 100.0  # Match Deoxys state publisher rate (100 Hz)
 
 # =============================================================================
 # SYNC RECORDING
@@ -76,18 +76,24 @@ SPHERE_CENTER_Z = 0.4
 
 # Target point (where the camera looks at)
 # For RandomHemisphereAgent, this is also the center of the hemisphere
-TARGET_X = 0.35
+TARGET_X = 0.3
 TARGET_Y = 0.0
-TARGET_Z = 0.15
+TARGET_Z = 0.05
 
 # Sphere/Hemisphere radius
-SPHERE_RADIUS = 0.3
+SPHERE_RADIUS = 0.4
 
 # Inner radius for hollow hemisphere (RandomHemisphereAgent only)
-INNER_RADIUS = 0.05
+INNER_RADIUS = 0.15
 
 # Number of random poses to generate
-NUM_POSES = 15
+NUM_POSES = 20
+
+# =============================================================================
+# WAYPOINT INTERPOLATION
+# =============================================================================
+# Number of intermediate waypoints between main poses
+WAYPOINTS_PER_TRANSITION = 2
 
 # Time to wait at each pose (seconds)
 WAIT_TIME = 0.0
@@ -99,19 +105,15 @@ RANDOM_SEED = None
 # SAFETY ZONE PARAMETERS (for RandomSphereAgent and RandomHemisphereAgent)
 # =============================================================================
 # Exclude poses within this x,y radius of robot base (0,0)
-BASE_EXCLUSION_RADIUS = 0.35
+BASE_EXCLUSION_RADIUS = 0.4
 
 # Exclude poses beyond this x,y radius of robot base (0,0)
-BASE_MAX_RADIUS = 0.5
+BASE_MAX_RADIUS = 0.55
 
 # Minimum z-height for poses (table level)
-MIN_Z_HEIGHT = 0.2
+MIN_Z_HEIGHT = 0.15
 
-# =============================================================================
-# WAYPOINT INTERPOLATION
-# =============================================================================
-# Number of intermediate waypoints between main poses
-WAYPOINTS_PER_TRANSITION = 1
+
 
 # =============================================================================
 # ROTATION CONTROL

@@ -9,10 +9,12 @@ Usage:
         [--zmq-bind tcp://0.0.0.0:6002] [--output-dir camera_data]
 
 Protocol  (this script = REP,  agent in Docker A = REQ):
-    INIT          ->  initialise, reply READY
+    INIT          ->  initialise, reply READY (data preserved between rounds)
     POSE_REACHED  ->  capture RS RGB, start event accumulation, reply RGB_CAPTURED
     WIGGLE_DONE   ->  stop event accumulation, reply EVENT_CAPTURED
-    ALL_DONE      ->  run calibration pipeline, reply success / fail
+    ALL_DONE      ->  if more rounds: wait for user to reposition board,
+                      reply ROUND_COMPLETE with more_rounds=True;
+                      if final round: run calibration, reply CALIBRATION_COMPLETE
 
 Outputs (saved to --output-dir):
     rgb_frames/rgb_XXX.png                       RGB images
@@ -134,7 +136,7 @@ def _detect(image, detector):
     """Detect ChArUco corners. Returns (corners, ids) or (None, None)."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     corners, ids, _, _ = detector.detectBoard(gray)
-    if corners is not None and len(corners) >= 4:
+    if corners is not None and len(corners) >= 8:
         return corners, ids
     return None, None
 
@@ -188,7 +190,7 @@ def calibrate_stereo(rgb_imgs, ev_imgs, K_rgb, d_rgb, K_ev, d_ev,
             continue
 
         common = np.intersect1d(i1.flatten(), i2.flatten())
-        if len(common) < 6:
+        if len(common) < 8:
             continue
 
         m1 = np.isin(i1.flatten(), common)
@@ -239,9 +241,15 @@ def _rs_intrinsics_to_Kd(intr):
 #  Server
 # ═══════════════════════════════════════════════════════════════════════
 class CalibrationRecordingServer:
-    def __init__(self, bind_addr: str, output_dir: str):
+    def __init__(self, bind_addr: str, output_dir: str, num_rounds: int = 5):
         self.output = Path(output_dir)
         self.output.mkdir(parents=True, exist_ok=True)
+
+        # Multi-round tracking
+        self._num_rounds = num_rounds
+        self._current_round = 1
+        self._global_img_idx = 0
+        self._poses_per_round: int | None = None  # set from first INIT
 
         # ZMQ REP
         self._ctx = zmq.Context()
@@ -278,6 +286,7 @@ class CalibrationRecordingServer:
 
         print(f"[server] ZMQ REP bound on {bind_addr}")
         print(f"[server] Output directory: {self.output}")
+        print(f"[server] Calibration rounds: {self._num_rounds}")
 
     # ── camera init ─────────────────────────────────────────────────
     def _start_realsense(self):
@@ -386,10 +395,14 @@ class CalibrationRecordingServer:
 
             if cmd == "INIT":
                 n = msg.get("num_poses", "?")
-                print(f"\n[server] INIT  ({n} poses)")
-                self._rgb_images.clear()
-                self._ev_frames.clear()
-                self._ee_poses.clear()
+                print(f"\n[server] INIT  ({n} poses, round {self._current_round}/{self._num_rounds})")
+                if self._current_round == 1:
+                    self._rgb_images.clear()
+                    self._ev_frames.clear()
+                    self._ee_poses.clear()
+                    self._global_img_idx = 0
+                    if isinstance(n, int):
+                        self._poses_per_round = n
                 self._reply({"status": "READY"})
 
             elif cmd == "POSE_REACHED":
@@ -404,11 +417,11 @@ class CalibrationRecordingServer:
                 c, _ = _detect(bgr, self._det)
                 rgb_found = c is not None
                 print(
-                    f"[server] POSE_REACHED #{idx}  "
+                    f"[server] POSE_REACHED #{idx} (round {self._current_round})  "
                     f"RGB charuco={'yes' if rgb_found else 'NO'}"
                 )
-                # Save RGB image
-                rgb_out = self._rgb_dir / f"rgb_{idx:03d}.png"
+                # Save RGB image (global index across rounds)
+                rgb_out = self._rgb_dir / f"rgb_{self._global_img_idx:03d}.png"
                 cv2.imwrite(str(rgb_out), bgr)
                 # Start event accumulation
                 if self._event_acc is not None:
@@ -425,8 +438,8 @@ class CalibrationRecordingServer:
                     # Rotate 180° – event camera is mounted upside-down
                     ev_frame = cv2.rotate(ev_frame, cv2.ROTATE_180)
                     self._ev_frames.append(ev_frame)
-                    # Save event frame image
-                    img_out = self._event_frames_dir / f"event_{idx:03d}.png"
+                    # Save event frame image (global index across rounds)
+                    img_out = self._event_frames_dir / f"event_{self._global_img_idx:03d}.png"
                     cv2.imwrite(str(img_out), ev_frame)
                     # ChArUco detection on event frame
                     c, _ = _detect(ev_frame, self._det)
@@ -438,17 +451,42 @@ class CalibrationRecordingServer:
                     )
                 else:
                     print(f"[server] WIGGLE_DONE #{idx}  (no event camera)")
+                self._global_img_idx += 1
                 self._reply({"status": "EVENT_CAPTURED"})
 
             elif cmd == "ALL_DONE":
-                print("\n[server] ALL_DONE – running calibration pipeline ...")
-                success, error = self._run_calibration()
-                self._reply({
-                    "status": "CALIBRATION_COMPLETE",
-                    "success": success,
-                    "error": error,
-                })
-                break
+                if self._current_round < self._num_rounds:
+                    print(f"\n{'='*60}")
+                    print(f"[server] Round {self._current_round}/{self._num_rounds} complete!")
+                    print(f"[server] Total images so far: "
+                          f"{len(self._rgb_images)} RGB, {len(self._ev_frames)} event")
+                    print(f"[server] Please reposition the ChArUco board,")
+                    print(f"[server] then press ENTER to continue...")
+                    print(f"{'='*60}")
+                    input()  # block until user presses Enter
+                    # Restart RealSense to avoid stale frame buffer after long pause
+                    print("[server] Restarting RealSense...")
+                    self._rs_pipe.stop()
+                    self._start_realsense()
+                    self._current_round += 1
+                    print(f"[server] Starting round {self._current_round}/{self._num_rounds}")
+                    self._reply({
+                        "status": "ROUND_COMPLETE",
+                        "round": self._current_round - 1,
+                        "more_rounds": True,
+                    })
+                else:
+                    print(f"\n[server] All {self._num_rounds} rounds complete ")
+                    print(f"[server] Total: {len(self._rgb_images)} RGB, "
+                          f"{len(self._ev_frames)} event images")
+                    print("[server] Running calibration pipeline ...")
+                    success, error = self._run_calibration()
+                    self._reply({
+                        "status": "CALIBRATION_COMPLETE",
+                        "success": success,
+                        "error": error,
+                    })
+                    break
 
             else:
                 print(f"[server] Unknown command: {cmd}")
@@ -568,11 +606,20 @@ class CalibrationRecordingServer:
         """Compute T_rgb_from_ee via cv2.calibrateHandEye.
 
         Returns 4×4 T such that  p_rgb = T @ p_ee,  or None on failure.
+
+        NOTE: Only uses data from the *first round* of poses.  With multi-round
+        calibration the robot visits the same poses in every round (only the
+        board moves), so ee_poses contain duplicates.  calibrateHandEye needs
+        each EE pose to be unique — duplicate gripper poses with different
+        board-to-camera transforms produce contradictory AX=XB constraints.
         """
-        n = min(len(self._rgb_images), len(self._ee_poses))
+        # Restrict to first round (unique EE poses)
+        n_first = self._poses_per_round or len(self._ee_poses)
+        n = min(len(self._rgb_images), len(self._ee_poses), n_first)
         if n == 0:
             print("[hand-eye] No EE poses recorded – skipping hand-eye calibration")
             return None
+        print(f"[hand-eye] Using first {n} images (1 round) for hand-eye")
 
         R_g2b, t_g2b, R_t2c, t_t2c = [], [], [], []
         for i in range(n):
@@ -645,10 +692,18 @@ def main():
         default="camera_data",
         help="Directory to save calibration results (default: camera_data)",
     )
+    parser.add_argument(
+        "--num-rounds",
+        type=int,
+        default=5,
+        help="Number of board-position rounds before calibrating (default: 5)",
+    )
     args = parser.parse_args()
 
     server = CalibrationRecordingServer(
-        bind_addr=args.zmq_bind, output_dir=args.output_dir
+        bind_addr=args.zmq_bind,
+        output_dir=args.output_dir,
+        num_rounds=args.num_rounds,
     )
     server.serve()
 

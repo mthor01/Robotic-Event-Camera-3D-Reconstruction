@@ -436,15 +436,35 @@ class MultiCameraCalibrationAgent(Agent):
         # --- WAITING FOR CALIBRATION ---
         if self.state == self.State.WAITING_CALIBRATION:
             try:
-                # Increase timeout for calibration computation
-                self._zmq_req.setsockopt(zmq.RCVTIMEO, 120_000)
+                # Long timeout: user may need several minutes to reposition the board
+                self._zmq_req.setsockopt(zmq.RCVTIMEO, 600_000)
                 reply = self._zmq_send({"cmd": "ALL_DONE"})
-                success = reply.get("success", False)
-                if success:
-                    logger.info("Calibration complete!  Results saved by Docker B.")
+
+                if reply.get("more_rounds"):
+                    round_done = reply.get("round", "?")
+                    logger.info(
+                        f"Round {round_done} complete. "
+                        "Server waiting for board repositioning..."
+                    )
+                    # Send INIT for next round (server preserves data)
+                    re_reply = self._zmq_send({
+                        "cmd": "INIT",
+                        "num_poses": len(self.calibration_poses),
+                    })
+                    if re_reply.get("status") == "READY":
+                        self.current_pose_index = 0
+                        self.state = self.State.MOVING_TO_POSE
+                        logger.info("Starting next round of calibration poses...")
+                    else:
+                        logger.error(f"Unexpected reply to re-INIT: {re_reply}")
+                        self.state = self.State.COMPLETE
                 else:
-                    logger.error(f"Calibration failed: {reply.get('error', 'unknown')}")
-                self.state = self.State.COMPLETE
+                    success = reply.get("success", False)
+                    if success:
+                        logger.info("Calibration complete!  Results saved by Docker B.")
+                    else:
+                        logger.error(f"Calibration failed: {reply.get('error', 'unknown')}")
+                    self.state = self.State.COMPLETE
             except zmq.error.Again:
                 logger.error("Timeout waiting for calibration result.")
                 self.state = self.State.COMPLETE
