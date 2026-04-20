@@ -7,7 +7,7 @@ Implementation based on:
 Key differences from standard UNet:
 - ConvLSTM in encoder layers for temporal recurrence
 - Residual blocks in bottleneck
-- Log depth output with sigmoid activation
+- Sigmoid output [0,1]: log depth (--log_depth) or linear normalization (default)
 - Scale-invariant + multi-scale gradient loss
 - Bilinear upsampling in decoder
 
@@ -64,19 +64,14 @@ try:
 except Exception:
     _NVML_AVAILABLE = False
 
+from reconstruction_config import (
+    D_MAX, ALPHA, DEPTH_MIN, WHITE_THRESH, NUM_BINS,
+    DATA_ROOT as _DATA_ROOT, DEFAULT_OUT_DIR,
+)
 
 # ================= DEFAULT PATHS =================
-DATA_ROOT = Path("data/real")
-DEFAULT_OUT_DIR = Path("checkpoints_e2depth")
+DATA_ROOT = _DATA_ROOT
 # =================================================
-
-# ================= DEPTH PARAMETERS (tabletop scene) =================
-D_MAX = 0.6   # Maximum depth in meters (tabletop range)
-ALPHA = 2.5   # Log depth parameter
-# D_metric = D_MAX * exp(-ALPHA * (1 - D_pred))
-# At D_pred=0: D_metric = D_MAX * exp(-ALPHA) ≈ 0.05m (5cm minimum)
-# At D_pred=1: D_metric = D_MAX = 0.6m
-# =====================================================================
 
 
 
@@ -268,7 +263,7 @@ class E2DepthNet(nn.Module):
         # Prediction layer (depth-wise conv with kernel 1, sigmoid output)
         self.pred = nn.Sequential(
             nn.Conv2d(base, 1, kernel_size=1),
-            nn.Sigmoid(),  # Output normalized log depth in [0, 1]
+            nn.Sigmoid(),  # Output normalized depth in [0, 1]
         )
     
     def forward(
@@ -407,20 +402,32 @@ def e2depth_loss(
     pred: torch.Tensor,
     gt: torch.Tensor,
     mask: torch.Tensor,
-    lambda_grad: float = 0.5
+    lambda_grad: float = 0.5,
+    lambda_mean: float = 0.2,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Combined loss from paper (Equation 5).
-    
-    L_tot = L_si + λ * L_grad
-    where λ = 0.5
+    Combined loss.
+
+    L_tot = L_si + λ_grad * L_grad + λ_mean * L_mean
+
+    L_mean penalises systematic global bias (mean residual) that L_si ignores
+    because its second term cancels constant offsets.
     """
     l_si = scale_invariant_loss(pred, gt, mask)
     l_grad = multi_scale_gradient_loss(pred, gt, mask)
-    
-    total = l_si + lambda_grad * l_grad
-    
-    return total, {"si": l_si.item(), "grad": l_grad.item(), "total": total.item()}
+
+    n = mask.sum().clamp_min(1.0)
+    mean_diff = ((pred - gt) * mask).sum() / n
+    l_mean = mean_diff ** 2
+
+    total = l_si + lambda_grad * l_grad + lambda_mean * l_mean
+
+    return total, {
+        "si": l_si.item(),
+        "grad": l_grad.item(),
+        "mean": l_mean.item(),
+        "total": total.item(),
+    }
 
 
 # -----------------------------
@@ -449,6 +456,16 @@ def log_normalized_to_depth(pred: torch.Tensor, d_max: float = D_MAX, alpha: flo
     return d_max * torch.exp(-alpha * (1.0 - pred))
 
 
+def depth_to_linear_normalized(depth: torch.Tensor, d_min: float = DEPTH_MIN, d_max: float = D_MAX) -> torch.Tensor:
+    """Convert metric depth to linearly normalized [0, 1]: (d - d_min) / (d_max - d_min)."""
+    return ((depth - d_min) / (d_max - d_min)).clamp(0, 1)
+
+
+def linear_normalized_to_depth(pred: torch.Tensor, d_min: float = DEPTH_MIN, d_max: float = D_MAX) -> torch.Tensor:
+    """Convert linearly normalized [0, 1] back to metric depth."""
+    return pred * (d_max - d_min) + d_min
+
+
 # -----------------------------
 # Dataset Configuration
 # -----------------------------
@@ -459,11 +476,13 @@ class DataConfig:
     crop_size: Optional[Tuple[int, int]] = None  # (H, W) center crop applied after resize
     resize_hw: Optional[Tuple[int, int]] = None  # (H, W) resize before crop/augmentation
     depth_max: float = D_MAX  # Maximum depth in meters
-    depth_min: float = 0.05   # Minimum depth in meters (5cm for tabletop)
+    depth_min: float = DEPTH_MIN   # Minimum depth in meters (5cm for tabletop)
     augment: bool = True  # Apply data augmentation during training
-    num_bins: int = 5  # Number of temporal bins for voxel grid
+    num_bins: int = NUM_BINS  # Number of temporal bins for voxel grid
     use_pose: bool = False  # Use precomputed pose depth channel (from voxels_pose_cam0/)
     rgb_mask: bool = False  # Mask out white pixels using projected RGB
+    spatial_mask: bool = False  # Mask pixels outside cube around EE (from spatial_mask.h5)
+    log_depth: bool = False  # Use log depth encoding (paper default); False = linear normalization
 
 
 class RealDataset(Dataset):
@@ -553,6 +572,18 @@ class RealDataset(Dataset):
                     f"Run: python project_realsense_to_event.py --data_dir {self.sequence_dir}"
                 )
             self._rgb_h5_path = rgb_proj
+
+        # --- Spatial mask (optional, precomputed) ---
+        self.spatial_mask = cfg.spatial_mask
+        self._spatial_h5_path = None
+        if self.spatial_mask:
+            sp = self.sequence_dir / "hdf5" / "spatial_mask.h5"
+            if not sp.exists():
+                raise FileNotFoundError(
+                    f"--spatial_mask requires precomputed masks. "
+                    f"Run: python precompute_spatial_mask.py --data_dir {self.sequence_dir}"
+                )
+            self._spatial_h5_path = sp
         
         # --- Train / val split ---
         self._compute_valid_indices(val_ratio, seed)
@@ -560,8 +591,10 @@ class RealDataset(Dataset):
         depth_src = "projected" if self._depth_is_metric else "raw realsense"
         pose_str = "with pose" if self.use_pose else "no pose"
         rgb_str = ", rgb_mask" if self.rgb_mask else ""
+        spatial_str = ", spatial_mask" if self.spatial_mask else ""
+        depth_enc = "log" if cfg.log_depth else "linear"
         print(f"[{self.sequence_dir.name}] {split}: {len(self.indices)} samples "
-              f"(frames: {self.n_frames}, depth: {depth_src}, {pose_str}{rgb_str}, res: {self.W}x{self.H})")
+              f"(frames: {self.n_frames}, depth: {depth_src} [{depth_enc}], {pose_str}{rgb_str}{spatial_str}, res: {self.W}x{self.H})")
     
     def _compute_valid_indices(self, val_ratio: float, seed: int):
         """Compute valid starting indices for sequences."""
@@ -641,12 +674,21 @@ class RealDataset(Dataset):
                 with h5py.File(self._rgb_h5_path, 'r') as rf:
                     rgb = rf["rgb"][idx]  # (H, W, 3) uint8
                 # White = all channels above threshold
-                white = np.all(rgb > 200, axis=-1)  # (H, W)
+                white = np.all(rgb > WHITE_THRESH, axis=-1)  # (H, W)
                 mask[white] = 0.0
+
+            # Apply precomputed spatial mask (cube around EE)
+            if self.spatial_mask:
+                with h5py.File(self._spatial_h5_path, 'r') as sf:
+                    sp = sf["mask"][idx]  # (H, W) uint8
+                mask[sp == 0] = 0.0
             
-            # Convert depth to log normalized [0, 1]
+            # Normalize depth to [0, 1]
             depth = np.clip(depth, self.cfg.depth_min, self.cfg.depth_max)
-            depth = 1.0 + (1.0 / ALPHA) * np.log(depth / D_MAX)
+            if self.cfg.log_depth:
+                depth = 1.0 + (1.0 / ALPHA) * np.log(depth / self.cfg.depth_max)
+            else:
+                depth = (depth - self.cfg.depth_min) / (self.cfg.depth_max - self.cfg.depth_min)
             depth = np.clip(depth, 0, 1)
             
             events_seq.append(voxel)
@@ -754,6 +796,7 @@ def debug_visualize(
     crop_size: Optional[Tuple[int, int]] = None,
     use_pose: bool = False,
     rgb_mask: bool = False,
+    spatial_mask: bool = False,
 ) -> None:
     """
     Save a debug PNG with n_samples × 2 rows (raw + preprocessed per timestamp).
@@ -845,6 +888,13 @@ def debug_visualize(
         proj_rgb_path = None
         if rgb_mask:
             print("[debug_viz] Warning: rgb_in_event_frame.h5 not found, skipping RGB mask")
+
+    # ---- Spatial mask (precomputed) ----
+    spatial_mask_path: Optional[Path] = seq_dir / "hdf5" / "spatial_mask.h5"
+    if not spatial_mask_path.exists():
+        spatial_mask_path = None
+        if spatial_mask:
+            print("[debug_viz] Warning: spatial_mask.h5 not found, skipping spatial mask")
 
     # ---- Sample random frame indices ----
     n_samples = min(n_samples, n_frames)
@@ -1095,10 +1145,19 @@ def debug_visualize(
             if rgb_mask and proj_rgb_frame is not None:
                 white_mask = np.all(proj_rgb_frame > 200, axis=-1)  # (H, W)
                 total_mask[white_mask] = 0.0
+            if spatial_mask and spatial_mask_path is not None:
+                with h5py.File(spatial_mask_path, 'r') as _sf:
+                    sp_raw = _sf["mask"][frame_idx].astype(np.float32)
+                total_mask[sp_raw == 0] = 0.0
             tm_pre = _apply_resize_crop(total_mask)
             tmh, tmw = tm_pre.shape
             ax.imshow(tm_pre, cmap="gray", vmin=0, vmax=1)
-            label = "Total Mask (depth + RGB)" if (rgb_mask and proj_rgb_frame is not None) else "Total Mask (depth only)"
+            parts = ["depth"]
+            if rgb_mask and proj_rgb_frame is not None:
+                parts.append("RGB")
+            if spatial_mask and spatial_mask_path is not None:
+                parts.append("spatial")
+            label = f"Total Mask ({' + '.join(parts)})"
             _annotate(ax, tmw, tmh, f"{label}  [{preproc_label}]")
         else:
             _na(ax, f"Total Mask  [{preproc_label}]")
@@ -1157,6 +1216,7 @@ def train_one_epoch(
     total_loss = 0.0
     total_si = 0.0
     total_grad = 0.0
+    total_mean = 0.0
     n_batches = 0
     n_total = len(loader)
 
@@ -1177,6 +1237,7 @@ def train_one_epoch(
         batch_loss = 0.0
         batch_si = 0.0
         batch_grad = 0.0
+        batch_mean = 0.0
         
         for t in range(T):
             pred, states = model(events[:, t], states)
@@ -1184,6 +1245,7 @@ def train_one_epoch(
             batch_loss += loss
             batch_si += metrics["si"]
             batch_grad += metrics["grad"]
+            batch_mean += metrics["mean"]
         
         # Average over sequence
         batch_loss = batch_loss / T
@@ -1196,6 +1258,7 @@ def train_one_epoch(
         total_loss += batch_loss.item()
         total_si += batch_si / T
         total_grad += batch_grad / T
+        total_mean += batch_mean / T
         n_batches += 1
 
         now = time.time()
@@ -1217,6 +1280,7 @@ def train_one_epoch(
         "total": total_loss / max(1, n_batches),
         "si": total_si / max(1, n_batches),
         "grad": total_grad / max(1, n_batches),
+        "mean": total_mean / max(1, n_batches),
     }
 
 
@@ -1225,6 +1289,9 @@ def validate(
     model: E2DepthNet,
     loader: DataLoader,
     device: torch.device,
+    log_depth: bool = False,
+    depth_min: float = DEPTH_MIN,
+    depth_max: float = D_MAX,
 ) -> Dict[str, float]:
     """Validate and compute metrics."""
     model.eval()
@@ -1252,8 +1319,12 @@ def validate(
         total_si += scale_invariant_loss(pred, gt, mask).item()
         
         # Convert to metric depth for L1 and abs_rel
-        pred_metric = log_normalized_to_depth(pred)
-        gt_metric = log_normalized_to_depth(gt)
+        if log_depth:
+            pred_metric = log_normalized_to_depth(pred)
+            gt_metric = log_normalized_to_depth(gt)
+        else:
+            pred_metric = linear_normalized_to_depth(pred, d_min=depth_min, d_max=depth_max)
+            gt_metric = linear_normalized_to_depth(gt, d_min=depth_min, d_max=depth_max)
         
         # Debug: track prediction statistics
         pred_mean = (pred * mask).sum() / mask.sum()
@@ -1282,6 +1353,19 @@ def validate(
         "pred_metric_mean": last_pred_metric_mean,
         "gt_metric_mean": last_gt_metric_mean,
     }
+
+
+def _depth_to_rgb(t: torch.Tensor) -> torch.Tensor:
+    """Apply turbo colormap to a (1, H, W) or (H, W) float tensor in [0, 1].
+
+    Returns a (3, H, W) float32 tensor suitable for writer.add_image.
+    """
+    import matplotlib.cm as cm
+
+    arr = t[0].cpu().float().numpy() if t.dim() == 3 else t.cpu().float().numpy()
+    rgba = cm.turbo(arr)  # (H, W, 4) float64
+    rgb = rgba[:, :, :3].transpose(2, 0, 1).astype("float32")  # (3, H, W)
+    return torch.from_numpy(rgb)
 
 
 def log_images(
@@ -1337,10 +1421,10 @@ def log_images(
 
                 tag = f"{split}/sample_{j}"
                 writer.add_image(f"{tag}/input_events", ev_img, epoch)
-                writer.add_image(f"{tag}/gt_log_depth", gt_img, epoch)
-                writer.add_image(f"{tag}/pred_log_depth", pred_img, epoch)
+                writer.add_image(f"{tag}/gt_depth", _depth_to_rgb(gt_img), epoch)
+                writer.add_image(f"{tag}/pred_depth", _depth_to_rgb(pred_img), epoch)
                 writer.add_image(f"{tag}/total_mask", mask_img, epoch)
-                writer.add_image(f"{tag}/error", err_img / (err_img.max() + 1e-6), epoch)
+                writer.add_image(f"{tag}/error", _depth_to_rgb(err_img / (err_img.max() + 1e-6)), epoch)
 
 
 # -----------------------------
@@ -1358,8 +1442,8 @@ def main():
                            help="Sequence directory(ies) to train on")
     data_group.add_argument("--data_root", type=str, default=str(DATA_ROOT),
                            help="Root data directory (will use all subdirs)")
-    data_group.add_argument("--val_ratio", type=float, default=0.1,
-                           help="Fraction of data for validation")
+    data_group.add_argument("--val_ratio", type=float, default=0.2,
+                           help="Fraction of data for validation (object-level split when >1 sequence, temporal otherwise)")
     data_group.add_argument("--num_bins", type=int, default=5,
                            help="Number of temporal bins for voxel grid")
     data_group.add_argument("--depth_max", type=float, default=D_MAX,
@@ -1370,6 +1454,11 @@ def main():
                            help="Use precomputed pose depth channel (from voxels_pose_cam0/)")
     data_group.add_argument("--rgb_mask", action="store_true",
                            help="Mask out white pixels using projected RGB (from rgb_in_event_frame.h5)")
+    data_group.add_argument("--spatial_mask", action="store_true",
+                           help="Mask pixels outside cube around EE (from spatial_mask.h5, "
+                                "run precompute_spatial_mask.py first)")
+    data_group.add_argument("--log_depth", action="store_true",
+                           help="Use log depth encoding (paper method); default is linear normalization")
     
     # Model (paper defaults)
     model_group = parser.add_argument_group("Model")
@@ -1382,9 +1471,9 @@ def main():
     
     # Training
     train_group = parser.add_argument_group("Training")
-    train_group.add_argument("--epochs", type=int, default=300,
+    train_group.add_argument("--epochs", type=int, default=50,
                             help="Number of epochs")
-    train_group.add_argument("--batch", type=int, default=10,
+    train_group.add_argument("--batch", type=int, default=12,
                             help="Batch size")
     train_group.add_argument("--seq_len", type=int, default=10,
                             help="Sequence length for recurrent training")
@@ -1392,7 +1481,7 @@ def main():
                             help="Learning rate")
     train_group.add_argument("--lambda_grad", type=float, default=0.5,
                             help="Weight for gradient loss (λ in paper)")
-    train_group.add_argument("--num_workers", type=int, default=4)
+    train_group.add_argument("--num_workers", type=int, default=8)
     train_group.add_argument("--crop_h", type=int, default=240,
                             help="Center crop height in pixels (0=no crop)")
     train_group.add_argument("--crop_w", type=int, default=320,
@@ -1462,6 +1551,7 @@ def main():
             crop_size=dbg_crop_size,
             use_pose=args.use_pose,
             rgb_mask=args.rgb_mask,
+            spatial_mask=args.spatial_mask,
         )
         return
 
@@ -1484,6 +1574,8 @@ def main():
         num_bins=args.num_bins,
         use_pose=args.use_pose,
         rgb_mask=args.rgb_mask,
+        spatial_mask=args.spatial_mask,
+        log_depth=args.log_depth,
     )
     
     # Create config without augmentation for validation
@@ -1497,15 +1589,37 @@ def main():
         num_bins=args.num_bins,
         use_pose=args.use_pose,
         rgb_mask=args.rgb_mask,
+        spatial_mask=args.spatial_mask,
+        log_depth=args.log_depth,
     )
     
-    # Datasets (split each sequence into train/val)
-    train_ds = create_multi_sequence_dataset(
-        [str(d) for d in sequence_dirs], cfg, split="train", val_ratio=args.val_ratio
-    )
-    val_ds = create_multi_sequence_dataset(
-        [str(d) for d in sequence_dirs], cfg_val, split="val", val_ratio=args.val_ratio
-    )
+    # Datasets — object-level split when multiple sequences are available,
+    # fallback to temporal block-split within the single sequence.
+    if len(sequence_dirs) > 1:
+        rng = np.random.default_rng(args.seed if hasattr(args, 'seed') else 42)
+        dirs_shuffled = list(sequence_dirs)
+        rng.shuffle(dirs_shuffled)
+        n_val_dirs = max(1, int(round(len(dirs_shuffled) * args.val_ratio)))
+        val_dirs = dirs_shuffled[:n_val_dirs]
+        train_dirs = dirs_shuffled[n_val_dirs:]
+        if not train_dirs:
+            # Edge case: only 1 dir total, fall through to temporal split
+            train_dirs = val_dirs
+        print(f"  Object-level split: {len(train_dirs)} train dirs, {len(val_dirs)} val dirs")
+        train_ds = create_multi_sequence_dataset(
+            [str(d) for d in train_dirs], cfg, split="train", val_ratio=0.0
+        )
+        val_ds = create_multi_sequence_dataset(
+            [str(d) for d in val_dirs], cfg_val, split="val", val_ratio=1.0
+        )
+    else:
+        # Single sequence: temporal block-split within that sequence
+        train_ds = create_multi_sequence_dataset(
+            [str(d) for d in sequence_dirs], cfg, split="train", val_ratio=args.val_ratio
+        )
+        val_ds = create_multi_sequence_dataset(
+            [str(d) for d in sequence_dirs], cfg_val, split="val", val_ratio=args.val_ratio
+        )
     
     # Print dataset info
     print(f"\n{'='*60}")
@@ -1514,6 +1628,7 @@ def main():
     print(f"  Train samples: {len(train_ds)}")
     print(f"  Valid samples: {len(val_ds)}")
     print(f"  Depth range: {args.depth_min:.2f}m - {args.depth_max:.2f}m")
+    print(f"  Depth encoding: {'log' if args.log_depth else 'linear'}")
     print(f"  Voxel bins: {args.num_bins}")
     print(f"  Use pose: {args.use_pose}")
     print(f"  RGB mask: {args.rgb_mask}")
@@ -1581,7 +1696,10 @@ def main():
         train_metrics = train_one_epoch(
             model, train_loader, optimizer, device, lambda_grad=args.lambda_grad, epoch=epoch
         )
-        val_metrics = validate(model, val_loader, device)
+        val_metrics = validate(model, val_loader, device,
+                               log_depth=args.log_depth,
+                               depth_min=args.depth_min,
+                               depth_max=args.depth_max)
         
         # Step scheduler based on validation loss
         scheduler.step(val_metrics["si"])
@@ -1590,6 +1708,7 @@ def main():
         writer.add_scalar("loss/train_total", train_metrics["total"], epoch)
         writer.add_scalar("loss/train_si", train_metrics["si"], epoch)
         writer.add_scalar("loss/train_grad", train_metrics["grad"], epoch)
+        writer.add_scalar("loss/train_mean", train_metrics["mean"], epoch)
         writer.add_scalar("loss/val_si", val_metrics["si"], epoch)
         writer.add_scalar("loss/val_l1_metric", val_metrics["l1_metric"], epoch)
         writer.add_scalar("loss/val_abs_rel", val_metrics["abs_rel"], epoch)

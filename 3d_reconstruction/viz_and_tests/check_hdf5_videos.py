@@ -5,8 +5,8 @@ Reads the HDF5 files written by synchronised_recording.py and exports
 test MP4 videos so you can visually check the data is correct.
 
 Usage:
-    python check_hdf5_videos.py data/real/<object_name>
-    python check_hdf5_videos.py data/real/<object_name> --fps 30
+    python3 check_hdf5_videos.py data/real/<object_name>
+    python3 check_hdf5_videos.py data/real/<object_name> --fps 30
 """
 
 import argparse
@@ -18,7 +18,11 @@ import h5py
 import numpy as np
 from tqdm import tqdm
 
-CALIB_DIR = Path(__file__).parent / "camera_data"
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from reconstruction_config import CALIB_DIR as _CALIB_DIR_REL, FPS as DEFAULT_FPS
+
+CALIB_DIR = Path(__file__).parent.parent / _CALIB_DIR_REL
 
 
 def make_video(frames: np.ndarray, out_path: Path, fps: float, is_color: bool) -> None:
@@ -295,8 +299,8 @@ def main() -> None:
     parser.add_argument(
         "--fps",
         type=float,
-        default=30.0,
-        help="Frame rate for output videos (default: 30)",
+        default=float(DEFAULT_FPS),
+        help="Frame rate for output videos",
     )
     parser.add_argument(
         "--event-cameras",

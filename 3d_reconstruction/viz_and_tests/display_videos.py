@@ -1,8 +1,12 @@
 import time
+import sys
 import cv2
 import h5py
 import numpy as np
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from reconstruction_config import DEPTH_VIZ_P_LOW, DEPTH_VIZ_P_HIGH
 
 # ================= CONFIG =================
 DATA_DIR = Path("data") / "hdf5"
@@ -23,7 +27,7 @@ def normalize_uint8(img):
         img /= img.max()
     return (img * 255).astype(np.uint8)
 
-def depth_to_uint8(depth, p_low=2, p_high=98):
+def depth_to_uint8(depth, p_low=DEPTH_VIZ_P_LOW, p_high=DEPTH_VIZ_P_HIGH):
     depth = depth.astype(np.float32)
 
     lo = np.percentile(depth, p_low)

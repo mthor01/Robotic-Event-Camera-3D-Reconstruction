@@ -43,10 +43,12 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
+from reconstruction_config import (
+    CALIB_DIR, DATA_ROOT, FPS as DEFAULT_FPS,
+)
 
-# ─── defaults ──────────────────────────────────────────────────────
-CALIB_DIR = Path("camera_data")
-DATA_ROOT = Path("data/real")
+# ─── module-level FPS (overridden by --fps CLI arg) ───────────────
+FPS = DEFAULT_FPS
 
 
 def load_calibration(calib_dir: Path) -> dict:
@@ -443,6 +445,7 @@ def find_recordings(root: Path) -> list[Path]:
 
 
 def main():
+    global FPS
     parser = argparse.ArgumentParser(
         description="Project RealSense depth and RGB into the event camera frame",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -460,7 +463,7 @@ def main():
         help="Path to camera_data/ calibration directory",
     )
     parser.add_argument(
-        "--fps", type=int, default=30,
+        "--fps", type=int, default=FPS,
         help="Video output framerate",
     )
     parser.add_argument(
@@ -485,7 +488,6 @@ def main():
 
     print(f"Processing {len(dirs)} recording(s)")
     print(f"RGB projection: {'off' if args.no_rgb else 'on'}")
-    global FPS
     FPS = args.fps
 
     for d in dirs:

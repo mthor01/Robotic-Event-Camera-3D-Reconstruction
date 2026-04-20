@@ -44,23 +44,22 @@ import msgpack
 from metavision_hal import DeviceDiscovery
 from metavision_core.event_io import EventsIterator
 
+from reconstruction_config import (
+    FPS, RS_WIDTH, RS_HEIGHT,
+    BIAS_DIFF_ON, BIAS_DIFF_OFF, BIAS_FO, BIAS_HPF, BIAS_REFR,
+    CHARUCO_SQUARES_H, CHARUCO_SQUARES_V, CHARUCO_SQUARE_LEN, CHARUCO_MARKER_LEN,
+)
+
 
 # ── ChArUco board defaults (must match the physical board) ──────────────
 ARUCO_DICT = cv2.aruco.DICT_6X6_250
-SQUARES_H = 6
-SQUARES_V = 9
-SQUARE_LEN = 0.03     # metres
-MARKER_LEN = 0.015    # metres
-
-# ── Event camera biases ────────────────────────────────────────────────
-BIAS_DIFF_ON = 10
-BIAS_DIFF_OFF = 80
-BIAS_FO = 0
-BIAS_HPF = 50
-BIAS_REFR = 150
+SQUARES_H = CHARUCO_SQUARES_H
+SQUARES_V = CHARUCO_SQUARES_V
+SQUARE_LEN = CHARUCO_SQUARE_LEN
+MARKER_LEN = CHARUCO_MARKER_LEN
 
 # ── RealSense stream config ───────────────────────────────────────────
-RS_W, RS_H, RS_FPS = 640, 480, 30
+RS_W, RS_H, RS_FPS = RS_WIDTH, RS_HEIGHT, FPS
 
 
 # ═══════════════════════════════════════════════════════════════════════

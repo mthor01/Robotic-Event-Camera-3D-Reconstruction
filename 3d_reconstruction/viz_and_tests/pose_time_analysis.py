@@ -38,6 +38,9 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.gridspec import GridSpec
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from reconstruction_config import FPS as DEFAULT_FPS
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  Shared helpers
@@ -495,7 +498,7 @@ def run_verify(seq_dir: Path, out_dir: Path) -> None:
         joints    = f["joint_positions"][:]
         offset_ms = f["nearest_offset_ms"][:]
 
-    fps = 30.0; raw_poses = -1
+    fps = float(DEFAULT_FPS); raw_poses = -1
     if meta_path.exists():
         with h5py.File(meta_path, "r") as f:
             fps = float(f.attrs.get("fps", 30.0))

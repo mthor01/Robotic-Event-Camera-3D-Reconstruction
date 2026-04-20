@@ -7,10 +7,9 @@ from pathlib import Path
 from metavision_core.event_io import EventsIterator
 from metavision_sdk_core import PeriodicFrameGenerationAlgorithm
 
-# ================= CONFIG =================
-FPS = 30
-DELTA_T_US = int(1e6 / FPS)
+from reconstruction_config import FPS, DELTA_T_US
 
+# ================= CONFIG =================
 DATA_DIR = Path("data")
 RAW_DIR  = DATA_DIR / "raw_event_data"
 VIDEO_DIR = DATA_DIR / "videos"

@@ -60,7 +60,10 @@ docker run --rm -it \
   openvla \
   bash -lc "chown -R 101403:5018 /work"
   
-  
+##########Record Data############
+python3 precompute_voxels.py --overwrite
+
+python3 precompute_pose_depth.py 
   
 ##########Calibration############
 python my_main.py --real-robot --calibration-poses calibration_poses.npy --agent-type multi_cam_calibrate --no-wiggle

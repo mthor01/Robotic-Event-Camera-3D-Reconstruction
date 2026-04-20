@@ -18,9 +18,9 @@ Merges the following individual scripts into subcommands:
 Output images are saved to  <data_dir>/data_plots/  by default.
 
 Usage examples:
-    python data_analysis.py polarity_speed   --data_dir data/real/1
-    python data_analysis.py direction_change --data_dir data/real/1 --smooth 5
-    python data_analysis.py all              --data_dir data/real/1
+    python3 data_analysis.py polarity_speed   --data_dir data/real/1
+    python3 data_analysis.py direction_change --data_dir data/real/1 --smooth 5
+    python3 data_analysis.py all              --data_dir data/real/1
 """
 
 from __future__ import annotations
@@ -38,6 +38,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from scipy.signal import find_peaks
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from reconstruction_config import WHITE_THRESH, POSE_VIZ_AXIS_LEN, POSE_VIZ_ARROW_LEN
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -566,7 +569,7 @@ def run_poses(seq_dir: Path, out_dir: Path, calib_dir: str = "camera_data",
     from matplotlib.gridspec import GridSpec
 
     calib_dir_p = Path(calib_dir)
-    AXIS_LEN = 0.03; ARROW_LEN = 0.06
+    AXIS_LEN = POSE_VIZ_AXIS_LEN; ARROW_LEN = POSE_VIZ_ARROW_LEN
 
     T_rgb_from_ee = np.load(calib_dir_p / "T_rgb_from_ee.npz")["T"].astype(np.float64)
     T_ee_rgb = np.linalg.inv(T_rgb_from_ee)
@@ -925,7 +928,7 @@ def run_voxels(seq_dir: Path, out_dir: Path, indices: Optional[list] = None,
 # ══════════════════════════════════════════════════════════════════════
 
 def run_white_mask(seq_dir: Path, out_dir: Path, indices: Optional[list] = None,
-                   n_random: int = 5, cam: int = 0, white_thresh: int = 200) -> None:
+                   n_random: int = 5, cam: int = 0, white_thresh: int = WHITE_THRESH) -> None:
     """Visualize white-pixel mask and its projection onto the event plane."""
     realsense_h5 = seq_dir / "hdf5" / "realsense.h5"
     proj_rgb_h5  = seq_dir / "hdf5" / "rgb_in_event_frame.h5"
@@ -1078,7 +1081,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--indices", type=int, nargs="+", default=None)
     p.add_argument("--n", type=int, default=5)
     p.add_argument("--cam", type=int, default=0)
-    p.add_argument("--white_thresh", type=int, default=200)
+    p.add_argument("--white_thresh", type=int, default=WHITE_THRESH)
 
     # -- all --
     p = sub.add_parser("all", help="Run every analysis")

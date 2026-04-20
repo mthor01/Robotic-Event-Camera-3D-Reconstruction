@@ -19,12 +19,14 @@ from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 
+from reconstruction_config import NUM_BINS
+
 
 def events_to_voxel_grid(
     events: np.ndarray,
     height: int,
     width: int,
-    num_bins: int = 5,
+    num_bins: int = NUM_BINS,
 ) -> np.ndarray:
     """
     Convert raw events to a voxel grid representation.

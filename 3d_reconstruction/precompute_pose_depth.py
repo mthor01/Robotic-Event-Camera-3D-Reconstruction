@@ -24,12 +24,9 @@ import h5py
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
-# ================= POSE DEPTH-TO-PLANE ENCODING =================
-POSE_D_MAX = 10.0   # Maximum depth for pose-to-plane feature (metres)
-POSE_ALPHA = 4.6    # ln(10.0 / 0.1) ≈ 4.6, covers 0.1 m to 10 m
-# ================================================================
+from reconstruction_config import POSE_D_MAX, POSE_ALPHA, CALIB_DIR as _CALIB_DIR
 
-CALIB_DIR = Path(__file__).resolve().parent / "camera_data"
+CALIB_DIR = Path(__file__).resolve().parent / _CALIB_DIR
 
 
 def compute_pose_depth_to_plane(
@@ -38,19 +35,21 @@ def compute_pose_depth_to_plane(
     rays_cam: np.ndarray,
     H: int,
     W: int,
+    log_depth: bool = False,
 ) -> np.ndarray:
     """
-    Compute log-normalised depth from the event camera to the z=0 (table) plane.
+    Compute normalised depth from the event camera to the z=0 (table) plane.
 
     For every pixel a ray is cast from the camera through the pixel into the
     robot base frame and intersected with the z=0 plane.  The resulting metric
-    depth is log-encoded with POSE_D_MAX / POSE_ALPHA (suitable for <= 10 m).
+    depth is normalised with POSE_D_MAX / POSE_ALPHA.
 
     Args:
         ee_T:                    (4, 4) T_base_from_ee for the current frame.
         T_base_from_event_static:(4, 4) inv(T_event_from_ee) — precomputed.
         rays_cam:                (H*W, 3) ray directions in event-camera frame.
         H, W:                    Event-camera image dimensions.
+        log_depth:               If True, use log encoding; otherwise linear.
 
     Returns:
         (H, W) float32 array in [0, 1].
@@ -69,7 +68,10 @@ def compute_pose_depth_to_plane(
     t[t <= 0] = POSE_D_MAX
     depth = np.clip(t, 1e-4, POSE_D_MAX).reshape(H, W)
 
-    depth = (1.0 + (1.0 / POSE_ALPHA) * np.log(depth / POSE_D_MAX)).clip(0.0, 1.0)
+    if log_depth:
+        depth = (1.0 + (1.0 / POSE_ALPHA) * np.log(depth / POSE_D_MAX)).clip(0.0, 1.0)
+    else:
+        depth = (depth / POSE_D_MAX).clip(0.0, 1.0)
     return depth.astype(np.float32)
 
 
@@ -78,6 +80,7 @@ def process_sequence(
     calib_dir: Path,
     overwrite: bool = False,
     workers: int = 4,
+    log_depth: bool = False,
 ) -> dict:
     """
     Augment precomputed voxels in a single sequence with pose depth.
@@ -170,6 +173,7 @@ def process_sequence(
         voxel = np.load(voxel_files[i])  # (num_bins, H, W)
         pose_depth = compute_pose_depth_to_plane(
             ee_T[i], T_base_from_event_static, rays_cam, H, W,
+            log_depth=log_depth,
         )
         augmented = np.concatenate([voxel, pose_depth[None]], axis=0)
         np.save(dst_path, augmented)
@@ -221,6 +225,8 @@ def main():
                         help="Overwrite existing pose-augmented voxels")
     parser.add_argument("--workers", type=int, default=4,
                         help="Number of parallel workers for frame processing")
+    parser.add_argument("--log_depth", action="store_true",
+                        help="Use log encoding for pose depth (default: linear normalization)")
 
     args = parser.parse_args()
     calib_dir = Path(args.calib_dir)
@@ -243,13 +249,14 @@ def main():
 
     print(f"Found {len(sequence_dirs)} sequences to process")
     print(f"Calibration: {calib_dir}")
-    print(f"Pose encoding: D_MAX={POSE_D_MAX}, ALPHA={POSE_ALPHA}")
+    print(f"Pose encoding: D_MAX={POSE_D_MAX}, ALPHA={POSE_ALPHA}, mode={'log' if args.log_depth else 'linear'}")
     print(f"Overwrite: {args.overwrite}")
     print()
 
     results = []
     for seq_dir in sequence_dirs:
-        result = process_sequence(seq_dir, calib_dir, args.overwrite, workers=args.workers)
+        result = process_sequence(seq_dir, calib_dir, args.overwrite, workers=args.workers,
+                                  log_depth=args.log_depth)
         results.append(result)
         if result["success"]:
             print(f"  ✓ {result['name']}: {result['n_frames']} frames")

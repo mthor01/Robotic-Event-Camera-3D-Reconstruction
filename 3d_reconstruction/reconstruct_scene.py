@@ -33,10 +33,14 @@ import numpy as np
 import h5py
 import open3d as o3d
 
+from reconstruction_config import (
+    TSDF_VOXEL_SIZE, TSDF_SDF_TRUNC_FACTOR, TSDF_DEPTH_MIN, TSDF_DEPTH_MAX,
+    CALIB_DIR as _CALIB_DIR_REL,
+)
 
 # ── paths ────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).resolve().parent
-CAM_DATA   = SCRIPT_DIR / "camera_data"
+CAM_DATA   = SCRIPT_DIR / _CALIB_DIR_REL
 
 
 def load_calibration():
@@ -67,10 +71,10 @@ def make_o3d_intrinsic(K, width, height):
 
 def reconstruct(
     object_dir: Path,
-    voxel_size: float = 0.003,
-    sdf_trunc_factor: float = 4.0,
-    depth_min: float = 0.05,
-    depth_max: float = 2.0,
+    voxel_size: float = TSDF_VOXEL_SIZE,
+    sdf_trunc_factor: float = TSDF_SDF_TRUNC_FACTOR,
+    depth_min: float = TSDF_DEPTH_MIN,
+    depth_max: float = TSDF_DEPTH_MAX,
     skip: int = 1,
     output_format: str = "obj",
 ):
@@ -176,13 +180,13 @@ def main():
     )
     parser.add_argument("object_dir", type=str,
                         help="Path to recorded object directory (e.g. data/real/1)")
-    parser.add_argument("--voxel_size", type=float, default=0.003,
+    parser.add_argument("--voxel_size", type=float, default=TSDF_VOXEL_SIZE,
                         help="TSDF voxel size in metres")
-    parser.add_argument("--sdf_trunc_factor", type=float, default=4.0,
+    parser.add_argument("--sdf_trunc_factor", type=float, default=TSDF_SDF_TRUNC_FACTOR,
                         help="SDF truncation = voxel_size × this factor")
-    parser.add_argument("--depth_min", type=float, default=0.05,
+    parser.add_argument("--depth_min", type=float, default=TSDF_DEPTH_MIN,
                         help="Minimum depth in metres")
-    parser.add_argument("--depth_max", type=float, default=2.0,
+    parser.add_argument("--depth_max", type=float, default=TSDF_DEPTH_MAX,
                         help="Maximum depth in metres")
     parser.add_argument("--skip", type=int, default=1,
                         help="Use every N-th frame (1 = all frames)")

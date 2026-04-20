@@ -30,23 +30,14 @@ from metavision_hal import DeviceDiscovery
 from metavision_core.event_io import EventsIterator
 from metavision_sdk_core import PeriodicFrameGenerationAlgorithm
 
+from reconstruction_config import (
+    FPS, RS_WIDTH, RS_HEIGHT,
+    BIAS_DIFF_ON, BIAS_DIFF_OFF, BIAS_FO, BIAS_HPF, BIAS_REFR,
+    ZMQ_SYNC_ADDR, ZMQ_POSE_ADDR, DATA_ROOT, TEMPORAL_CHECK_ROOT,
+)
 
 # ================= CONFIG =================
-FPS = 30
-
-DATA_DIR = Path("data/real")
-
-RS_WIDTH, RS_HEIGHT = 640, 480
-
-BIAS_DIFF_ON = 10 #10 
-BIAS_DIFF_OFF = 80 # 80
-BIAS_FO = 0
-BIAS_HPF = 50
-BIAS_REFR = 150
-
-# ZMQ addresses
-ZMQ_SYNC_ADDR = "tcp://localhost:6001"  # REQ/REP for sync handshake
-ZMQ_POSE_ADDR = "tcp://localhost:6000"  # PUB/SUB for pose streaming (from my_main)
+DATA_DIR = DATA_ROOT
 # =========================================
 
 
@@ -350,12 +341,15 @@ def record_single_object(
     pose_receiver: "ZMQPoseReceiver",
     sync_client: "ZMQSyncClient",
     num_event_cams: int = 1,
+    data_dir: Path = None,
 ) -> bool:
     """
     Record a single object. Returns True if successful, False if should abort.
     """
+    if data_dir is None:
+        data_dir = DATA_DIR
     # Create object-specific directories
-    object_dir = DATA_DIR / object_name
+    object_dir = data_dir / object_name
     object_video_dir = object_dir / "videos"
     object_raw_dir = object_dir / "raw_event_data"
     object_hdf5_dir = object_dir / "hdf5"
@@ -966,12 +960,15 @@ def main(
             # In temporal-check mode, use a fixed name and record once
             if temporal_check:
                 object_name = "temporal_check"
-                object_dir = DATA_DIR / object_name
+                rec_dir = TEMPORAL_CHECK_ROOT
+                rec_dir.mkdir(parents=True, exist_ok=True)
+                object_dir = rec_dir / object_name
                 if object_dir.exists():
                     import shutil
                     shutil.rmtree(object_dir)
                     print(f"[Recording] Removed previous temporal_check recording")
             else:
+                rec_dir = DATA_DIR
                 # Ask for object name
                 object_name = get_object_name()
             
@@ -986,6 +983,7 @@ def main(
                 pose_receiver=pose_receiver,
                 sync_client=sync_client,
                 num_event_cams=num_event_cams,
+                data_dir=rec_dir,
             )
             
             if success:
@@ -998,7 +996,7 @@ def main(
                     _spec = importlib.util.spec_from_file_location("analyze_temporal_alignment", _script)
                     _mod = importlib.util.module_from_spec(_spec)
                     _spec.loader.exec_module(_mod)
-                    _mod.analyze_temporal_alignment(DATA_DIR / object_name)
+                    _mod.analyze_temporal_alignment(rec_dir / object_name)
                     break
             else:
                 print("\n[Recording] Recording failed or was aborted.")
