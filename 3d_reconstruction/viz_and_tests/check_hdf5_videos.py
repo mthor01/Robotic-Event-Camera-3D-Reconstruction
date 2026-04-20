@@ -323,7 +323,7 @@ def main() -> None:
         print(f"ERROR: hdf5 subdirectory not found: {hdf5_dir}")
         sys.exit(1)
 
-    out_dir = object_dir / "check_videos"
+    out_dir = object_dir / "video"
     out_dir.mkdir(exist_ok=True)
     print(f"Output videos will be written to: {out_dir}")
 
