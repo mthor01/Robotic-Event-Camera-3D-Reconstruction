@@ -30,6 +30,9 @@ Usage:
     # Depth only (skip RGB projection)
     python3 project_realsense_to_event.py --data_root data/real --no_rgb
 
+    # Overwrite existing outputs
+    python3 project_realsense_to_event.py --data_root data/real --overwrite
+
     # Custom calibration directory
     python3 project_realsense_to_event.py --data_root data/real --calib_dir camera_data
 """
@@ -44,7 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
 from reconstruction_config import (
-    CALIB_DIR, DATA_ROOT, FPS as DEFAULT_FPS,
+    CALIB_DIR, DATA_ROOT, FPS as DEFAULT_FPS, DEPTH_BLEED_RADIUS,
 )
 
 # ─── module-level FPS (overridden by --fps CLI arg) ───────────────
@@ -116,6 +119,7 @@ def project_depth_frame(
     ev_h: int,
     ev_w: int,
     depth_scale: float,
+    bleed_correction: bool = True,
 ) -> np.ndarray:
     """
     Project a single depth frame into the event camera image.
@@ -162,12 +166,38 @@ def project_depth_frame(
     order = np.argsort(-z_event)
     depth_out[pv[order], pu[order]] = z_event[order].astype(np.float32)
 
-    # Fill small gaps caused by resolution mismatch between depth and event
-    # cameras.  A 3×3 dilation propagates valid depths into 1-pixel holes,
-    # then we keep only newly-filled pixels where a hole existed.
-    kernel = np.ones((3, 3), dtype=np.uint8)
-    dilated = cv2.dilate(depth_out, kernel, iterations=1)
-    depth_out[depth_out == 0] = dilated[depth_out == 0]
+    # Parallax bleed correction: a scattered background point that lands on a
+    # foreground pixel appears as an isolated high-depth value surrounded by
+    # low-depth values.  Replace it with the nearest valid neighbour depth.
+    # SENTINEL substitutes for 0/invalid so erode gives the true nearest-valid
+    # minimum instead of propagating zeros.
+    # Keep BLEED_RADIUS small (1 = 3×3) so only immediately adjacent foreground
+    # triggers a correction; larger radii turn into a foreground halo.
+    SENTINEL = np.float32(1e6)
+    if bleed_correction:
+        BLEED_THRESHOLD_M = np.float32(0.05)   # pixel must be >5 cm farther than neighbour
+        bleed_kernel = np.ones((2 * DEPTH_BLEED_RADIUS + 1, 2 * DEPTH_BLEED_RADIUS + 1), dtype=np.uint8)
+        depth_temp = depth_out.copy()
+        depth_temp[depth_temp == 0] = SENTINEL
+        local_min = cv2.erode(depth_temp, bleed_kernel)
+        local_min[local_min >= SENTINEL * 0.9] = np.float32(0.0)
+        bleed_mask = (
+            (depth_out > 0) &
+            (local_min > 0) &
+            (depth_out > local_min + BLEED_THRESHOLD_M)
+        )
+        depth_out[bleed_mask] = local_min[bleed_mask]
+
+    # Gap fill: fill zero pixels (scatter resolution mismatch) with the nearest
+    # (minimum) valid neighbour using erode+sentinel.
+    # Do NOT use cv2.dilate (local MAX) — that fills gaps with background (far)
+    # depth, which causes a background grid pattern on the foreground object.
+    small_kernel = np.ones((3, 3), dtype=np.uint8)
+    depth_temp2 = depth_out.copy()
+    depth_temp2[depth_temp2 == 0] = SENTINEL
+    fill_min = cv2.erode(depth_temp2, small_kernel)
+    fill_min[fill_min >= SENTINEL * 0.9] = np.float32(0.0)
+    depth_out[depth_out == 0] = fill_min[depth_out == 0]
 
     return depth_out
 
@@ -269,7 +299,7 @@ def project_rgb_frame(
     return rgb_out
 
 
-def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True, workers: int = 4) -> None:
+def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True, save_videos: bool = False, workers: int = 4, bleed_correction: bool = True, overwrite: bool = False) -> None:
     """Project all depth (and optionally RGB) frames for one recording directory."""
     rs_h5_path = seq_dir / "hdf5" / "realsense.h5"
     if not rs_h5_path.exists():
@@ -280,7 +310,13 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True, work
     out_depth_vid = seq_dir / "videos" / "depth_in_event_frame.mp4"
     out_rgb_h5 = seq_dir / "hdf5" / "rgb_in_event_frame.h5"
     out_rgb_vid = seq_dir / "videos" / "rgb_in_event_frame.mp4"
-    (seq_dir / "videos").mkdir(parents=True, exist_ok=True)
+
+    if not overwrite and out_depth_h5.exists():
+        print(f"[skip] {seq_dir.name} — depth_in_event_frame.h5 already exists (use --overwrite)")
+        return
+
+    if save_videos:
+        (seq_dir / "videos").mkdir(parents=True, exist_ok=True)
 
     # Extract calibration
     T = calib["T_event_from_depth"]
@@ -313,17 +349,19 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True, work
         print(f"[{seq_dir.name}] Projecting {N} frames ({dep_w}x{dep_h}) → event frame ({ev_w}x{ev_h})"
               f"{' + RGB' if has_rgb_src else ''}")
 
-        # Video writers
-        depth_video = cv2.VideoWriter(
-            str(out_depth_vid), cv2.VideoWriter_fourcc(*"mp4v"),
-            FPS, (ev_w, ev_h), isColor=True,
-        )
+        # Video writers (optional)
+        depth_video = None
         rgb_video = None
-        if has_rgb_src:
-            rgb_video = cv2.VideoWriter(
-                str(out_rgb_vid), cv2.VideoWriter_fourcc(*"mp4v"),
+        if save_videos:
+            depth_video = cv2.VideoWriter(
+                str(out_depth_vid), cv2.VideoWriter_fourcc(*"mp4v"),
                 FPS, (ev_w, ev_h), isColor=True,
             )
+            if has_rgb_src:
+                rgb_video = cv2.VideoWriter(
+                    str(out_rgb_vid), cv2.VideoWriter_fourcc(*"mp4v"),
+                    FPS, (ev_w, ev_h), isColor=True,
+                )
 
         # Event frames for overlay
         ev_h5_path = seq_dir / "hdf5" / "events_cam0.h5"
@@ -373,6 +411,7 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True, work
                         pool.submit(
                             project_depth_frame,
                             d, rays, R, t_vec, K_event, dist_event, ev_h, ev_w, depth_scale,
+                            bleed_correction,
                         )
                         for d in batch_depth_u16
                     ]
@@ -392,36 +431,40 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True, work
                         proj_depth = depth_futures[j].result()
                         depth_out_ds[i] = proj_depth
 
-                        colour = colorise_depth(proj_depth)
-                        ev_gray = batch_ev[j]
-                        if ev_gray is not None:
-                            ev_bgr = cv2.cvtColor(ev_gray, cv2.COLOR_GRAY2BGR)
-                            mask = proj_depth > 0
-                            frame = ev_bgr.copy()
-                            frame[mask] = cv2.addWeighted(ev_bgr, 0.4, colour, 0.6, 0)[mask]
-                        else:
-                            frame = colour
-                        depth_video.write(frame)
+                        if save_videos:
+                            colour = colorise_depth(proj_depth)
+                            ev_gray = batch_ev[j]
+                            if ev_gray is not None:
+                                ev_bgr = cv2.cvtColor(ev_gray, cv2.COLOR_GRAY2BGR)
+                                mask = proj_depth > 0
+                                frame = ev_bgr.copy()
+                                frame[mask] = cv2.addWeighted(ev_bgr, 0.4, colour, 0.6, 0)[mask]
+                            else:
+                                frame = colour
+                            depth_video.write(frame)
 
                         if has_rgb_src:
                             proj_rgb = rgb_futures[j].result()
                             rgb_out_ds[i] = proj_rgb
 
-                            rgb_bgr = cv2.cvtColor(proj_rgb, cv2.COLOR_RGB2BGR)
-                            if ev_gray is not None:
-                                ev_bgr2 = cv2.cvtColor(ev_gray, cv2.COLOR_GRAY2BGR)
-                                rgb_mask = np.any(proj_rgb > 0, axis=-1)
-                                rgb_frame = ev_bgr2.copy()
-                                rgb_frame[rgb_mask] = cv2.addWeighted(ev_bgr2, 0.3, rgb_bgr, 0.7, 0)[rgb_mask]
-                            else:
-                                rgb_frame = rgb_bgr
-                            rgb_video.write(rgb_frame)
+                            if save_videos:
+                                rgb_bgr = cv2.cvtColor(proj_rgb, cv2.COLOR_RGB2BGR)
+                                ev_gray = batch_ev[j]
+                                if ev_gray is not None:
+                                    ev_bgr2 = cv2.cvtColor(ev_gray, cv2.COLOR_GRAY2BGR)
+                                    rgb_mask = np.any(proj_rgb > 0, axis=-1)
+                                    rgb_frame = ev_bgr2.copy()
+                                    rgb_frame[rgb_mask] = cv2.addWeighted(ev_bgr2, 0.3, rgb_bgr, 0.7, 0)[rgb_mask]
+                                else:
+                                    rgb_frame = rgb_bgr
+                                rgb_video.write(rgb_frame)
 
                     pbar.update(len(batch_range))
         finally:
             if ev_h5 is not None:
                 ev_h5.close()
-            depth_video.release()
+            if depth_video is not None:
+                depth_video.release()
             if rgb_video is not None:
                 rgb_video.release()
             out_dh5.close()
@@ -429,10 +472,12 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True, work
                 out_rh5.close()
 
     print(f"  -> {out_depth_h5}")
-    print(f"  -> {out_depth_vid}")
+    if save_videos:
+        print(f"  -> {out_depth_vid}")
     if has_rgb_src:
         print(f"  -> {out_rgb_h5}")
-        print(f"  -> {out_rgb_vid}")
+        if save_videos:
+            print(f"  -> {out_rgb_vid}")
 
 
 def find_recordings(root: Path) -> list[Path]:
@@ -471,8 +516,21 @@ def main():
         help="Skip RGB projection (depth only)",
     )
     parser.add_argument(
+        "--save-videos", action="store_true",
+        help="Generate MP4 videos (depth_in_event_frame.mp4, rgb_in_event_frame.mp4). "
+             "Default: only create HDF5 files.",
+    )
+    parser.add_argument(
         "--workers", type=int, default=4,
         help="Number of parallel workers for frame projection",
+    )
+    parser.add_argument(
+        "--no-bleed-correction", action="store_true",
+        help="Disable parallax bleed correction (background depth on foreground pixels)",
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true",
+        help="Overwrite existing depth_in_event_frame.h5 / rgb_in_event_frame.h5 files",
     )
     args = parser.parse_args()
 
@@ -488,10 +546,18 @@ def main():
 
     print(f"Processing {len(dirs)} recording(s)")
     print(f"RGB projection: {'off' if args.no_rgb else 'on'}")
+    print(f"Video generation: {'on' if args.save_videos else 'off'}")
     FPS = args.fps
 
     for d in dirs:
-        process_recording(d, calib, project_rgb=not args.no_rgb, workers=args.workers)
+        process_recording(
+            d, calib,
+            project_rgb=not args.no_rgb,
+            save_videos=args.save_videos,
+            workers=args.workers,
+            bleed_correction=not args.no_bleed_correction,
+            overwrite=args.overwrite,
+        )
 
     print("\nDone.")
 

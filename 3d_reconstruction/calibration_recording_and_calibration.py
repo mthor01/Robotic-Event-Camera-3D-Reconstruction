@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
-"""Combined calibration recording + calibration server (Docker B / metavision).
+"""Multi-camera calibration with optional robot arm data collection.
 
-Records RGB images and accumulated event frames, then runs the full
-intrinsic + extrinsic calibration pipeline in one go.
+Two modes:
+  1. Calibration-only mode (default): Uses pre-collected frames from
+     rgb_frames/ and event_frames/ in --output-dir. Requires RealSense
+     to be connected for SDK intrinsics/extrinsics extraction.
 
-Usage:
-    python calibration_recording_and_calibration.py \
+  2. Robot arm collection mode (--collect-data): Runs ZMQ server to collect
+     new frames via robot arm movements. Overwrites existing frames.
+
+Usage (calibration-only, default):
+    python calibration_recording_and_calibration.py --output-dir camera_data
+
+Usage (collect new data with robot arm):
+    python calibration_recording_and_calibration.py --collect-data \
         [--zmq-bind tcp://0.0.0.0:6002] [--output-dir camera_data]
 
-Protocol  (this script = REP,  agent in Docker A = REQ):
+Protocol for --collect-data mode (this script = REP,  agent in Docker A = REQ):
     INIT          ->  initialise, reply READY (data preserved between rounds)
     POSE_REACHED  ->  capture RS RGB, start event accumulation, reply RGB_CAPTURED
     WIGGLE_DONE   ->  stop event accumulation, reply EVENT_CAPTURED
@@ -218,10 +226,14 @@ def calibrate_stereo(rgb_imgs, ev_imgs, K_rgb, d_rgb, K_ev, d_ev,
 
 # ── pyrealsense2 conversion helpers ──────────────────────────────────
 def _rs_extrinsics_to_4x4(extr) -> np.ndarray:
+    """Convert RealSense extrinsics to 4x4 transformation matrix.
+    
+    CRITICAL: RealSense stores rotation as column-major 3x3 matrix in a
+    9-element array. Must use Fortran-order reshape or transpose.
+    """
     T = np.eye(4)
-    print(extr.rotation)
-    print(extr.translation)
-    T[:3, :3] = np.array(extr.rotation).reshape(3, 3)
+    # RealSense rotation is column-major, so use order='F' for correct reshape
+    T[:3, :3] = np.array(extr.rotation).reshape(3, 3, order='F')
     T[:3, 3] = np.array(extr.translation).flatten()
     return T
 
@@ -672,39 +684,251 @@ class CalibrationRecordingServer:
             self._rs_pipe.stop()
         if self._event_acc:
             self._event_acc.shutdown()
-        self._rep.close()
+        if hasattr(self, '_rep') and self._rep:
+            self._rep.close()
         print("[server] Cleanup done")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Standalone calibration (no robot arm)
+# ═══════════════════════════════════════════════════════════════════════
+def load_frames_from_disk(output_dir: Path) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Load pre-collected RGB and event frames from disk.
+    
+    Returns (rgb_images, event_frames) as lists of numpy arrays.
+    """
+    rgb_dir = output_dir / "rgb_frames"
+    event_dir = output_dir / "event_frames"
+    
+    if not rgb_dir.exists():
+        raise FileNotFoundError(f"RGB frames directory not found: {rgb_dir}")
+    
+    rgb_images = []
+    event_frames = []
+    
+    # Load RGB frames
+    rgb_files = sorted(rgb_dir.glob("rgb_*.png"))
+    if not rgb_files:
+        raise FileNotFoundError(f"No RGB frames found in {rgb_dir}")
+    
+    print(f"[load] Loading {len(rgb_files)} RGB frames from {rgb_dir}")
+    for rgb_file in rgb_files:
+        img = cv2.imread(str(rgb_file), cv2.IMREAD_COLOR)
+        if img is not None:
+            rgb_images.append(img)
+        else:
+            print(f"[load] WARNING: Failed to load {rgb_file}")
+    
+    # Load event frames (optional)
+    if event_dir.exists():
+        event_files = sorted(event_dir.glob("event_*.png"))
+        if event_files:
+            print(f"[load] Loading {len(event_files)} event frames from {event_dir}")
+            for event_file in event_files:
+                img = cv2.imread(str(event_file), cv2.IMREAD_GRAYSCALE)
+                if img is not None:
+                    event_frames.append(img)
+                else:
+                    print(f"[load] WARNING: Failed to load {event_file}")
+        else:
+            print(f"[load] No event frames found in {event_dir}")
+    else:
+        print(f"[load] Event frames directory not found: {event_dir} (skipping event calibration)")
+    
+    return rgb_images, event_frames
+
+
+def run_standalone_calibration(output_dir: Path) -> bool:
+    """Run calibration using pre-collected frames (no robot arm required).
+    
+    Requires RealSense to be connected for SDK intrinsics/extrinsics extraction.
+    """
+    print("\n" + "="*60)
+    print("CALIBRATION-ONLY MODE")
+    print("="*60)
+    print(f"Output directory: {output_dir}\n")
+    
+    # Load frames from disk
+    try:
+        rgb_images, event_frames = load_frames_from_disk(output_dir)
+    except FileNotFoundError as e:
+        print(f"\n[ERROR] {e}")
+        print("\nTo collect calibration data, run with --collect-data flag.")
+        return False
+    
+    print(f"[cal] Loaded {len(rgb_images)} RGB images, {len(event_frames)} event frames\n")
+    
+    # Initialize RealSense to get SDK intrinsics/extrinsics
+    print("[RS] Connecting to RealSense for SDK calibration data...")
+    try:
+        pipe = rs.pipeline()
+        cfg = rs.config()
+        cfg.disable_all_streams()
+        cfg.enable_stream(rs.stream.color, RS_W, RS_H, rs.format.bgr8, RS_FPS)
+        cfg.enable_stream(rs.stream.depth, RS_W, RS_H, rs.format.z16, RS_FPS)
+        profile = pipe.start(cfg)
+        
+        # Extract SDK calibration data
+        c_prof = profile.get_stream(rs.stream.color).as_video_stream_profile()
+        d_prof = profile.get_stream(rs.stream.depth).as_video_stream_profile()
+        
+        K_depth_sdk, d_depth_sdk, sz_depth = _rs_intrinsics_to_Kd(d_prof.get_intrinsics())
+        K_color_sdk, d_color_sdk, sz_color = _rs_intrinsics_to_Kd(c_prof.get_intrinsics())
+        T_color_from_depth = _rs_extrinsics_to_4x4(d_prof.get_extrinsics_to(c_prof))
+        depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
+        
+        pipe.stop()
+        print(f"[RS] Extracted SDK calibration data (depth scale={depth_scale:.6f})")
+        
+    except Exception as e:
+        print(f"\n[ERROR] Failed to connect to RealSense: {e}")
+        print("RealSense camera must be connected for calibration (SDK intrinsics/extrinsics needed).")
+        return False
+    
+    # Save SDK data
+    output_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        str(output_dir / "rs_depth_intrinsics.npz"),
+        camera_matrix=K_depth_sdk,
+        dist_coeffs=d_depth_sdk,
+        image_size=np.array(sz_depth),
+    )
+    np.savez(str(output_dir / "T_color_from_depth.npz"), T=T_color_from_depth)
+    np.savez(str(output_dir / "depth_scale.npz"), scale=depth_scale)
+    print("[cal] Saved SDK depth intrinsics + T_color_from_depth + depth_scale")
+    
+    # ChArUco board setup
+    board, det = _make_charuco()
+    
+    # RGB intrinsic calibration
+    print("\n=== RGB intrinsic calibration ===")
+    rgb_res = calibrate_intrinsics(rgb_images, board, det, label="RS-RGB")
+    if rgb_res is None:
+        print("[cal] RGB intrinsic calibration failed")
+        return False
+    K_rgb, d_rgb, sz_rgb, rms_rgb = rgb_res
+    np.savez(
+        str(output_dir / "rs_rgb_intrinsics.npz"),
+        camera_matrix=K_rgb,
+        dist_coeffs=d_rgb,
+        image_size=np.array(sz_rgb),
+        rms=rms_rgb,
+    )
+    print(f"[cal] Saved rs_rgb_intrinsics.npz  (RMS={rms_rgb:.4f})")
+    
+    # Event camera intrinsic calibration (if event frames exist)
+    if event_frames:
+        print("\n=== Event intrinsic calibration ===")
+        ev_res = calibrate_intrinsics(event_frames, board, det, label="Event")
+        if ev_res is None:
+            print("[cal] Event intrinsic calibration failed")
+            return False
+        K_ev, d_ev, sz_ev, rms_ev = ev_res
+        np.savez(
+            str(output_dir / "event_intrinsics.npz"),
+            camera_matrix=K_ev,
+            dist_coeffs=d_ev,
+            image_size=np.array(sz_ev),
+            rms=rms_ev,
+        )
+        print(f"[cal] Saved event_intrinsics.npz  (RMS={rms_ev:.4f})")
+        
+        # Stereo calibration RGB <-> event
+        n_pairs = min(len(rgb_images), len(event_frames))
+        print(f"\n=== Stereo calibration ({n_pairs} pairs) ===")
+        stereo = calibrate_stereo(
+            rgb_images[:n_pairs], event_frames[:n_pairs],
+            K_rgb, d_rgb, K_ev, d_ev,
+            board, det,
+        )
+        if stereo is None:
+            print("[cal] Stereo calibration failed")
+            return False
+        R, T = stereo
+        T_event_from_rgb = np.eye(4)
+        T_event_from_rgb[:3, :3] = R
+        T_event_from_rgb[:3, 3] = T.flatten()
+        np.savez(
+            str(output_dir / "T_event_from_rgb.npz"),
+            T=T_event_from_rgb,
+            R=R,
+            t=T,
+        )
+        print("[cal] Saved T_event_from_rgb.npz")
+        
+        # Compose T_event_from_depth
+        T_event_from_depth = T_event_from_rgb @ T_color_from_depth
+        np.savez(str(output_dir / "T_event_from_depth.npz"), T=T_event_from_depth)
+        print("[cal] Saved T_event_from_depth.npz  (composed)")
+    else:
+        print("\n[cal] No event frames – skipping event + stereo calibration")
+    
+    print("\n" + "="*60)
+    print("CALIBRATION COMPLETE")
+    print("="*60)
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════
 def main():
     parser = argparse.ArgumentParser(
-        description="Combined calibration recording + calibration server (Docker B)"
+        description="Multi-camera calibration with optional robot arm data collection",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Calibrate using existing frames (default)
+  python calibration_recording_and_calibration.py --output-dir camera_data
+
+  # Collect new data with robot arm (overwrites existing frames)
+  python calibration_recording_and_calibration.py --collect-data --output-dir camera_data
+        """
+    )
+    parser.add_argument(
+        "--collect-data",
+        action="store_true",
+        help="Enable robot arm data collection mode (requires ZMQ backend). "
+             "Overwrites existing frames in output-dir.",
     )
     parser.add_argument(
         "--zmq-bind",
         default="tcp://0.0.0.0:6002",
-        help="ZMQ REP bind address (default: tcp://0.0.0.0:6002)",
+        help="ZMQ REP bind address for --collect-data mode (default: tcp://0.0.0.0:6002)",
     )
     parser.add_argument(
         "--output-dir",
         default="camera_data",
-        help="Directory to save calibration results (default: camera_data)",
+        help="Directory to save/load calibration data (default: camera_data)",
     )
     parser.add_argument(
         "--num-rounds",
         type=int,
         default=5,
-        help="Number of board-position rounds before calibrating (default: 5)",
+        help="Number of board-position rounds for --collect-data mode (default: 5)",
     )
     args = parser.parse_args()
-
-    server = CalibrationRecordingServer(
-        bind_addr=args.zmq_bind,
-        output_dir=args.output_dir,
-        num_rounds=args.num_rounds,
-    )
-    server.serve()
+    
+    output_path = Path(args.output_dir)
+    
+    if args.collect_data:
+        # Robot arm collection mode
+        print("\n" + "="*60)
+        print("ROBOT ARM DATA COLLECTION MODE")
+        print("="*60)
+        print(f"Output directory: {output_path}")
+        print(f"ZMQ bind address: {args.zmq_bind}")
+        print(f"Calibration rounds: {args.num_rounds}\n")
+        
+        server = CalibrationRecordingServer(
+            bind_addr=args.zmq_bind,
+            output_dir=args.output_dir,
+            num_rounds=args.num_rounds,
+        )
+        server.serve()
+    else:
+        # Standalone calibration mode (default)
+        success = run_standalone_calibration(output_path)
+        if not success:
+            exit(1)
 
 
 if __name__ == "__main__":

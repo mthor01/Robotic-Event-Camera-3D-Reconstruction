@@ -1473,7 +1473,7 @@ def main():
     train_group = parser.add_argument_group("Training")
     train_group.add_argument("--epochs", type=int, default=50,
                             help="Number of epochs")
-    train_group.add_argument("--batch", type=int, default=12,
+    train_group.add_argument("--batch", type=int, default=10,
                             help="Batch size")
     train_group.add_argument("--seq_len", type=int, default=10,
                             help="Sequence length for recurrent training")

@@ -33,16 +33,17 @@ from tqdm import tqdm
 from reconstruction_config import (
     CALIB_DIR as _CALIB_DIR,
     DATA_ROOT as _DATA_ROOT,
+    SPATIAL_CUBE_SIDE,
+    SPATIAL_CUBE_CENTER_Z,
 )
 
 CALIB_DIR = Path(__file__).resolve().parent / _CALIB_DIR
-SPATIAL_CUBE_SIDE = 0.40  # metres
 
 # Default target point in robot base frame (where the object is placed)
-# These match franka_pipeline/config_defaults.py TARGET_X/Y/Z
+# X/Y match franka_pipeline/config_defaults.py TARGET_X/Y; Z comes from reconstruction_config
 DEFAULT_TARGET_X = 0.3
 DEFAULT_TARGET_Y = 0.0
-DEFAULT_TARGET_Z = 0.05
+DEFAULT_TARGET_Z = SPATIAL_CUBE_CENTER_Z
 
 
 def load_calibration(calib_dir: Path) -> dict:

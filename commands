@@ -30,37 +30,18 @@ docker run --gpus all -it --rm \
   meta_and_pytorch \
   bash -c "cd /work/project/3d_reconstruction && exec bash"
 
-
-# testing
-
-python project/franka_pipeline/main.py --osc-demo --simulated-robot
-
-#zeromq test
-xhost +local:root
-
-docker compose up
-
-docker exec -it openvla bash
-
-docker exec -it metavision bash
-
-python project/franka_pipeline/my_main.py --simulated-robot
-
-#test training with test data
-python3 train_e2depth.py --data_dir test_data --batch 4 --seq_len 4 --all_sequences
-
-sudo chown -R $USER:$USER *
-sudo chown -R mthormann:cs_stud *
-
-python3 my_main.py --synthetic-data --object-filter "cube,milk,bottle" --headless
-
-
 docker run --rm -it \
   -v "$PWD:/work" \
   openvla \
   bash -lc "chown -R 101403:5018 /work"
+
+xhost +local:root
+
+
   
 ##########Record Data############
+python3 my_main.py --real-robot
+
 python3 precompute_voxels.py --overwrite
 
 python3 precompute_pose_depth.py 

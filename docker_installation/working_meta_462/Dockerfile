@@ -60,7 +60,8 @@ RUN python3 -m pip install --upgrade pip \
     tensorboard \
     tqdm \
     matplotlib \
-    scipy
+    scipy\
+    open3d
 
 
 # Optional: HDF5 plugin path for Ubuntu 22.04 (doc gives this exact path)

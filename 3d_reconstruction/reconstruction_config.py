@@ -63,9 +63,12 @@ TSDF_DEPTH_MAX = 2.0           # metres (larger range for 3-D reconstruction)
 WHITE_THRESH = 100  # RGB channel threshold for white detection
 
 # ═══════════════════════════════════════════════════════════════════
-#  Spatial masking (cube around end-effector)
+#  Spatial masking (cube around target position)
 # ═══════════════════════════════════════════════════════════════════
-SPATIAL_CUBE_SIDE = 0.40  # metres (40 cm cube)
+SPATIAL_CUBE_SIDE = 0.27    # metres (40 cm cube)
+SPATIAL_CUBE_Z_OFFSET = 0.006
+SPATIAL_CUBE_CENTER_Z = SPATIAL_CUBE_Z_OFFSET + SPATIAL_CUBE_SIDE / 2  # metres — Z of cube centre in robot base frame
+DEPTH_BLEED_RADIUS = 1      # px — half-width of bleed-correction kernel (3×3 default)
 
 # ═══════════════════════════════════════════════════════════════════
 #  Depth visualization (percentile normalization)

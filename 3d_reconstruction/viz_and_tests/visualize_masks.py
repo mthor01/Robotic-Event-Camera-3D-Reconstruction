@@ -15,8 +15,9 @@ fallback to the raw realsense.h5 for frames where the projection is empty.
 
 Usage:
     python3 viz_and_tests/visualize_masks.py
-    python3 viz_and_tests/visualize_masks.py --resize_h 288 --resize_w 384 --crop_h 240 --crop_w 320
+    python3 viz_and_tests/visualize_masks.py --data_dir data/real/box
     python3 viz_and_tests/visualize_masks.py --data_root data/real --out masks_overview.png
+    python3 viz_and_tests/visualize_masks.py --resize_h 288 --resize_w 384 --crop_h 240 --crop_w 320
 """
 
 from __future__ import annotations
@@ -117,7 +118,10 @@ def main():
         description="Visualize depth, white, and combined masks for all objects",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--data_root", type=str, default=str(DATA_ROOT))
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="Single recording directory (mutually exclusive with --data_root)")
+    parser.add_argument("--data_root", type=str, default=str(DATA_ROOT),
+                        help="Root directory containing recording subdirs")
     parser.add_argument("--out", type=str, default="masks_overview.png",
                         help="Output image path")
     parser.add_argument("--resize_h", type=int, default=288)
@@ -133,10 +137,16 @@ def main():
                         help="Display depth with log encoding (default: linear normalization)")
     args = parser.parse_args()
 
-    data_root = Path(args.data_root)
-    objects = find_objects(data_root)
-    if not objects:
-        sys.exit(f"No recordings found under {data_root}")
+    if args.data_dir:
+        obj_path = Path(args.data_dir)
+        if not (obj_path / "hdf5" / "realsense.h5").exists():
+            sys.exit(f"No realsense.h5 found in {obj_path}")
+        objects = [obj_path]
+    else:
+        data_root = Path(args.data_root)
+        objects = find_objects(data_root)
+        if not objects:
+            sys.exit(f"No recordings found under {data_root}")
 
     resize_hw = (args.resize_h, args.resize_w) if args.resize_h > 0 and args.resize_w > 0 else None
     crop_hw = (args.crop_h, args.crop_w) if args.crop_h > 0 and args.crop_w > 0 else None
@@ -160,8 +170,10 @@ def main():
             # Depth mask: valid depth range
             depth_mask = ((depth > args.depth_min) & (depth < args.depth_max)).astype(np.float32)
 
-            # White mask from RGB
-            white_mask = np.all(rgb > args.white_thresh, axis=-1).astype(np.float32)
+            # White mask from RGB: flag pixels that are white (background table)
+            # OR have no projected RGB value (event-frame pixels with no coverage).
+            no_rgb = np.all(rgb == 0, axis=-1)
+            white_mask = (np.all(rgb > args.white_thresh, axis=-1) | no_rgb).astype(np.float32)
 
             # Spatial mask (precomputed, optional)
             spatial_raw = None
