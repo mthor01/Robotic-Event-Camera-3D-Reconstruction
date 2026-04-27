@@ -65,35 +65,29 @@ HEADLESS = False
 # =============================================================================
 # AGENT CONFIGURATION
 # =============================================================================
-# Agent type: "hemisphere", "random_sphere", or "random_hemisphere"
+# Agent type: "hemisphere" or "random_hemisphere"
 AGENT_TYPE = "random_hemisphere"
-
-# Sphere center (robot base frame) - only used by RandomSphereAgent
-# For RandomHemisphereAgent, the center is always equal to TARGET_X/Y/Z
-SPHERE_CENTER_X = 0.4
-SPHERE_CENTER_Y = 0.0
-SPHERE_CENTER_Z = 0.4
 
 # Target point (where the camera looks at)
 # For RandomHemisphereAgent, this is also the center of the hemisphere
-TARGET_X = 0.3
+TARGET_X = 0.35
 TARGET_Y = 0.0
-TARGET_Z = 0.05
+TARGET_Z = 0.12
 
 # Sphere/Hemisphere radius
 SPHERE_RADIUS = 0.4
 
 # Inner radius for hollow hemisphere (RandomHemisphereAgent only)
-INNER_RADIUS = 0.15
+INNER_RADIUS = 0.2
 
 # Number of random poses to generate
-NUM_POSES = 20
+NUM_POSES = 30
 
 # =============================================================================
 # WAYPOINT INTERPOLATION
 # =============================================================================
 # Number of intermediate waypoints between main poses
-WAYPOINTS_PER_TRANSITION = 2
+WAYPOINTS_PER_TRANSITION = 1
 
 # Time to wait at each pose (seconds)
 WAIT_TIME = 0.0
@@ -102,7 +96,7 @@ WAIT_TIME = 0.0
 RANDOM_SEED = None
 
 # =============================================================================
-# SAFETY ZONE PARAMETERS (for RandomSphereAgent and RandomHemisphereAgent)
+# SAFETY ZONE PARAMETERS (for RandomHemisphereAgent)
 # =============================================================================
 # Exclude poses within this x,y radius of robot base (0,0)
 BASE_EXCLUSION_RADIUS = 0.4

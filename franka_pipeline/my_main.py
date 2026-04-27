@@ -31,7 +31,6 @@ import msgpack
 from franka_pipeline.logging import get_logger, setup_logging
 from franka_pipeline.agents.episode_control_wrapper_agent import EpisodeControlWrapperAgent
 from franka_pipeline.agents.hemisphere_grid_agent import HemisphereGridAgent
-from franka_pipeline.agents.random_sphere_agent import RandomSphereAgent
 from franka_pipeline.agents.random_hemisphere_agent import RandomHemisphereAgent
 from franka_pipeline.agents.temporal_alignment_agent import TemporalAlignmentAgent
 from franka_pipeline.robot_controllers.controller import (
@@ -274,8 +273,7 @@ def _run_single_object_recording(
     zmq_bind: str,
     publish_hz: float,
     headless: bool = False,
-    agent_type: str = "random_sphere",
-    sphere_center: np.ndarray = None,
+    agent_type: str = "random_hemisphere",
     sphere_radius: float = 0.3,
     num_poses: int = 20,
     wait_time: float = 0.0,
@@ -367,22 +365,9 @@ def _run_single_object_recording(
                 lock_rotation_horizontal=cfg.LOCK_ROTATION_HORIZONTAL,
             )
         )
-    else:  # Default to random_sphere
-        if sphere_center is None:
-            sphere_center = np.array([0.4, 0.0, 0.0])
-        if target_point is None:
-            target_point = np.array([0.35, 0.0, -0.1])
-        agent = EpisodeControlWrapperAgent(
-            RandomSphereAgent(
-                center=sphere_center,
-                radius=sphere_radius,
-                num_poses=num_poses,
-                wait_time=wait_time,
-                seed=random_seed,
-                target_point=target_point,
-            )
-        )
-    
+    else:
+        raise ValueError(f"Unknown agent_type: {agent_type!r}")
+
     # Reset for recording
     robot_controller.reset_robot_joints()
     step_count = 0
@@ -599,22 +584,7 @@ def main(
     agent_type: str = typer.Option(
         cfg.AGENT_TYPE,
         "--agent-type",
-        help="Agent type to use: 'hemisphere', 'random_sphere', or 'random_hemisphere'. Default: random_sphere",
-    ),
-    sphere_center_x: float = typer.Option(
-        cfg.SPHERE_CENTER_X,
-        "--sphere-center-x",
-        help="X coordinate of sphere center (robot base frame).",
-    ),
-    sphere_center_y: float = typer.Option(
-        cfg.SPHERE_CENTER_Y,
-        "--sphere-center-y",
-        help="Y coordinate of sphere center (robot base frame).",
-    ),
-    sphere_center_z: float = typer.Option(
-        cfg.SPHERE_CENTER_Z,
-        "--sphere-center-z",
-        help="Z coordinate of sphere center (robot base frame).",
+        help="Agent type to use: 'hemisphere' or 'random_hemisphere'. Default: random_hemisphere",
     ),
     target_x: float = typer.Option(
         cfg.TARGET_X,
@@ -729,7 +699,6 @@ def main(
                 publish_hz=publish_hz,
                 headless=headless,
                 agent_type=agent_type,
-                sphere_center=np.array([sphere_center_x, sphere_center_y, sphere_center_z]),
                 sphere_radius=sphere_radius,
                 num_poses=num_poses,
                 wait_time=wait_time,
@@ -821,25 +790,12 @@ def main(
                     center_x=target_x,
                     center_y=target_y,
                     center_z=0.25,
-                    rotation_deg=45.0,
-                    num_sweeps=8,
+                    rotation_deg=20.0,
+                    num_sweeps=20,
                 )
             )
-        else:  # Default to random_sphere
-            logger.info(f"Using RandomSphereAgent with {num_poses} poses")
-            logger.info(f"  Sphere center: ({sphere_center_x}, {sphere_center_y}, {sphere_center_z})")
-            logger.info(f"  Target point: ({target_x}, {target_y}, {target_z})")
-            logger.info(f"  Sphere radius: {sphere_radius}")
-            return EpisodeControlWrapperAgent(
-                RandomSphereAgent(
-                    center=np.array([sphere_center_x, sphere_center_y, sphere_center_z]),
-                    radius=sphere_radius,
-                    num_poses=num_poses,
-                    wait_time=wait_time,
-                    seed=random_seed,
-                    target_point=np.array([target_x, target_y, target_z]),
-                )
-            )
+        else:
+            raise ValueError(f"Unknown agent_type: {agent_type!r}")
 
     # Special case: multi-camera calibration agent (own control loop)
     if calibration_poses or agent_type.lower() == "multi_cam_calibrate":

@@ -97,7 +97,18 @@ def run_frame_level(seq_dir: Path, out_dir: Path, smooth_k: int = 3) -> None:
         raise FileNotFoundError(f"No poses.h5 in {hdf5_dir}")
     with h5py.File(poses_path, "r") as f:
         ee_T = f["ee_T"][:]
-        t_ns = f["t_ns"][:] if "t_ns" in f else np.arange(len(ee_T), dtype=np.float64)
+
+    # Load frame timestamps from realsense.h5 (poses.h5 does not store t_ns)
+    rs_path = hdf5_dir / "realsense.h5"
+    if rs_path.exists():
+        with h5py.File(rs_path, "r") as f:
+            # Prefer hardware-anchored timestamps (cleaner inter-frame spacing)
+            if "t_hw_as_sys_ns" in f:
+                t_ns = f["t_hw_as_sys_ns"][:]
+            else:
+                t_ns = f["t_sys_ns"][:]
+    else:
+        t_ns = np.arange(len(ee_T), dtype=np.float64) * (1e9 / DEFAULT_FPS)
 
     N = len(ee_T)
     R = ee_T[:, :3, :3]
@@ -135,33 +146,42 @@ def run_frame_level(seq_dir: Path, out_dir: Path, smooth_k: int = 3) -> None:
     spikes_vel = find_troughs(vel_smooth)
     spikes_ev  = find_troughs(ev_smooth)
 
-    if len(spikes_ev) > 0:
-        idx_ev = np.round(spikes_ev).astype(int).clip(0, L - 1)
-        spikes_ev = spikes_ev[ev_smooth[idx_ev] < np.percentile(ev_smooth, 20)]
-    if len(spikes_vel) > 0:
-        idx_vel = np.round(spikes_vel).astype(int).clip(0, L - 1)
-        spikes_vel = spikes_vel[vel_smooth[idx_vel] < np.percentile(vel_smooth, 20)]
+    # Estimate expected inter-trough spacing to cap match distance
+    n_troughs = max(len(spikes_vel), len(spikes_ev), 1)
+    max_match_dist = max(3.0, L / n_troughs * 0.4)  # 40% of avg spacing, min 3 frames
 
-    # Match spikes
+    # Match spikes — symmetric greedy (sort all pairs by distance, match closest first)
     offsets_frames = []
     matched_vel, matched_ev = [], []
-    used_ev = set()
-    for sv in spikes_vel:
-        if len(spikes_ev) == 0:
-            break
-        dists = np.abs(spikes_ev - sv)
-        for best in np.argsort(dists):
-            if best not in used_ev:
-                used_ev.add(int(best))
-                offsets_frames.append(float(spikes_ev[best] - sv))
-                matched_vel.append(float(sv))
-                matched_ev.append(float(spikes_ev[best]))
+    if len(spikes_vel) > 0 and len(spikes_ev) > 0:
+        candidates = sorted(
+            (abs(float(a) - float(b)), ia, ib)
+            for ia, a in enumerate(spikes_vel)
+            for ib, b in enumerate(spikes_ev)
+        )
+        used_vel, used_ev = set(), set()
+        for dist, ia, ib in candidates:
+            if dist > max_match_dist:
                 break
+            if ia not in used_vel and ib not in used_ev:
+                used_vel.add(ia); used_ev.add(ib)
+                offsets_frames.append(float(spikes_ev[ib] - spikes_vel[ia]))
+                matched_vel.append(float(spikes_vel[ia]))
+                matched_ev.append(float(spikes_ev[ib]))
 
     offsets_frames = np.array(offsets_frames) if offsets_frames else np.array([])
     int_offsets = np.round(offsets_frames).astype(int) if len(offsets_frames) > 0 else np.array([], dtype=int)
     frame_dt = np.median(np.diff(t_sec_trim)) if len(t_sec_trim) > 1 else 1.0 / 30.0
     offsets_ms = offsets_frames * frame_dt * 1000.0
+
+    # Keep only pairs with |offset| < 100 ms
+    if len(offsets_ms) > 0:
+        mask = np.abs(offsets_ms) < 100.0
+        offsets_frames = offsets_frames[mask]
+        int_offsets = int_offsets[mask]
+        offsets_ms = offsets_ms[mask]
+        matched_vel = [v for v, m in zip(matched_vel, mask) if m]
+        matched_ev  = [e for e, m in zip(matched_ev,  mask) if m]
 
     # Print summary
     print("\n" + "=" * 60)
@@ -177,8 +197,8 @@ def run_frame_level(seq_dir: Path, out_dir: Path, smooth_k: int = 3) -> None:
     print("=" * 60)
 
     # Figure
-    fig = plt.figure(figsize=(14, 12))
-    gs = GridSpec(4, 2, figure=fig, height_ratios=[2, 2, 1.2, 1.2], hspace=0.35, wspace=0.30)
+    fig = plt.figure(figsize=(14, 10))
+    gs = GridSpec(3, 2, figure=fig, height_ratios=[2, 2, 1.2], hspace=0.35, wspace=0.30)
     frames = np.arange(L)
     color_pos, color_ev = "#2066a8", "#d6604d"
 
@@ -210,7 +230,7 @@ def run_frame_level(seq_dir: Path, out_dir: Path, smooth_k: int = 3) -> None:
     ax2.legend(fontsize=8)
 
     # Panel 3: histogram
-    ax3 = fig.add_subplot(gs[2, 0])
+    ax3 = fig.add_subplot(gs[2, 0])  # noqa
     if len(int_offsets) > 0:
         lo, hi = int_offsets.min(), int_offsets.max()
         bins = np.arange(lo - 0.5, hi + 1.5, 1.0)
@@ -226,34 +246,15 @@ def run_frame_level(seq_dir: Path, out_dir: Path, smooth_k: int = 3) -> None:
     # Panel 4: offset over time
     ax4 = fig.add_subplot(gs[2, 1])
     if len(int_offsets) > 0:
-        ax4.scatter(matched_vel, int_offsets, color="#333", s=35, zorder=3)
+        dot_colors = ["#4daf4a" if o == 0 else ("#2066a8" if abs(o) <= 1 else "#ff7f00") for o in int_offsets]
+        ax4.scatter(matched_vel, int_offsets, color=dot_colors, edgecolors="k", linewidths=0.5, s=40, zorder=3)
         ax4.axhline(0, color="gray", lw=0.5, ls=":")
         ax4.axhline(float(np.median(int_offsets)), color="red", lw=1.0, ls="--")
         ax4.set_xlabel("Frame of speed spike"); ax4.set_ylabel("Offset (frames)")
         ax4.set_title("Offset over time", fontsize=10)
-
-    # Panel 5: per-pair bar
-    ax5 = fig.add_subplot(gs[3, 0])
-    if len(int_offsets) > 0:
-        from matplotlib.patches import Patch
-        bar_colors = ["#4daf4a" if o == 0 else ("#2066a8" if abs(o) <= 1 else "#ff7f00") for o in int_offsets]
-        ax5.bar(range(len(int_offsets)), int_offsets, color=bar_colors, edgecolor="k", linewidth=0.5)
-        ax5.axhline(0, color="gray", lw=0.7, ls="--")
-        ax5.set_xlabel("Pair"); ax5.set_ylabel("Offset")
-        ax5.legend(handles=[Patch(facecolor="#4daf4a", label="0"), Patch(facecolor="#2066a8", label="±1"),
-                            Patch(facecolor="#ff7f00", label=">1")], fontsize=7)
-
-    # Panel 6: summary
-    ax6 = fig.add_subplot(gs[3, 1]); ax6.axis("off")
-    summary = f"Recording: {seq_dir.name}\nPose: {N}  Event: {M}\nSmoothing: k={smooth_k}\n\n"
-    if len(int_offsets) > 0:
         med = int(np.median(int_offsets))
-        summary += f"Matched: {len(int_offsets)}\nMean: {int_offsets.mean():+.1f}fr\nMedian: {med:+d}fr\n"
-        if abs(med) == 0: summary += "\n✓ Alignment GOOD"
-        elif abs(med) == 1: summary += "\n~ Alignment OK (±1)"
-        else: summary += f"\n✗ Alignment OFF ({med:+d}fr)"
-    ax6.text(0.05, 0.95, summary, transform=ax6.transAxes, fontsize=9, family="monospace", va="top",
-             bbox=dict(boxstyle="round,pad=0.4", facecolor="#f7f7f7", edgecolor="#ccc"))
+        label = "✓ GOOD" if abs(med) == 0 else ("~ OK (±1)" if abs(med) == 1 else f"✗ OFF ({med:+d}fr)")
+        ax4.set_title(f"Offset over time  |  n={len(int_offsets)}  med={med:+d}fr  {label}", fontsize=9)
 
     fig.suptitle("Frame-Level Temporal Alignment — Rotation Speed vs Event Activity",
                  fontsize=13, fontweight="bold", y=0.98)
@@ -268,8 +269,7 @@ def run_frame_level(seq_dir: Path, out_dir: Path, smooth_k: int = 3) -> None:
 
 def run_voxel_level(seq_dir: Path, out_dir: Path, smooth_k: int = 5) -> None:
     """Voxel-bin level temporal alignment at ~5× higher resolution."""
-    hdf5_dir   = seq_dir / "hdf5"
-    voxels_dir = seq_dir / "events" / "voxels_cam0"
+    hdf5_dir = seq_dir / "hdf5"
 
     # Raw poses
     raw_path = hdf5_dir / "raw_poses.h5"
@@ -296,30 +296,30 @@ def run_voxel_level(seq_dir: Path, out_dir: Path, smooth_k: int = 5) -> None:
         t_end_us   = f["events/t_ev_end_us"][:]
     N_frames = len(t_start_us)
 
-    # Voxels
-    if not voxels_dir.exists():
-        raise FileNotFoundError(f"No voxels directory: {voxels_dir}")
-    voxel_files = sorted(voxels_dir.glob("voxel_*.npy"))
-    if not voxel_files:
-        raise FileNotFoundError(f"No voxel files in {voxels_dir}")
+    # Voxels — stored as a single HDF5 file (shape: N, bins, H, W)
+    voxels_h5 = seq_dir / "events" / "voxels_cam0.h5"
+    if not voxels_h5.exists():
+        raise FileNotFoundError(f"No voxels file: {voxels_h5}")
 
-    n_voxel_frames = min(len(voxel_files), N_frames)
-    num_bins = np.load(voxel_files[0]).shape[0]
+    with h5py.File(voxels_h5, "r") as vf:
+        voxels_ds = vf["voxels"]
+        n_voxel_frames = min(voxels_ds.shape[0], N_frames)
+        num_bins = voxels_ds.shape[1]
 
-    bin_t_us, bin_activity = [], []
-    for fi in range(n_voxel_frames):
-        voxel = np.load(voxels_dir / f"voxel_{fi:06d}.npy")
-        t0, t1 = float(t_start_us[fi]), float(t_end_us[fi])
-        for b in range(num_bins):
-            frac = (b + 0.5) / num_bins
-            bin_t_us.append(t0 + frac * (t1 - t0))
-            bin_activity.append(float(np.std(voxel[b])))
+        bin_t_us, bin_activity = [], []
+        for fi in range(n_voxel_frames):
+            voxel = voxels_ds[fi]  # (bins, H, W)
+            t0, t1 = float(t_start_us[fi]), float(t_end_us[fi])
+            for b in range(num_bins):
+                frac = (b + 0.5) / num_bins
+                bin_t_us.append(t0 + frac * (t1 - t0))
+                bin_activity.append(float(np.std(voxel[b])))
 
     bin_t_us = np.array(bin_t_us)
     bin_activity = np.array(bin_activity)
     N_bins = len(bin_t_us)
 
-    ev_elapsed_ns = (bin_t_us - t_end_us[0]).astype(np.float64) * 1000.0
+    ev_elapsed_ns = (bin_t_us - t_start_us[0]).astype(np.float64) * 1000.0
     pose_elapsed_ns = (pose_t_ns - event_logging_start_ns).astype(np.float64)
 
     # Nearest pose matching
@@ -382,6 +382,15 @@ def run_voxel_level(seq_dir: Path, out_dir: Path, smooth_k: int = 5) -> None:
     offsets_ms = offsets_bins * bin_dt * 1000.0
     offsets_frames = offsets_bins / num_bins
 
+    # Keep only pairs with |offset| < 100 ms
+    if len(offsets_ms) > 0:
+        mask = np.abs(offsets_ms) < 100.0
+        offsets_bins   = offsets_bins[mask]
+        offsets_ms     = offsets_ms[mask]
+        offsets_frames = offsets_frames[mask]
+        matched_v = [v for v, m in zip(matched_v, mask) if m]
+        matched_a = [a for a, m in zip(matched_a, mask) if m]
+
     # Summary
     print("\n" + "=" * 60)
     print("  VOXEL-BIN TEMPORAL ALIGNMENT")
@@ -397,7 +406,7 @@ def run_voxel_level(seq_dir: Path, out_dir: Path, smooth_k: int = 5) -> None:
 
     # Figure
     fig = plt.figure(figsize=(14, 12))
-    gs = GridSpec(4, 2, figure=fig, height_ratios=[2, 2, 1.2, 1.2], hspace=0.35, wspace=0.30)
+    gs = GridSpec(3, 2, figure=fig, height_ratios=[2, 2, 1.2], hspace=0.35, wspace=0.30)
     bins_x = np.arange(L)
     color_sp, color_ev = "#2066a8", "#d6604d"
 
@@ -437,31 +446,11 @@ def run_voxel_level(seq_dir: Path, out_dir: Path, smooth_k: int = 5) -> None:
         ax4.axhline(0, color="gray", lw=0.5, ls=":")
         ax4.axhline(float(np.median(offsets_ms)), color="red", lw=1.0, ls="--")
         ax4.set_xlabel("Bin of speed trough"); ax4.set_ylabel("Offset (ms)")
-    ax4.set_title("Offset over time", fontsize=10)
-
-    ax5 = fig.add_subplot(gs[3, 0])
-    if len(offsets_ms) > 0:
-        from matplotlib.patches import Patch
-        bar_c = ["#4daf4a" if abs(o) < bin_dt * 1000 else ("#2066a8" if abs(o) < 2 * bin_dt * 1000 else "#ff7f00")
-                 for o in offsets_ms]
-        ax5.bar(range(len(offsets_ms)), offsets_ms, color=bar_c, edgecolor="k", linewidth=0.5)
-        ax5.axhline(0, color="gray", lw=0.7, ls="--")
-        ax5.set_xlabel("Pair"); ax5.set_ylabel("Offset (ms)")
-        ax5.legend(handles=[Patch(facecolor="#4daf4a", label="<1 bin"),
-                            Patch(facecolor="#2066a8", label="1-2 bins"),
-                            Patch(facecolor="#ff7f00", label=">2 bins")], fontsize=7)
-    ax5.set_title("Per-pair offset", fontsize=10)
-
-    ax6 = fig.add_subplot(gs[3, 1]); ax6.axis("off")
-    summary = f"Recording: {seq_dir.name}\nPoses: {P}  Voxels: {n_voxel_frames}\nBins/fr: {num_bins}  k={smooth_k}\n\n"
-    if len(offsets_ms) > 0:
         med_ms = float(np.median(offsets_ms))
-        summary += f"Matched: {len(offsets_ms)}\nMedian: {med_ms:+.1f} ms\nStd: {offsets_ms.std():.1f} ms\n"
-        if abs(med_ms) < bin_dt * 1000: summary += "\n✓ GOOD (<1 bin)"
-        elif abs(med_ms) < 2 * bin_dt * 1000: summary += "\n~ OK (1-2 bins)"
-        else: summary += "\n✗ OFF (>2 bins)"
-    ax6.text(0.05, 0.95, summary, transform=ax6.transAxes, fontsize=9, family="monospace", va="top",
-             bbox=dict(boxstyle="round,pad=0.4", facecolor="#f7f7f7", edgecolor="#ccc"))
+        label = "✓ GOOD" if abs(med_ms) < bin_dt * 1000 else ("~ OK" if abs(med_ms) < 2 * bin_dt * 1000 else "✗ OFF")
+        ax4.set_title(f"Offset over time  |  n={len(offsets_ms)}  med={med_ms:+.1f}ms  {label}", fontsize=9)
+    else:
+        ax4.set_title("Offset over time", fontsize=10)
 
     fig.suptitle("Voxel-Bin Temporal Alignment — Rotation Speed vs Activity",
                  fontsize=13, fontweight="bold", y=0.98)
@@ -493,6 +482,8 @@ def run_verify(seq_dir: Path, out_dir: Path) -> None:
         t_sys_ns = f["t_sys_ns"][:]
         t_hw_ms  = f["t_hw_ms"][:]
         frame_no = f["frame_number"][:]
+        # Prefer hardware-anchored timestamps (same domain as sys, but cleaned-up jitter)
+        t_hw_as_sys_ns = f["t_hw_as_sys_ns"][:] if "t_hw_as_sys_ns" in f else t_sys_ns
     with h5py.File(poses_path, "r") as f:
         ee_T      = f["ee_T"][:]
         joints    = f["joint_positions"][:]
@@ -505,7 +496,9 @@ def run_verify(seq_dir: Path, out_dir: Path) -> None:
             raw_poses = int(f.attrs.get("raw_poses_received", -1))
 
     N = len(t_sys_ns)
-    t_s = (t_sys_ns - t_sys_ns[0]) / 1e9
+    t_s = (t_hw_as_sys_ns - t_hw_as_sys_ns[0]) / 1e9  # use hw-anchored times as the time axis
+    # sys-vs-hw drift: how much does raw receive time deviate from hw-anchored time?
+    sys_vs_hw_drift_ms = (t_sys_ns - t_hw_as_sys_ns).astype(np.float64) / 1e6
     dt_hw_ms = np.diff(t_hw_ms)
     frame_gaps = np.diff(frame_no.astype(np.int64))
     dropped = int(np.sum(frame_gaps > 1))
@@ -565,15 +558,17 @@ def run_verify(seq_dir: Path, out_dir: Path) -> None:
     ax2.set_xlabel("Offset (ms)"); ax2.set_ylabel("Count"); ax2.set_title("Offset distribution")
     ax2.grid(True, alpha=0.3)
 
-    # 3: frame interval
+    # 3: sys-vs-hw drift over time  (how noisy is the Python receive time vs hw clock)
     ax3 = fig.add_subplot(gs[1, :2])
-    ax3.plot(t_s[1:], dt_hw_ms, color="teal", lw=0.7, alpha=0.80)
-    ax3.axhline(dt_median, color="darkgreen", ls="--", lw=1.5, label=f"median {dt_median:.1f}ms")
-    ax3.axhline(target_dt_ms, color="gray", ls=":", lw=1.5, label=f"target {target_dt_ms:.1f}ms")
-    ax3.set_xlabel("Time (s)"); ax3.set_ylabel("Interval (ms)")
-    ax3.set_title("Hardware frame interval [jitter check]"); ax3.legend(fontsize=8); ax3.grid(True, alpha=0.3)
+    ax3.plot(t_s[1:], sys_vs_hw_drift_ms[1:], color="teal", lw=0.7, alpha=0.80)
+    ax3.axhline(float(np.median(sys_vs_hw_drift_ms[1:])), color="darkgreen", ls="--", lw=1.5,
+                label=f"median {np.median(sys_vs_hw_drift_ms[1:]):.1f}ms")
+    ax3.axhline(0, color="gray", ls=":", lw=1.0)
+    ax3.set_xlabel("Time (s)"); ax3.set_ylabel("sys − hw_as_sys (ms)")
+    ax3.set_title("Sys receive-time jitter vs hardware clock [clock drift check]")
+    ax3.legend(fontsize=8); ax3.grid(True, alpha=0.3)
 
-    # 4: interval histogram
+    # 4: hw frame interval histogram (regularity of depth capture)
     ax4 = fig.add_subplot(gs[1, 2])
     ax4.hist(dt_hw_ms, bins=60, color="teal", edgecolor="white", alpha=0.80)
     ax4.axvline(target_dt_ms, color="red", ls="--", lw=1.5)

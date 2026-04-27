@@ -13,12 +13,14 @@ depth_in_event_frame.h5), so it can be applied directly during training
 or visualization without additional alignment.
 
 Outputs (per recording):
-    hdf5/spatial_mask.h5  — dataset "mask" (N, H, W) uint8 {0, 1}
+    hdf5/spatial_mask.h5          — dataset "mask" (N, H, W) uint8 {0, 1}
+    videos/spatial_mask.mp4       — (optional, with --save_videos)
 
 Usage:
     python3 precompute_spatial_mask.py --data_root data/real
     python3 precompute_spatial_mask.py --data_dir data/real/box --cube_side 0.4
     python3 precompute_spatial_mask.py --data_root data/real --overwrite
+    python3 precompute_spatial_mask.py --data_root data/real --save_videos
 """
 
 import argparse
@@ -34,20 +36,21 @@ from reconstruction_config import (
     CALIB_DIR as _CALIB_DIR,
     DATA_ROOT as _DATA_ROOT,
     SPATIAL_CUBE_SIDE,
-    SPATIAL_CUBE_CENTER_Z,
+    SPATIAL_TARGET_X,
+    SPATIAL_TARGET_Y,
+    SPATIAL_TARGET_Z,
 )
 
 CALIB_DIR = Path(__file__).resolve().parent / _CALIB_DIR
 
-# Default target point in robot base frame (where the object is placed)
-# X/Y match franka_pipeline/config_defaults.py TARGET_X/Y; Z comes from reconstruction_config
-DEFAULT_TARGET_X = 0.3
-DEFAULT_TARGET_Y = 0.0
-DEFAULT_TARGET_Z = SPATIAL_CUBE_CENTER_Z
+# Default target point — imported from reconstruction_config
+DEFAULT_TARGET_X = SPATIAL_TARGET_X
+DEFAULT_TARGET_Y = SPATIAL_TARGET_Y
+DEFAULT_TARGET_Z = SPATIAL_TARGET_Z
 
 
 def load_calibration(calib_dir: Path) -> dict:
-    """Load calibration needed for event-pixel → base-frame unprojection."""
+    """Load calibration needed for event-pixel and depth-pixel → base-frame unprojection."""
     T_rgb_from_ee = np.load(calib_dir / "T_rgb_from_ee.npz")["T"]       # (4,4)
     T_event_from_rgb = np.load(calib_dir / "T_event_from_rgb.npz")["T"] # (4,4)
     ev = np.load(calib_dir / "event_intrinsics.npz")
@@ -59,12 +62,25 @@ def load_calibration(calib_dir: Path) -> dict:
     # inv(T_event_from_ee) brings event-cam → ee → base when composed with ee_T
     T_ee_from_event = np.linalg.inv(T_event_from_ee)
 
+    # depth camera calibration (for native-resolution mask stored in mask_depth)
+    T_color_from_depth = np.load(calib_dir / "T_color_from_depth.npz")["T"]  # (4,4)
+    depth_intr = np.load(calib_dir / "rs_depth_intrinsics.npz")
+    K_depth    = depth_intr["camera_matrix"]   # (3,3)
+    depth_size = depth_intr["image_size"]       # [W, H]
+    depth_scale = float(np.load(calib_dir / "depth_scale.npz")["scale"])
+    T_ee_from_depth = np.linalg.inv(T_rgb_from_ee) @ T_color_from_depth
+
     return {
         "T_ee_from_event": T_ee_from_event,
         "K_event": K_event,
         "dist_event": dist_event,
         "ev_w": int(ev_size[0]),
         "ev_h": int(ev_size[1]),
+        "T_ee_from_depth": T_ee_from_depth,
+        "K_depth": K_depth,
+        "depth_w": int(depth_size[0]),
+        "depth_h": int(depth_size[1]),
+        "depth_scale": depth_scale,
     }
 
 
@@ -135,6 +151,7 @@ def process_sequence(
     cube_side: float,
     target_point: np.ndarray,
     overwrite: bool = False,
+    save_videos: bool = False,
 ) -> dict:
     """Precompute spatial mask for one recording directory."""
     result = {"name": seq_dir.name, "success": False, "n_frames": 0, "error": None}
@@ -177,27 +194,75 @@ def process_sequence(
     rays = build_event_rays(calib["K_event"], H, W)
     half_side = cube_side / 2.0
 
-    # Process frames
-    with h5py.File(depth_h5_path, "r") as df, \
-         h5py.File(out_path, "w") as of:
-        mask_ds = of.create_dataset(
-            "mask", shape=(n_frames, H, W), dtype=np.uint8,
-            chunks=(1, H, W), compression="gzip", compression_opts=4,
-        )
-        of.attrs["cube_side_m"] = cube_side
-        of.attrs["target_point"] = target_point
-        of.attrs["description"] = (
-            f"Spatial mask: 1 inside {cube_side:.2f}m cube around "
-            f"target ({target_point[0]:.3f}, {target_point[1]:.3f}, {target_point[2]:.3f}), 0 outside"
-        )
+    # Depth-frame mask: compute natively at depth resolution from realsense.h5
+    realsense_h5_path = seq_dir / "hdf5" / "realsense.h5"
+    has_realsense = realsense_h5_path.exists()
+    if has_realsense:
+        dH, dW = calib["depth_h"], calib["depth_w"]
+        rays_depth = build_event_rays(calib["K_depth"], dH, dW)
+    else:
+        dH = dW = 0
+        rays_depth = None
 
-        for i in tqdm(range(n_frames), desc=f"  {seq_dir.name}", leave=False):
-            depth = df["depth"][i].astype(np.float32)
-            m = compute_spatial_mask(
-                depth, ee_T_all[i], calib["T_ee_from_event"], rays, half_side,
-                target_point,
+    # Process frames
+    rs_file = h5py.File(realsense_h5_path, "r") if has_realsense else None
+    try:
+        with h5py.File(depth_h5_path, "r") as df, \
+             h5py.File(out_path, "w") as of:
+            mask_ds = of.create_dataset(
+                "mask", shape=(n_frames, H, W), dtype=np.uint8,
+                chunks=(1, H, W), compression="gzip", compression_opts=4,
             )
-            mask_ds[i] = m
+            if has_realsense:
+                mask_depth_ds = of.create_dataset(
+                    "mask_depth", shape=(n_frames, dH, dW), dtype=np.uint8,
+                    chunks=(1, dH, dW), compression="gzip", compression_opts=4,
+                )
+            of.attrs["cube_side_m"] = cube_side
+            of.attrs["target_point"] = target_point
+            of.attrs["description"] = (
+                f"Spatial mask: 1 inside {cube_side:.2f}m cube around "
+                f"target ({target_point[0]:.3f}, {target_point[1]:.3f}, {target_point[2]:.3f}), 0 outside"
+            )
+
+            masks = np.empty((n_frames, H, W), dtype=np.uint8)
+            rs_depth_ds = rs_file["depth"] if rs_file is not None else None
+            for i in tqdm(range(n_frames), desc=f"  {seq_dir.name}", leave=False):
+                depth = df["depth"][i].astype(np.float32)
+                m = compute_spatial_mask(
+                    depth, ee_T_all[i], calib["T_ee_from_event"], rays, half_side,
+                    target_point,
+                )
+                mask_ds[i] = m
+                masks[i] = m
+
+                if rs_depth_ds is not None:
+                    depth_raw = rs_depth_ds[i].astype(np.float32) * calib["depth_scale"]
+                    md = compute_spatial_mask(
+                        depth_raw, ee_T_all[i], calib["T_ee_from_depth"], rays_depth,
+                        half_side, target_point,
+                    )
+                    mask_depth_ds[i] = md
+    finally:
+        if rs_file is not None:
+            rs_file.close()
+
+    if save_videos:
+        video_dir = seq_dir / "videos"
+        video_dir.mkdir(exist_ok=True)
+        video_path = video_dir / "spatial_mask.mp4"
+        fps = 30
+        writer = cv2.VideoWriter(
+            str(video_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (W, H),
+            isColor=False,
+        )
+        for i in range(n_frames):
+            writer.write((masks[i] * 255).astype(np.uint8))
+        writer.release()
+        result["video_path"] = video_path
 
     result["success"] = True
     result["n_frames"] = n_frames
@@ -237,6 +302,8 @@ def main():
                         help="Target point Z in robot base frame (metres)")
     parser.add_argument("--overwrite", action="store_true",
                         help="Overwrite existing spatial_mask.h5 files")
+    parser.add_argument("--save_videos", action="store_true",
+                        help="Save a video of the spatial mask to videos/spatial_mask.mp4")
     args = parser.parse_args()
 
     calib = load_calibration(Path(args.calib_dir))
@@ -254,7 +321,7 @@ def main():
           f"target = ({target_point[0]:.3f}, {target_point[1]:.3f}, {target_point[2]:.3f})")
 
     for d in dirs:
-        result = process_sequence(d, calib, args.cube_side, target_point, overwrite=args.overwrite)
+        result = process_sequence(d, calib, args.cube_side, target_point, overwrite=args.overwrite, save_videos=args.save_videos)
         status = "OK" if result["success"] else "FAIL"
         msg = f"  [{result['name']}] {status}"
         if result["n_frames"]:

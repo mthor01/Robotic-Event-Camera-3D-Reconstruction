@@ -12,14 +12,14 @@ Usage:
 
 import argparse
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple
 import numpy as np
 import h5py
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 
-from reconstruction_config import NUM_BINS
+from reconstruction_config import NUM_BINS, TRAIN_RESIZE_HW, TRAIN_CROP_HW
 
 
 def events_to_voxel_grid(
@@ -84,8 +84,34 @@ def events_to_voxel_grid(
         std = voxel[nonzero_mask].std()
         if std > 0:
             voxel = (voxel - mean) / std
-    
+
     return voxel
+
+
+def resize_voxel(
+    voxel: np.ndarray,
+    output_hw: Tuple[int, int],
+    as_float16: bool = False,
+) -> np.ndarray:
+    """
+    Downsample a (C, H, W) voxel grid to output_hw using bilinear interpolation.
+
+    Args:
+        voxel:      (C, H, W) float32 array.
+        output_hw:  (out_H, out_W) target spatial size.
+        as_float16: If True, cast the result to float16 before returning.
+
+    Returns:
+        (C, out_H, out_W) array.
+    """
+    import torch
+    import torch.nn.functional as F
+    t = torch.from_numpy(voxel).unsqueeze(0)  # (1, C, H, W)
+    t = F.interpolate(t, size=output_hw, mode='bilinear', align_corners=False)
+    out = t.squeeze(0).numpy()  # (C, out_H, out_W)
+    if as_float16:
+        out = out.astype(np.float16)
+    return out
 
 
 def load_events_from_raw(raw_path: Path) -> np.ndarray:
@@ -112,15 +138,27 @@ def load_events_from_raw(raw_path: Path) -> np.ndarray:
     return events[sort_idx]
 
 
-def process_sequence(sequence_dir: Path, num_bins: int = 5, overwrite: bool = False) -> dict:
+def process_sequence(
+    sequence_dir: Path,
+    num_bins: int = 5,
+    overwrite: bool = False,
+    output_hw: Optional[Tuple[int, int]] = None,
+    as_float16: bool = False,
+    crop_hw: Optional[Tuple[int, int]] = None,
+) -> dict:
     """
     Process a single sequence directory.
 
     Reads depth timestamps from hdf5/realsense.h5 and raw events from
     raw/event_cam*.raw.  For each depth frame i the events in the half-open
     interval [t_depth[i], t_depth[i+1]) are accumulated into a voxel grid
-    with `num_bins` temporal bins and saved to
-    events/voxels_cam{k}/voxel_{i:06d}.npy.
+    with `num_bins` temporal bins.  If `output_hw` is given the voxel is
+    downsampled to that resolution before saving (dramatically reduces storage
+    when the training pipeline already downscales).  Use `as_float16` to halve
+    storage with negligible precision loss on normalised event data.
+
+    Saved to events/voxels_cam{k}.h5 as HDF5 dataset "voxels" with shape
+    (N, num_bins, H, W).
     """
     sequence_dir = Path(sequence_dir)
 
@@ -168,11 +206,13 @@ def process_sequence(sequence_dir: Path, num_bins: int = 5, overwrite: bool = Fa
 
     # Fast-path: all cameras already processed
     if not overwrite:
-        all_done = all(
-            len(list((sequence_dir / "events" / f"voxels_cam{i}").glob("voxel_*.npy"))) >= n_frames
-            for i in range(len(raw_event_files))
-        )
-        if all_done:
+        def _cam_done(i: int) -> bool:
+            h5 = sequence_dir / "events" / f"voxels_cam{i}.h5"
+            if h5.exists():
+                with h5py.File(h5, 'r') as _f:
+                    return int(_f["voxels"].shape[0]) >= n_frames
+            return False
+        if all(_cam_done(i) for i in range(len(raw_event_files))):
             result["success"] = True
             result["n_frames"] = n_frames
             result["error"] = "Already processed (use --overwrite to reprocess)"
@@ -188,12 +228,13 @@ def process_sequence(sequence_dir: Path, num_bins: int = 5, overwrite: bool = Fa
 
     try:
         for cam_idx, raw_path in enumerate(raw_event_files):
-            voxels_dir = sequence_dir / "events" / f"voxels_cam{cam_idx}"
+            voxels_h5 = sequence_dir / "events" / f"voxels_cam{cam_idx}.h5"
 
             # Skip if this camera is already done
-            if not overwrite and voxels_dir.exists():
-                if len(list(voxels_dir.glob("voxel_*.npy"))) >= n_frames:
-                    continue
+            if not overwrite and voxels_h5.exists():
+                with h5py.File(voxels_h5, 'r') as _f:
+                    if int(_f["voxels"].shape[0]) >= n_frames:
+                        continue
 
             # Read per-frame time windows from the aligned HDF5
             aligned_h5 = sequence_dir / "hdf5" / f"events_cam{cam_idx}.h5"
@@ -208,21 +249,52 @@ def process_sequence(sequence_dir: Path, num_bins: int = 5, overwrite: bool = Fa
                 print(f"  [cam{cam_idx}] WARNING: HDF5 has {len(ev_t_start_us)} frames "
                       f"but depth has {n_frames}")
 
-            voxels_dir.mkdir(parents=True, exist_ok=True)
+            (sequence_dir / "events").mkdir(parents=True, exist_ok=True)
 
             # Load all raw events for this camera into memory
             events = load_events_from_raw(raw_path)
             raw_t = events['t'].astype(np.int64)
 
-            for frame_idx in tqdm(range(n_frames), desc=f"  cam{cam_idx}", leave=False):
-                t_start = int(ev_t_start_us[frame_idx])
-                t_end   = int(ev_t_end_us[frame_idx])
+            # Determine final stored resolution (after resize and optional crop)
+            if crop_hw is not None:
+                out_H, out_W = crop_hw
+            elif output_hw is not None:
+                out_H, out_W = output_hw
+            else:
+                out_H, out_W = EV_H, EV_W
+            dtype = np.float16 if as_float16 else np.float32
 
-                i0 = np.searchsorted(raw_t, t_start, side='left')
-                i1 = np.searchsorted(raw_t, t_end,   side='right')
+            # Precompute center-crop offsets (only needed when both resize and crop are set)
+            if output_hw is not None and crop_hw is not None:
+                ch, cw = crop_hw
+                rh, rw = output_hw
+                cy0 = (rh - ch) // 2
+                cx0 = (rw - cw) // 2
+            else:
+                cy0 = cx0 = 0
 
-                voxel = events_to_voxel_grid(events[i0:i1], EV_H, EV_W, num_bins)
-                np.save(voxels_dir / f"voxel_{frame_idx:06d}.npy", voxel)
+            with h5py.File(voxels_h5, 'w') as vf:
+                ds = vf.create_dataset(
+                    "voxels",
+                    shape=(n_frames, num_bins, out_H, out_W),
+                    dtype=dtype,
+                    chunks=(1, num_bins, out_H, out_W),
+                )
+                for frame_idx in tqdm(range(n_frames), desc=f"  cam{cam_idx}", leave=False):
+                    t_start = int(ev_t_start_us[frame_idx])
+                    t_end   = int(ev_t_end_us[frame_idx])
+
+                    i0 = np.searchsorted(raw_t, t_start, side='left')
+                    i1 = np.searchsorted(raw_t, t_end,   side='right')
+
+                    voxel = events_to_voxel_grid(events[i0:i1], EV_H, EV_W, num_bins)
+                    if output_hw is not None:
+                        voxel = resize_voxel(voxel, output_hw, as_float16=False)
+                    if crop_hw is not None:
+                        voxel = voxel[:, cy0:cy0+ch, cx0:cx0+cw]
+                    if as_float16:
+                        voxel = voxel.astype(np.float16)
+                    ds[frame_idx] = voxel
 
         result["success"] = True
         result["n_frames"] = n_frames
@@ -261,32 +333,83 @@ def main():
                        help="Overwrite existing voxel files")
     parser.add_argument("--workers", type=int, default=None,
                        help="Number of parallel workers (default: CPU count)")
+    parser.add_argument("--output_h", type=int, default=TRAIN_RESIZE_HW[0],
+                       help="Intermediate resize height before center-crop "
+                            "(default: TRAIN_RESIZE_HW[0]=%(default)s). "
+                            "Set to 0 to skip resize.")
+    parser.add_argument("--output_w", type=int, default=TRAIN_RESIZE_HW[1],
+                       help="Intermediate resize width before center-crop "
+                            "(default: TRAIN_RESIZE_HW[1]=%(default)s). "
+                            "Set to 0 to skip resize.")
+    parser.add_argument("--crop_h", type=int, default=TRAIN_CROP_HW[0],
+                       help="Final stored height after center-crop "
+                            "(default: TRAIN_CROP_HW[0]=%(default)s). "
+                            "Set to 0 to disable crop (store at resize resolution).")
+    parser.add_argument("--crop_w", type=int, default=TRAIN_CROP_HW[1],
+                       help="Final stored width after center-crop "
+                            "(default: TRAIN_CROP_HW[1]=%(default)s). "
+                            "Set to 0 to disable crop (store at resize resolution).")
+    parser.add_argument("--float16", action="store_true",
+                       help="Store voxels as float16 instead of float32 (2x extra space saving).")
     
     args = parser.parse_args()
-    
+
+    # Build output_hw (resize target) and crop_hw (final stored size)
+    output_hw: Optional[Tuple[int, int]] = None
+    if args.output_h and args.output_w:
+        output_hw = (args.output_h, args.output_w)
+    elif (bool(args.output_h)) != (bool(args.output_w)):
+        parser.error("--output_h and --output_w must both be non-zero or both zero")
+
+    crop_hw: Optional[Tuple[int, int]] = None
+    if args.crop_h and args.crop_w:
+        crop_hw = (args.crop_h, args.crop_w)
+    elif (bool(args.crop_h)) != (bool(args.crop_w)):
+        parser.error("--crop_h and --crop_w must both be non-zero or both zero")
+
+    # Crop without a prior resize doesn't make sense
+    if crop_hw is not None and output_hw is None:
+        parser.error("--crop_h/w requires --output_h/w to be set")
+
     # Find sequences
     if args.data_dir:
         sequence_dirs = [Path(d) for d in args.data_dir]
     else:
         sequence_dirs = find_sequence_dirs(Path(args.data_root))
-    
+
     if not sequence_dirs:
         print(f"No valid sequences found!")
         return
-    
+
     print(f"Found {len(sequence_dirs)} sequences to process")
     print(f"Voxel bins: {args.num_bins}")
+    if output_hw:
+        native_px = 1280 * 720
+        stored_hw = crop_hw if crop_hw is not None else output_hw
+        out_px = stored_hw[1] * stored_hw[0]
+        if crop_hw is not None:
+            print(f"Resize → crop  : {output_hw[1]}×{output_hw[0]} → {stored_hw[1]}×{stored_hw[0]} "
+                  f"({out_px/native_px*100:.1f}% of native 1280×720, "
+                  f"~{native_px/out_px:.1f}x smaller per voxel)")
+        else:
+            print(f"Output resolution: {output_hw[1]}×{output_hw[0]} "
+                  f"({out_px/native_px*100:.1f}% of native 1280×720, "
+                  f"~{native_px/out_px:.1f}x smaller per voxel)")
+    if args.float16:
+        print("Dtype: float16 (2x additional saving vs float32)")
     print(f"Overwrite: {args.overwrite}")
     print()
-    
+
     # Process sequences
     n_workers = args.workers or min(multiprocessing.cpu_count(), len(sequence_dirs))
-    
+
     if n_workers == 1 or len(sequence_dirs) == 1:
         # Sequential processing with progress bar
         results = []
         for seq_dir in tqdm(sequence_dirs, desc="Processing"):
-            result = process_sequence(seq_dir, args.num_bins, args.overwrite)
+            result = process_sequence(
+                seq_dir, args.num_bins, args.overwrite, output_hw, args.float16, crop_hw
+            )
             results.append(result)
             if result["success"]:
                 tqdm.write(f"  ✓ {result['name']}: {result['n_frames']} frames")
@@ -298,10 +421,12 @@ def main():
         results = []
         with ProcessPoolExecutor(max_workers=n_workers) as executor:
             futures = {
-                executor.submit(process_sequence, seq_dir, args.num_bins, args.overwrite): seq_dir
+                executor.submit(
+                    process_sequence, seq_dir, args.num_bins, args.overwrite, output_hw, args.float16, crop_hw
+                ): seq_dir
                 for seq_dir in sequence_dirs
             }
-            
+
             for future in tqdm(as_completed(futures), total=len(futures), desc="Processing"):
                 result = future.result()
                 results.append(result)

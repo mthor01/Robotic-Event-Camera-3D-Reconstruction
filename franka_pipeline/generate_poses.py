@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """Generate calibration/recording poses and save to .npy file.
 
-Supports RandomSphereAgent and RandomHemisphereAgent with full
-customisation of target, center, radius, and safety parameters.
+Supports RandomHemisphereAgent with full customisation of target,
+radius, and safety parameters.
 
 Usage:
     python generate_poses.py -o calibration_poses.npy
     python generate_poses.py --target 0.4 0.0 0.2 --radius 0.25 --num-poses 20
-    python generate_poses.py --agent sphere --center 0.5 0.0 0.4 --target 0.4 0.0 0.2
     python generate_poses.py --seed 42 -o my_poses.npy
 """
 
 import argparse
 import numpy as np
 
-from franka_pipeline.agents.random_sphere_agent import RandomSphereAgent
 from franka_pipeline.agents.random_hemisphere_agent import RandomHemisphereAgent
 import config_defaults as cfg
 
@@ -35,7 +33,7 @@ def main():
         "--agent", "-a",
         type=str,
         default="random_hemisphere",
-        choices=["sphere", "random_hemisphere"],
+        choices=["random_hemisphere"],
         help="Agent type (default: random_hemisphere)",
     )
     parser.add_argument(
@@ -106,35 +104,21 @@ def main():
     args = parser.parse_args()
     target = np.array(args.target)
 
-    if args.agent == "random_hemisphere":
-        center = target  # hemisphere always centered on target
-        agent = RandomHemisphereAgent(
-            center=center,
-            radius=args.radius,
-            inner_radius=args.inner_radius,
-            num_poses=args.num_poses,
-            wait_time=0.0,
-            seed=args.seed,
-            loop=False,
-            target_point=target,
-            base_exclusion_radius=args.base_exclusion_radius,
-            base_max_radius=args.base_max_radius,
-            min_z_height=args.min_z,
-            lock_rotation_horizontal=args.lock_rotation,
-        )
-    else:
-        center = np.array(args.center) if args.center else np.array(
-            [cfg.SPHERE_CENTER_X, cfg.SPHERE_CENTER_Y, cfg.SPHERE_CENTER_Z]
-        )
-        agent = RandomSphereAgent(
-            center=center,
-            radius=args.radius,
-            num_poses=args.num_poses,
-            wait_time=0.0,
-            seed=args.seed,
-            loop=False,
-            target_point=target,
-        )
+    center = target  # hemisphere always centered on target
+    agent = RandomHemisphereAgent(
+        center=center,
+        radius=args.radius,
+        inner_radius=args.inner_radius,
+        num_poses=args.num_poses,
+        wait_time=0.0,
+        seed=args.seed,
+        loop=False,
+        target_point=target,
+        base_exclusion_radius=args.base_exclusion_radius,
+        base_max_radius=args.base_max_radius,
+        min_z_height=args.min_z,
+        lock_rotation_horizontal=args.lock_rotation,
+    )
 
     poses = np.asarray(agent.poses, dtype=np.float64)
     np.save(args.output, poses)

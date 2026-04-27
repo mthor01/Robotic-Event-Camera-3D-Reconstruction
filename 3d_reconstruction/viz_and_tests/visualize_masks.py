@@ -131,8 +131,12 @@ def main():
     parser.add_argument("--depth_min", type=float, default=DEPTH_MIN)
     parser.add_argument("--depth_max", type=float, default=D_MAX)
     parser.add_argument("--white_thresh", type=int, default=WHITE_THRESH)
-    parser.add_argument("--spatial_mask", action="store_true",
-                        help="Include precomputed spatial mask column (from spatial_mask.h5)")
+    parser.add_argument("--no_spatial_mask", action="store_true",
+                        help="Hide the spatial mask column (shown by default)")
+    parser.add_argument("--depth_mask", action="store_true",
+                        help="Show depth-range mask column (hidden by default)")
+    parser.add_argument("--white_mask", action="store_true",
+                        help="Show white-pixel mask column (hidden by default)")
     parser.add_argument("--log_depth", action="store_true",
                         help="Display depth with log encoding (default: linear normalization)")
     args = parser.parse_args()
@@ -150,6 +154,10 @@ def main():
 
     resize_hw = (args.resize_h, args.resize_w) if args.resize_h > 0 and args.resize_w > 0 else None
     crop_hw = (args.crop_h, args.crop_w) if args.crop_h > 0 and args.crop_w > 0 else None
+
+    has_spatial    = not args.no_spatial_mask
+    show_depth_mask = args.depth_mask
+    show_white_mask = args.white_mask
 
     # Collect rows: each row is (object_name, frame_idx, depth, depth_mask, white_mask, combined)
     rows = []
@@ -175,9 +183,9 @@ def main():
             no_rgb = np.all(rgb == 0, axis=-1)
             white_mask = (np.all(rgb > args.white_thresh, axis=-1) | no_rgb).astype(np.float32)
 
-            # Spatial mask (precomputed, optional)
+            # Spatial mask (precomputed, shown by default)
             spatial_raw = None
-            if args.spatial_mask:
+            if has_spatial:
                 sp_path = obj_dir / "hdf5" / "spatial_mask.h5"
                 if sp_path.exists():
                     with h5py.File(sp_path, "r") as f:
@@ -233,13 +241,16 @@ def main():
 
     # Plot
     n_rows = len(rows)
-    has_spatial = args.spatial_mask
-    n_cols = 6 if has_spatial else 5  # RGB, depth GT, depth mask, white mask, [spatial mask,] combined
     depth_label = "Depth (log)" if args.log_depth else "Depth (linear)"
-    col_titles = ["RGB", depth_label, "Depth mask", "White mask"]
+    col_titles = ["RGB", depth_label]
+    if show_depth_mask:
+        col_titles.append("Depth mask")
+    if show_white_mask:
+        col_titles.append("White mask")
     if has_spatial:
         col_titles.append(f"Spatial mask ({SPATIAL_CUBE_SIDE*100:.0f}cm cube)")
     col_titles.append("Combined mask")
+    n_cols = len(col_titles)
     cell_h, cell_w = 2.0, 3.0
 
     fig, axes = plt.subplots(
@@ -253,40 +264,43 @@ def main():
         axes[0][ci].set_title(title, fontsize=9, fontweight="bold")
 
     for ri, row in enumerate(rows):
+        ci = 0
+
         # RGB
-        ax = axes[ri][0]
+        ax = axes[ri][ci]; ci += 1
         ax.imshow(row["rgb"])
         ax.set_ylabel(f"{row['name']}\n#{row['idx']} ({row['src']})", fontsize=7,
                       rotation=0, labelpad=65, va="center")
         ax.set_xticks([]); ax.set_yticks([])
 
-        # Depth log-normalized
-        ax = axes[ri][1]
+        # Depth normalized
+        ax = axes[ri][ci]; ci += 1
         ax.imshow(row["depth_norm"], cmap="plasma", vmin=0, vmax=1)
         ax.set_xticks([]); ax.set_yticks([])
 
-        # Depth mask
-        ax = axes[ri][2]
-        ax.imshow(row["depth_mask"], cmap="gray", vmin=0, vmax=1)
-        pct = row["depth_mask"].mean() * 100
-        ax.text(0.98, 0.02, f"{pct:.0f}%", transform=ax.transAxes,
-                fontsize=6, color="lime", ha="right", va="bottom",
-                fontweight="bold")
-        ax.set_xticks([]); ax.set_yticks([])
+        # Depth mask (optional)
+        if show_depth_mask:
+            ax = axes[ri][ci]; ci += 1
+            ax.imshow(row["depth_mask"], cmap="gray", vmin=0, vmax=1)
+            pct = row["depth_mask"].mean() * 100
+            ax.text(0.98, 0.02, f"{pct:.0f}%", transform=ax.transAxes,
+                    fontsize=6, color="lime", ha="right", va="bottom",
+                    fontweight="bold")
+            ax.set_xticks([]); ax.set_yticks([])
 
-        # White mask
-        ax = axes[ri][3]
-        ax.imshow(row["white_mask"], cmap="Reds", vmin=0, vmax=1)
-        pct = row["white_mask"].mean() * 100
-        ax.text(0.98, 0.02, f"{pct:.0f}%", transform=ax.transAxes,
-                fontsize=6, color="red", ha="right", va="bottom",
-                fontweight="bold")
-        ax.set_xticks([]); ax.set_yticks([])
+        # White mask (optional)
+        if show_white_mask:
+            ax = axes[ri][ci]; ci += 1
+            ax.imshow(row["white_mask"], cmap="Reds", vmin=0, vmax=1)
+            pct = row["white_mask"].mean() * 100
+            ax.text(0.98, 0.02, f"{pct:.0f}%", transform=ax.transAxes,
+                    fontsize=6, color="red", ha="right", va="bottom",
+                    fontweight="bold")
+            ax.set_xticks([]); ax.set_yticks([])
 
-        # Spatial mask (optional)
-        next_col = 4
+        # Spatial mask
         if has_spatial:
-            ax = axes[ri][next_col]
+            ax = axes[ri][ci]; ci += 1
             sm = row["spatial_mask"]
             if sm is not None:
                 ax.imshow(sm, cmap="gray", vmin=0, vmax=1)
@@ -298,16 +312,16 @@ def main():
                 ax.text(0.5, 0.5, "N/A", ha="center", va="center",
                         transform=ax.transAxes, fontsize=12, color="gray")
             ax.set_xticks([]); ax.set_yticks([])
-            next_col = 5
 
         # Combined mask
-        ax = axes[ri][next_col]
+        ax = axes[ri][ci]
         ax.imshow(row["combined_mask"], cmap="gray", vmin=0, vmax=1)
         pct = row["combined_mask"].mean() * 100
         ax.text(0.98, 0.02, f"{pct:.0f}%", transform=ax.transAxes,
                 fontsize=6, color="lime", ha="right", va="bottom",
                 fontweight="bold")
         ax.set_xticks([]); ax.set_yticks([])
+
 
     preproc = ""
     if resize_hw:

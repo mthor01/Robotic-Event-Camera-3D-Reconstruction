@@ -192,7 +192,10 @@ def project_depth_frame(
     # (minimum) valid neighbour using erode+sentinel.
     # Do NOT use cv2.dilate (local MAX) — that fills gaps with background (far)
     # depth, which causes a background grid pattern on the foreground object.
-    small_kernel = np.ones((3, 3), dtype=np.uint8)
+    # 5×5 kernel (reach=2) needed because depth (640×480) → event (1280×720) is a
+    # 2:1 ratio, so scatter hits land every ~2 event pixels; adjacent depth pixels
+    # can round to the same event pixel, creating 2-pixel gaps the 3×3 kernel misses.
+    small_kernel = np.ones((5, 5), dtype=np.uint8)
     depth_temp2 = depth_out.copy()
     depth_temp2[depth_temp2 == 0] = SENTINEL
     fill_min = cv2.erode(depth_temp2, small_kernel)

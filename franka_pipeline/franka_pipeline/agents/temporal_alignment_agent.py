@@ -1,7 +1,7 @@
 """Agent that rotates the end-effector about the Z axis for temporal alignment checks.
 
 The robot holds a fixed position pointing straight down and alternates
-between +45° and −45° Z-rotation.  Each reversal produces a sharp
+between +20° and −20° Z-rotation.  Each reversal produces a sharp
 change in event-camera activity that can be compared against the pose
 timestamps to verify temporal alignment."""
 
@@ -59,8 +59,8 @@ class TemporalAlignmentAgent(Agent):
         center_x: float = 0.45,
         center_y: float = 0.0,
         center_z: float = 0.25,
-        rotation_deg: float = 45.0,
-        num_sweeps: int = 4,
+        rotation_deg: float = 20.0,
+        num_sweeps: int = 40,
         wait_at_end: float = 0.0,
     ) -> None:
         super().__init__(action_type="OSC_POSE")
@@ -103,7 +103,11 @@ class TemporalAlignmentAgent(Agent):
     def _set_target(self) -> None:
         target = self._waypoints[self._wp_idx]
         cmd = np.concatenate([target, [-1.0]])  # gripper open
-        self._osc = OscPoseTargetController(target_pose=cmd)
+        self._osc = OscPoseTargetController(
+            target_pose=cmd,
+            threshold_reach=0.02,      # 20 mm (default 5 mm)
+            threshold_rotation=0.15,   # ~8.6° (default ~2.9°)
+        )
 
     # ------------------------------------------------------------------
     def act(

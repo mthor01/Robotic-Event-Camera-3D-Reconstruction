@@ -34,6 +34,7 @@ from reconstruction_config import (
     FPS, RS_WIDTH, RS_HEIGHT,
     BIAS_DIFF_ON, BIAS_DIFF_OFF, BIAS_FO, BIAS_HPF, BIAS_REFR,
     ZMQ_SYNC_ADDR, ZMQ_POSE_ADDR, DATA_ROOT, TEMPORAL_CHECK_ROOT,
+    DEPTH_EVENT_ALIGN_OFFSET_FRAMES,
 )
 
 # ================= CONFIG =================
@@ -182,12 +183,14 @@ def parse_raw_poses(poses: list) -> dict:
     """Parse a list of raw pose dicts (from ZMQ) into numpy arrays."""
     n = len(poses)
     t_ns = np.zeros(n, dtype=np.int64)
+    t_recv_ns = np.zeros(n, dtype=np.int64)
     ee_T = np.zeros((n, 4, 4), dtype=np.float64)
     joint_positions = np.zeros((n, 7), dtype=np.float64)
     gripper_q = np.zeros(n, dtype=np.float64)
 
     for i, pose in enumerate(poses):
         t_ns[i] = pose.get("t_ns", 0)
+        t_recv_ns[i] = pose.get("t_recv_ns", 0)
 
         if "ee_T" in pose:
             ee_T[i] = np.array(pose["ee_T"]).reshape(4, 4)
@@ -203,6 +206,7 @@ def parse_raw_poses(poses: list) -> dict:
 
     return {
         "t_ns": t_ns,
+        "t_recv_ns": t_recv_ns,
         "ee_T": ee_T,
         "joint_positions": joint_positions,
         "gripper_q": gripper_q,
@@ -377,6 +381,7 @@ def record_single_object(
     event_done_event = None
     event_ready_event = None
     event_device_open_ns = 0  # system time when event sensor opened (clock origin)
+    logging_start_queue = None
 
     if num_event_cams > 0:
         stop_acquire_event = MPEvent()
@@ -384,12 +389,14 @@ def record_single_object(
         event_ready_event = MPEvent()
         start_logging_event = MPEvent()
         clock_sync_queue = Queue()
+        logging_start_queue = Queue()
 
         event_proc = Process(
             target=event_drain_process,
             args=(stop_acquire_event, event_done_event, event_ready_event,
                   str(event0_raw_file), str(event1_raw_file), num_event_cams),
-            kwargs={"clock_sync_queue": clock_sync_queue, "start_logging_event": start_logging_event},
+            kwargs={"clock_sync_queue": clock_sync_queue, "start_logging_event": start_logging_event,
+                    "logging_start_queue": logging_start_queue},
         )
         event_proc.start()
 
@@ -487,6 +494,7 @@ def record_single_object(
     rs_idx = 0
     accumulated_poses = []
     frame_times_ns_list = []
+    frame_hw_ms_list = []
     rs_timestamp_domain = ""
     timestamp_domain_recorded = False
     
@@ -526,17 +534,33 @@ def record_single_object(
 
             # Store data
             t_ns = time.time_ns()
+            t_hw_ms = depth.get_timestamp()
             depth_ds[rs_idx] = depth_img
             rgb_ds[rs_idx] = color_img
             t_sys_ds[rs_idx] = t_ns
-            t_hw_ds[rs_idx] = depth.get_timestamp()
+            t_hw_ds[rs_idx] = t_hw_ms
             frame_num_ds[rs_idx] = depth.get_frame_number()
             frame_times_ns_list.append(t_ns)
+            frame_hw_ms_list.append(t_hw_ms)
 
             # Record RealSense timestamp domain once for diagnostics
             if not timestamp_domain_recorded:
                 rs_timestamp_domain = str(depth.get_frame_timestamp_domain())
                 timestamp_domain_recorded = True
+
+            # Periodic 3-clock sync check (every 90 frames ≈ 3 s at 30 fps)
+            if rs_idx > 0 and rs_idx % 90 == 0:
+                sys_elapsed_ms = (t_ns - frame_times_ns_list[0]) / 1e6
+                hw_elapsed_ms = t_hw_ms - frame_hw_ms_list[0]
+                ev_elapsed_ms = (t_ns - event_logging_start_ns) / 1e6 if event_logging_start_ns else float('nan')
+                drift_sys_hw_ms = sys_elapsed_ms - hw_elapsed_ms
+                print(
+                    f"[ClockSync @ frame {rs_idx}]"
+                    f"  sys_elapsed={sys_elapsed_ms:.1f}ms"
+                    f"  hw_elapsed={hw_elapsed_ms:.1f}ms"
+                    f"  ev_elapsed={ev_elapsed_ms:.1f}ms"
+                    f"  sys-hw drift={drift_sys_hw_ms:+.1f}ms"
+                )
 
             depth_colorized = cv2.applyColorMap(
                 cv2.convertScaleAbs(depth_img, alpha=0.03), cv2.COLORMAP_TURBO
@@ -554,7 +578,15 @@ def record_single_object(
             stop_acquire_event.set()
             event_done_event.wait()
             event_proc.join()
-        
+
+        # Refine event_logging_start_ns using the exact time captured in the subprocess
+        # right before raw0.log_raw_data() — eliminates inter-process scheduling jitter.
+        if logging_start_queue is not None:
+            try:
+                event_logging_start_ns = logging_start_queue.get_nowait()
+            except Exception:
+                pass  # keep the fallback value captured in the main process
+
         # Get remaining poses
         pose_receiver.stop()
         accumulated_poses.extend(pose_receiver.get_all_poses())
@@ -567,22 +599,42 @@ def record_single_object(
         rs_rgb_video.release()
         rs_h5.close()
         
-        # Interpolate raw poses to per-depth-frame timestamps → poses.h5
-        frame_times_ns = np.array(frame_times_ns_list, dtype=np.int64)
-        
+        # Compute hardware-anchored depth timestamps (same clock domain as sys,
+        # but inherits RealSense's clean hardware frame spacing instead of noisy
+        # Python receive-time jitter).
+        # Formula: sys_time_at_frame_0 + elapsed_hw_time_since_frame_0
+        depth_t_sys_ns = np.array(frame_times_ns_list, dtype=np.int64)
+        depth_t_hw_ms = np.array(frame_hw_ms_list, dtype=np.float64)
+        if len(depth_t_sys_ns) > 0:
+            depth_t_hw_as_sys_ns = (
+                depth_t_sys_ns[0]
+                + ((depth_t_hw_ms - depth_t_hw_ms[0]) * 1e6).astype(np.int64)
+            )
+        else:
+            depth_t_hw_as_sys_ns = depth_t_sys_ns
+
+        # Append t_hw_as_sys_ns to the already-closed realsense.h5
+        if len(depth_t_hw_as_sys_ns) > 0:
+            with h5py.File(rs_h5_file, "a") as rs_h5_append:
+                rs_h5_append.create_dataset("t_hw_as_sys_ns", data=depth_t_hw_as_sys_ns)
+
+        # Use hardware-anchored timestamps for all downstream alignment
+        frame_times_ns = depth_t_hw_as_sys_ns
+
         if raw_poses_received > 1 and rs_idx > 0:
             try:
                 parsed = parse_raw_poses(accumulated_poses)
                 # Save all raw poses into their own HDF5
                 with h5py.File(raw_poses_h5_file, "w") as rpf:
                     rpf.create_dataset("t_ns", data=parsed["t_ns"])
+                    rpf.create_dataset("t_recv_ns", data=parsed["t_recv_ns"])
                     rpf.create_dataset("ee_T", data=parsed["ee_T"])
                     rpf.create_dataset("joint_positions", data=parsed["joint_positions"])
                     rpf.create_dataset("gripper_q", data=parsed["gripper_q"])
                 print(f"[Recording] Raw poses saved: {len(parsed['t_ns'])} poses → {raw_poses_h5_file}")
                 interp = interpolate_poses_for_frames(
                     frame_times_ns=frame_times_ns,
-                    pose_times_ns=parsed["t_ns"],
+                    pose_times_ns=parsed["t_recv_ns"],
                     pose_ee_T=parsed["ee_T"],
                     pose_joint_pos=parsed["joint_positions"],
                     pose_gripper_q=parsed["gripper_q"],
@@ -627,9 +679,10 @@ def record_single_object(
     if num_event_cams > 0:
         print("[Recording] Generating event camera video(s) from raw data...")
         generate_event_videos(object_raw_dir, object_video_dir, object_hdf5_dir, num_event_cams)
-        print("[Recording] Aligning event frames to depth timestamps...")
+        print("[Recording] Aligning event frames to depth timestamps (using t_hw_as_sys_ns)...")
         align_event_frames_to_depth(
-            object_hdf5_dir, num_event_cams, frame_times_ns, event_logging_start_ns
+            object_hdf5_dir, num_event_cams, frame_times_ns, event_logging_start_ns,
+            depth_frame_offset=DEPTH_EVENT_ALIGN_OFFSET_FRAMES,
         )
 
     return True
@@ -715,6 +768,7 @@ def align_event_frames_to_depth(
     num_cameras: int,
     depth_times_ns: np.ndarray,
     event_logging_start_ns: int,
+    depth_frame_offset: int = 0,
 ) -> None:
     """
     Align event camera HDF5 frames to depth frame timestamps.
@@ -727,6 +781,12 @@ def align_event_frames_to_depth(
     The unaligned events_cam{i}.h5 (M frames) is replaced with an aligned
     version (N frames) where N = len(depth_times_ns), so that
     events[i] corresponds to depth[i] and poses[i].
+
+    ``depth_frame_offset`` (signed int, in frames): manual correction applied
+    before the nearest-neighbour search.  Negative values shift the event
+    lookup backward (use this when depth is behind events); positive shifts
+    it forward.  Corresponds to subtracting
+    ``depth_frame_offset * (1e9 / FPS)`` ns from depth_elapsed_ns.
     """
     N = len(depth_times_ns)
     if N == 0:
@@ -751,10 +811,18 @@ def align_event_frames_to_depth(
             continue
 
         # Elapsed time (ns) from each recording's own start.
-        # This is immune to raw-file timestamp rebasing and clock-sync
-        # uncertainty between the event sub-process and the main process.
-        ev_elapsed_ns = (ev_t_end_us - ev_t_end_us[0]).astype(np.int64) * 1000
+        # Use frame-center timestamps: each event frame covers [t_start, t_end]
+        # and the midpoint is the most representative time for that frame.
+        ev_t_center_us = (ev_t_start_us.astype(np.int64) + ev_t_end_us.astype(np.int64)) // 2
+        ev_elapsed_ns = (ev_t_center_us - ev_t_center_us[0]) * 1000
         depth_elapsed_ns = (depth_times_ns - event_logging_start_ns).astype(np.int64)
+
+        # Apply manual frame offset (e.g. to correct for observed systematic lag)
+        if depth_frame_offset != 0:
+            frame_duration_ns = int(round(1e9 / FPS))
+            depth_elapsed_ns = depth_elapsed_ns - depth_frame_offset * frame_duration_ns
+            print(f"[Align] cam{cam_idx}: applying depth_frame_offset={depth_frame_offset:+d} "
+                  f"({-depth_frame_offset * frame_duration_ns / 1e6:+.1f} ms shift on depth_elapsed)")
 
         # For each depth frame, find the nearest event frame
         indices = np.searchsorted(ev_elapsed_ns, depth_elapsed_ns, side="left")
@@ -767,7 +835,7 @@ def align_event_frames_to_depth(
         use_left = d_left < d_right
         indices[use_left] = left[use_left]
 
-        offset_ms = np.abs(ev_elapsed_ns[indices] - depth_elapsed_ns) / 1e6
+        offset_ms = (ev_elapsed_ns[indices] - depth_elapsed_ns).astype(np.float64) / 1e6
 
         # Select the aligned frames
         aligned_frames = ev_frames[indices]          # (N, H, W)
@@ -786,8 +854,9 @@ def align_event_frames_to_depth(
 
         print(
             f"[Align] cam{cam_idx}: {M} → {N} frames, "
-            f"median offset {np.median(offset_ms):.1f} ms, "
-            f"max {np.max(offset_ms):.1f} ms"
+            f"median signed offset {np.median(offset_ms):.1f} ms, "
+            f"mean {np.mean(offset_ms):.1f} ms, "
+            f"max abs {np.max(np.abs(offset_ms)):.1f} ms"
         )
 
 
@@ -801,6 +870,7 @@ def event_drain_process(
     flush_seconds: float = 0.5,
     clock_sync_queue: Optional[Queue] = None,
     start_logging_event=None,
+    logging_start_queue: Optional[Queue] = None,
 ) -> None:
     """Process that handles event camera acquisition with custom output paths."""
     devices = DeviceDiscovery.list()
@@ -847,11 +917,16 @@ def event_drain_process(
     logging_active = False
     try:
         if not stop_acquire_event.is_set():
-            # Start file logging now that the arm has reached the first pose
+            # Start file logging now that the arm has reached the first pose.
+            # Capture time immediately before calling log_raw_data so the main
+            # process has a precise anchor for the event-camera clock origin.
+            log_start_ns = time.time_ns()
             raw0.log_raw_data(event0_path)
             if raw1 is not None:
                 raw1.log_raw_data(event1_path)
             logging_active = True
+            if logging_start_queue is not None:
+                logging_start_queue.put(log_start_ns)
 
             while not stop_acquire_event.is_set():
                 next(it0)
@@ -960,12 +1035,10 @@ def main(
             # In temporal-check mode, use a fixed name and record once
             if temporal_check:
                 object_name = "temporal_check"
-                rec_dir = TEMPORAL_CHECK_ROOT
-                rec_dir.mkdir(parents=True, exist_ok=True)
-                object_dir = rec_dir / object_name
-                if object_dir.exists():
+                rec_dir = TEMPORAL_CHECK_ROOT.parent
+                if TEMPORAL_CHECK_ROOT.exists():
                     import shutil
-                    shutil.rmtree(object_dir)
+                    shutil.rmtree(TEMPORAL_CHECK_ROOT)
                     print(f"[Recording] Removed previous temporal_check recording")
             else:
                 rec_dir = DATA_DIR
@@ -996,7 +1069,7 @@ def main(
                     _spec = importlib.util.spec_from_file_location("analyze_temporal_alignment", _script)
                     _mod = importlib.util.module_from_spec(_spec)
                     _spec.loader.exec_module(_mod)
-                    _mod.analyze_temporal_alignment(rec_dir / object_name)
+                    _mod.analyze_temporal_alignment(TEMPORAL_CHECK_ROOT)
                     break
             else:
                 print("\n[Recording] Recording failed or was aborted.")

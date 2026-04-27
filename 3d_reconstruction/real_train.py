@@ -20,7 +20,7 @@ Expected folder structure (real data):
                 rgb_in_event_frame.h5     # rgb (N, H, W, 3) uint8 (for --rgb_mask)
                 poses.h5                  # ee_T (N, 4, 4), joint_positions, gripper_q
             events/
-                voxels_cam0/              # precomputed voxel_NNNNNN.npy files
+                voxels_cam0.h5            # precomputed voxels (N, C, H, W) HDF5
 
 Usage:
     python real_train.py --data_root data/real
@@ -28,9 +28,8 @@ Usage:
     # With specific objects:
     python3 real_train.py --data_dir data/real/bottle data/real/cube_medium
 
-    # With pose input (requires precomputed pose voxels):
-    python3 precompute_pose_depth.py --data_root data/real
-    python3 real_train.py --data_root data/real --use_pose
+    # With pose-warp (warps hidden states using relative camera pose):
+    python3 real_train.py --data_root data/real --use_pose_warp
 
     # With RGB white-pixel masking (requires projected RGB):
     python3 project_realsense_to_event.py --data_root data/real
@@ -67,10 +66,13 @@ except Exception:
 from reconstruction_config import (
     D_MAX, ALPHA, DEPTH_MIN, WHITE_THRESH, NUM_BINS,
     DATA_ROOT as _DATA_ROOT, DEFAULT_OUT_DIR,
+    CALIB_DIR as _CALIB_DIR,
+    TRAIN_RESIZE_HW, TRAIN_CROP_HW,
 )
 
 # ================= DEFAULT PATHS =================
 DATA_ROOT = _DATA_ROOT
+CALIB_DIR = Path(__file__).resolve().parent / _CALIB_DIR
 # =================================================
 
 
@@ -228,9 +230,25 @@ class E2DepthNet(nn.Module):
         base: int = 32,
         num_encoders: int = 3,
         num_residuals: int = 2,
+        use_pose_warp: bool = False,
+        K: Optional[np.ndarray] = None,
+        input_hw: Optional[Tuple[int, int]] = None,
+        pose_d_ref: float = 0.3,
     ):
         super().__init__()
         self.num_encoders = num_encoders
+        self.use_pose_warp = use_pose_warp
+        self.pose_d_ref = pose_d_ref
+
+        if use_pose_warp:
+            if K is None or input_hw is None:
+                raise ValueError("K and input_hw are required when use_pose_warp=True")
+            K_t = torch.from_numpy(K).float() if isinstance(K, np.ndarray) else K.float()
+            self.register_buffer("K", K_t)  # (3, 3)
+            self.input_hw = input_hw        # (H, W)
+        else:
+            self.K = None
+            self.input_hw = None
         
         # Head layer
         self.head = nn.Sequential(
@@ -266,10 +284,43 @@ class E2DepthNet(nn.Module):
             nn.Sigmoid(),  # Output normalized depth in [0, 1]
         )
     
+    def _warp_states(
+        self,
+        states: List,
+        T_rel: torch.Tensor,
+    ) -> List:
+        """
+        Warp all ConvLSTM hidden states (h, c) with the relative camera pose.
+
+        Args:
+            states:  List of (h, c) or None per encoder level.
+            T_rel:   (B, 4, 4) T_curr_from_prev in camera frame.
+        """
+        in_H, in_W = self.input_hw
+        warped = []
+        for state in states:
+            if state is None:
+                warped.append(None)
+                continue
+            h, c = state
+            feat_H, feat_W = h.shape[2], h.shape[3]
+            grid = build_warp_grid(
+                T_rel, self.K, feat_H, feat_W, in_H, in_W, self.pose_d_ref
+            )
+            h_w = F.grid_sample(
+                h, grid, mode='bilinear', padding_mode='border', align_corners=True
+            )
+            c_w = F.grid_sample(
+                c, grid, mode='bilinear', padding_mode='border', align_corners=True
+            )
+            warped.append((h_w, c_w))
+        return warped
+
     def forward(
         self,
         x: torch.Tensor,
-        states: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
+        states: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        T_rel: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Forward pass with recurrent state.
@@ -284,7 +335,11 @@ class E2DepthNet(nn.Module):
         """
         if states is None:
             states = [None] * self.num_encoders
-        
+
+        # Warp hidden states to align with the current camera frame
+        if self.use_pose_warp and T_rel is not None:
+            states = self._warp_states(states, T_rel)
+
         # Head
         x = self.head(x)
         
@@ -338,23 +393,110 @@ class E2DepthNet(nn.Module):
 
 
 # -----------------------------
+# Pose Warp Utilities
+# -----------------------------
+def build_warp_grid(
+    T_rel: torch.Tensor,
+    K: torch.Tensor,
+    feat_H: int,
+    feat_W: int,
+    in_H: int,
+    in_W: int,
+    d_ref: float = 0.3,
+) -> torch.Tensor:
+    """
+    Build an inverse-warp sampling grid for hidden-state alignment.
+
+    For each pixel in the current frame at reference depth d_ref, computes
+    where it came from in the previous frame under the given relative camera
+    pose.  The resulting grid is suitable for F.grid_sample.
+
+    Args:
+        T_rel:          (B, 4, 4) SE3 T_curr_from_prev in camera frame.
+        K:              (3, 3) camera intrinsics at the reference resolution.
+        feat_H, feat_W: Spatial size of the feature map to warp.
+        in_H, in_W:     Reference resolution that K was calibrated for.
+        d_ref:          Reference depth (metres) used for unprojection.
+
+    Returns:
+        grid: (B, feat_H, feat_W, 2) sampling coordinates in [-1, 1].
+    """
+    B = T_rel.shape[0]
+    device = T_rel.device
+
+    # Scale K to feature-map resolution
+    K_f = K.to(device=device, dtype=torch.float32).clone()
+    K_f[0] = K_f[0] * (feat_W / in_W)   # scale fx and cx
+    K_f[1] = K_f[1] * (feat_H / in_H)   # scale fy and cy
+
+    # Inverse relative pose: T_prev_from_curr
+    T_f = T_rel.float()
+    R_inv = T_f[:, :3, :3].transpose(1, 2)          # (B, 3, 3)
+    t_inv = -torch.bmm(R_inv, T_f[:, :3, 3:])       # (B, 3, 1)
+
+    # Pixel grid for the current (destination) frame
+    u = torch.arange(feat_W, device=device, dtype=torch.float32)
+    v = torch.arange(feat_H, device=device, dtype=torch.float32)
+    vv, uu = torch.meshgrid(v, u, indexing='ij')     # (feat_H, feat_W)
+    ones = torch.ones(feat_H, feat_W, device=device, dtype=torch.float32)
+    pix = torch.stack([uu, vv, ones], dim=0).reshape(3, -1)  # (3, N)
+
+    # Unproject to camera coordinates at reference depth
+    K_f_inv = torch.inverse(K_f)
+    X = (K_f_inv @ pix) * d_ref                     # (3, N)
+    X = X.unsqueeze(0).expand(B, -1, -1)            # (B, 3, N)
+
+    # Transform to previous camera frame
+    X_prev = torch.bmm(R_inv, X) + t_inv            # (B, 3, N)
+
+    # Project onto previous image plane
+    K_f_b = K_f.unsqueeze(0).expand(B, -1, -1)
+    p = torch.bmm(K_f_b, X_prev)                    # (B, 3, N)
+    z = p[:, 2:3].clamp(min=1e-6)
+    p_xy = p[:, :2] / z                             # (B, 2, N)
+
+    # Normalise to [-1, 1] for grid_sample (align_corners=True)
+    norm_x = 2.0 * p_xy[:, 0] / max(feat_W - 1, 1) - 1.0
+    norm_y = 2.0 * p_xy[:, 1] / max(feat_H - 1, 1) - 1.0
+    grid = torch.stack([norm_x, norm_y], dim=2).view(B, feat_H, feat_W, 2)
+    return grid
+
+
+# -----------------------------
 # Loss Functions (from paper)
 # -----------------------------
-def scale_invariant_loss(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def charbonnier_loss(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    mask: torch.Tensor,
+    eps: float = 1e-3,
+) -> torch.Tensor:
+    """Charbonnier (pseudo-Huber) loss: mean sqrt((pred-gt)^2 + eps^2) over valid pixels.
+
+    Preferred over plain L1: continuously differentiable at 0, robust to sensor
+    outliers near depth discontinuities.
     """
-    Scale-invariant loss from paper (Equation 3).
-    
-    L_si = (1/n) * sum(R^2) - (1/n^2) * sum(R)^2
-    where R = pred_log - gt_log
-    """
-    # Both pred and gt should be in log space already (normalized [0, 1])
-    diff = (pred - gt) * mask
     n = mask.sum().clamp_min(1.0)
-    
-    term1 = (diff ** 2).sum() / n
-    term2 = (diff.sum() ** 2) / (n ** 2)
-    
-    return term1 - term2
+    diff = (pred - gt) * mask
+    return torch.sqrt(diff ** 2 + eps ** 2).sum() / n
+
+
+def mean_alignment_loss(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Penalises global mean offset: (mean(pred) - mean(gt))^2 over valid pixels.
+
+    Gradient w.r.t. output bias = 2*(pred_mean - gt_mean)/n, which is non-zero
+    whenever there is a systematic offset.  This directly closes the persistent
+    pred_m vs gt_m gap that scale-invariant terms (gradient, smoothness, normal)
+    cannot fix because they are insensitive to global offsets.
+    """
+    n = mask.sum().clamp_min(1.0)
+    pred_mean = (pred * mask).sum() / n
+    gt_mean   = (gt   * mask).sum() / n
+    return (pred_mean - gt_mean) ** 2
 
 
 def multi_scale_gradient_loss(pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor, num_scales: int = 4) -> torch.Tensor:
@@ -373,10 +515,10 @@ def multi_scale_gradient_loss(pred: torch.Tensor, gt: torch.Tensor, mask: torch.
     
     for scale in range(num_scales):
         if scale > 0:
-            pred = F.avg_pool2d(pred, 2)
-            gt = F.avg_pool2d(gt, 2)
-            mask = F.avg_pool2d(mask, 2)
-            mask = (mask > 0.5).float()
+            m    = F.avg_pool2d(mask, 2)
+            pred = F.avg_pool2d(pred * mask, 2) / m.clamp_min(1e-6)
+            gt   = F.avg_pool2d(gt   * mask, 2) / m.clamp_min(1e-6)
+            mask = (m > 0.5).float()
         
         # Compute residual
         residual = pred - gt
@@ -398,35 +540,274 @@ def multi_scale_gradient_loss(pred: torch.Tensor, gt: torch.Tensor, mask: torch.
     return total_loss / num_scales
 
 
+def edge_aware_smoothness_loss(
+    pred: torch.Tensor,
+    events: torch.Tensor,
+    gamma: float = 1.0,
+) -> torch.Tensor:
+    """Edge-aware depth smoothness regulariser.
+
+    L_smooth = |dx D̂| · exp(-γ |dx Ē|) + |dy D̂| · exp(-γ |dy Ē|)
+
+    where Ē = per-sample normalised event activity summed over bins.
+    Keeps depth smooth on flat regions but allows sharp discontinuities where
+    the event camera sees real edges.
+    """
+    activity = events.abs().sum(dim=1, keepdim=True)                    # (B, 1, H, W)
+    a_max    = activity.flatten(1).max(dim=1)[0].view(-1, 1, 1, 1).clamp_min(1e-6)
+    activity = activity / a_max                                          # normalised [0,1]
+
+    dx_pred = torch.abs(pred[:, :, :, 1:] - pred[:, :, :, :-1])
+    dy_pred = torch.abs(pred[:, :, 1:, :] - pred[:, :, :-1, :])
+
+    dx_ev = (activity[:, :, :, 1:] + activity[:, :, :, :-1]) * 0.5
+    dy_ev = (activity[:, :, 1:, :] + activity[:, :, :-1, :]) * 0.5
+
+    loss_x = (dx_pred * torch.exp(-gamma * dx_ev)).mean()
+    loss_y = (dy_pred * torch.exp(-gamma * dy_ev)).mean()
+    return loss_x + loss_y
+
+
+def _compute_normals(depth: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
+    """Geometrically correct surface normals via backprojection and cross product.
+
+    Backprojects each pixel to 3-D using camera intrinsics, then estimates the
+    surface normal at each pixel as the cross product of the horizontal and
+    vertical 3-D central-difference vectors.
+
+    Args:
+        depth: (B, 1, H, W) **metric** depth in metres.
+        K:     (3, 3) camera intrinsics at input resolution.
+    Returns:
+        normals: (B, 3, H, W) unit normals.
+    """
+    B, _, H, W = depth.shape
+    device = depth.device
+    K = K.to(device=device, dtype=torch.float32)
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+
+    # Pixel coordinate grids
+    u = torch.arange(W, device=device, dtype=torch.float32)
+    v = torch.arange(H, device=device, dtype=torch.float32)
+    vv, uu = torch.meshgrid(v, u, indexing='ij')   # (H, W)
+
+    # Backproject each pixel to 3-D: X=(u-cx)*D/fx, Y=(v-cy)*D/fy, Z=D
+    D = depth[:, 0]  # (B, H, W)
+    points = torch.stack([
+        (uu - cx) * D / fx,   # X
+        (vv - cy) * D / fy,   # Y
+        D,                     # Z
+    ], dim=1)  # (B, 3, H, W)
+
+    # 3-D central differences along u and v
+    du = points[:, :, :, 2:] - points[:, :, :, :-2]   # (B, 3, H, W-2)
+    dv = points[:, :, 2:, :] - points[:, :, :-2, :]   # (B, 3, H-2, W)
+    du = F.pad(du, (1, 1, 0, 0), mode='replicate')     # (B, 3, H, W)
+    dv = F.pad(dv, (0, 0, 1, 1), mode='replicate')     # (B, 3, H, W)
+
+    # Normal = cross(du, dv)
+    nx = du[:, 1] * dv[:, 2] - du[:, 2] * dv[:, 1]
+    ny = du[:, 2] * dv[:, 0] - du[:, 0] * dv[:, 2]
+    nz = du[:, 0] * dv[:, 1] - du[:, 1] * dv[:, 0]
+    normals = torch.stack([nx, ny, nz], dim=1)  # (B, 3, H, W)
+    return F.normalize(normals, dim=1)
+
+
+def normal_loss(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    mask: torch.Tensor,
+    K: torch.Tensor,
+    log_depth: bool = False,
+    depth_min: float = DEPTH_MIN,
+    depth_max: float = D_MAX,
+) -> torch.Tensor:
+    """Surface normal cosine loss using geometrically correct backprojected normals.
+
+    Converts normalised predictions to metric depth before computing normals so
+    that the cross-product vectors are in consistent metric units.
+    """
+    if log_depth:
+        pred_m = log_normalized_to_depth(pred)
+        gt_m   = log_normalized_to_depth(gt)
+    else:
+        pred_m = linear_normalized_to_depth(pred, depth_min, depth_max)
+        gt_m   = linear_normalized_to_depth(gt, depth_min, depth_max)
+    n_pred = _compute_normals(pred_m, K)
+    n_gt   = _compute_normals(gt_m, K)
+    cosine = (n_pred * n_gt).sum(dim=1, keepdim=True)   # (B, 1, H, W)
+    return ((1.0 - cosine) * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def multiview_consistency_loss(
+    pred_prev: torch.Tensor,
+    pred_curr: torch.Tensor,
+    T_curr_from_prev: torch.Tensor,
+    K: torch.Tensor,
+    mask_prev: torch.Tensor,
+    mask_curr: torch.Tensor,
+    log_depth: bool = False,
+    depth_min: float = DEPTH_MIN,
+    depth_max: float = D_MAX,
+) -> torch.Tensor:
+    """Multi-view depth consistency using known relative camera pose.
+
+    Projects pred_prev into the current frame and enforces agreement with
+    pred_curr at the projected location.
+
+    Args:
+        pred_prev:        (B, 1, H, W) normalised depth at t-1.
+        pred_curr:        (B, 1, H, W) normalised depth at t.
+        T_curr_from_prev: (B, 4, 4) SE3 T_{t from t-1} in camera frame.
+        K:                (3, 3) camera intrinsics at input resolution.
+        mask_prev/curr:   (B, 1, H, W) valid-pixel masks.
+    """
+    if log_depth:
+        d_prev = log_normalized_to_depth(pred_prev)
+        d_curr = log_normalized_to_depth(pred_curr)
+    else:
+        d_prev = linear_normalized_to_depth(pred_prev, depth_min, depth_max)
+        d_curr = linear_normalized_to_depth(pred_curr, depth_min, depth_max)
+
+    B, _, H, W = d_prev.shape
+    device = d_prev.device
+    K_dev  = K.to(device=device, dtype=torch.float32)
+    K_inv  = torch.inverse(K_dev)
+
+    # Pixel grid for the prev frame
+    u    = torch.arange(W, device=device, dtype=torch.float32)
+    v    = torch.arange(H, device=device, dtype=torch.float32)
+    vv, uu = torch.meshgrid(v, u, indexing='ij')                     # (H, W)
+    pix  = torch.stack([uu, vv, torch.ones_like(uu)], dim=0).reshape(3, -1)  # (3, N)
+
+    # Unproject prev depth to 3-D points in camera_prev
+    d_flat   = d_prev.reshape(B, 1, H * W)
+    rays     = (K_inv @ pix).unsqueeze(0).expand(B, -1, -1)          # (B, 3, N)
+    X_prev   = rays * d_flat                                          # (B, 3, N)
+    X_prev_h = torch.cat(
+        [X_prev, torch.ones(B, 1, H * W, device=device)], dim=1      # (B, 4, N)
+    )
+
+    # Transform to curr frame
+    T      = T_curr_from_prev.to(device=device, dtype=torch.float32)
+    X_curr = torch.bmm(T, X_prev_h)[:, :3]                           # (B, 3, N)
+
+    # Project onto curr image plane
+    K_b   = K_dev.unsqueeze(0).expand(B, -1, -1)
+    p     = torch.bmm(K_b, X_curr)                                    # (B, 3, N)
+    z     = p[:, 2:3].clamp(min=1e-6)
+    p_xy  = p[:, :2] / z                                              # (B, 2, N)
+
+    # Normalise to [-1, 1] for F.grid_sample
+    norm_x = (2.0 * p_xy[:, 0] / max(W - 1, 1) - 1.0).view(B, H, W)
+    norm_y = (2.0 * p_xy[:, 1] / max(H - 1, 1) - 1.0).view(B, H, W)
+    grid   = torch.stack([norm_x, norm_y], dim=3)                     # (B, H, W, 2)
+
+    # Sample d_curr at the projected locations
+    d_curr_sampled = F.grid_sample(
+        d_curr, grid, align_corners=True, mode='bilinear', padding_mode='zeros'
+    )
+
+    # Expected depth in curr frame = Z of the transformed 3-D point (metric)
+    z_exp_m = X_curr[:, 2:3].view(B, 1, H, W).clamp_min(1e-6)
+
+    # Validity mask: in-bounds + positive z + valid in both frames
+    in_bounds = (
+        (norm_x.abs() <= 1.0) & (norm_y.abs() <= 1.0)
+    ).unsqueeze(1).float()
+    pos_z          = (z.view(B, 1, H, W) > 0.0).float()
+    mask_c_sampled = F.grid_sample(
+        mask_curr.float(), grid, align_corners=True,
+        mode='nearest', padding_mode='zeros'
+    )
+    valid = mask_prev * in_bounds * pos_z * mask_c_sampled
+
+    n    = valid.sum().clamp_min(1.0)
+    diff = (d_curr_sampled - z_exp_m) * valid
+    return torch.sqrt(diff ** 2 + 1e-3 ** 2).sum() / n
+
+
 def e2depth_loss(
     pred: torch.Tensor,
     gt: torch.Tensor,
     mask: torch.Tensor,
+    events: torch.Tensor,
     lambda_grad: float = 0.5,
-    lambda_mean: float = 0.2,
+    lambda_smooth: float = 0.01,
+    lambda_normal: float = 0.1,
+    lambda_mean: float = 0.1,
+    pred_prev: Optional[torch.Tensor] = None,
+    T_curr_from_prev: Optional[torch.Tensor] = None,
+    mask_prev: Optional[torch.Tensor] = None,
+    K: Optional[torch.Tensor] = None,
+    lambda_mv: float = 0.2,
+    log_depth: bool = False,
+    depth_min: float = DEPTH_MIN,
+    depth_max: float = D_MAX,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Combined depth loss.
+
+    L = L_charb + λ_grad·L_grad + λ_smooth·L_smooth + λ_normal·L_normal
+      + λ_mean·L_mean + λ_mv·L_mv  (only when pred_prev and K are available)
+
+    Design notes:
+    - Charbonnier replaces plain L1: robust to sensor outliers, fully
+      differentiable at 0 (no kink unlike Huber).
+    - No separate log-depth term: the network already predicts in
+      log-normalised space, so Charbonnier in that space IS a robust
+      log-domain loss.  Adding it explicitly would double-count.
+    - Multi-view consistency uses full gradients through pred_prev so
+      both frames learn to be geometrically consistent.
     """
-    Combined loss.
+    l_charb  = charbonnier_loss(pred, gt, mask)
+    l_grad   = multi_scale_gradient_loss(pred, gt, mask)
+    l_smooth = edge_aware_smoothness_loss(pred, events)
+    l_mean   = mean_alignment_loss(pred, gt, mask)
 
-    L_tot = L_si + λ_grad * L_grad + λ_mean * L_mean
+    total = (
+        l_charb
+        + lambda_grad   * l_grad
+        + lambda_smooth * l_smooth
+        + lambda_mean   * l_mean
+    )
 
-    L_mean penalises systematic global bias (mean residual) that L_si ignores
-    because its second term cancels constant offsets.
-    """
-    l_si = scale_invariant_loss(pred, gt, mask)
-    l_grad = multi_scale_gradient_loss(pred, gt, mask)
+    l_normal_val = 0.0
+    if K is not None:
+        l_normal = normal_loss(
+            pred, gt, mask, K,
+            log_depth=log_depth,
+            depth_min=depth_min,
+            depth_max=depth_max,
+        )
+        total        = total + lambda_normal * l_normal
+        l_normal_val = l_normal.item()
 
-    n = mask.sum().clamp_min(1.0)
-    mean_diff = ((pred - gt) * mask).sum() / n
-    l_mean = mean_diff ** 2
-
-    total = l_si + lambda_grad * l_grad + lambda_mean * l_mean
+    l_mv_val = 0.0
+    if (
+        pred_prev is not None
+        and T_curr_from_prev is not None
+        and mask_prev is not None
+        and K is not None
+    ):
+        l_mv = multiview_consistency_loss(
+            pred_prev, pred, T_curr_from_prev, K,
+            mask_prev, mask,
+            log_depth=log_depth,
+            depth_min=depth_min,
+            depth_max=depth_max,
+        )
+        total    = total + lambda_mv * l_mv
+        l_mv_val = l_mv.item()
 
     return total, {
-        "si": l_si.item(),
-        "grad": l_grad.item(),
-        "mean": l_mean.item(),
-        "total": total.item(),
+        "charb":  l_charb.item(),
+        "grad":   l_grad.item(),
+        "smooth": l_smooth.item(),
+        "normal": l_normal_val,
+        "mean":   l_mean.item(),
+        "mv":     l_mv_val,
+        "total":  total.item(),
     }
 
 
@@ -479,9 +860,9 @@ class DataConfig:
     depth_min: float = DEPTH_MIN   # Minimum depth in meters (5cm for tabletop)
     augment: bool = True  # Apply data augmentation during training
     num_bins: int = NUM_BINS  # Number of temporal bins for voxel grid
-    use_pose: bool = False  # Use precomputed pose depth channel (from voxels_pose_cam0/)
+    use_pose_warp: bool = False  # Warp ConvLSTM hidden states using relative camera pose (from poses.h5)
     rgb_mask: bool = False  # Mask out white pixels using projected RGB
-    spatial_mask: bool = False  # Mask pixels outside cube around EE (from spatial_mask.h5)
+    spatial_mask: bool = True  # Mask pixels outside cube around EE (from spatial_mask.h5)
     log_depth: bool = False  # Use log depth encoding (paper default); False = linear normalization
 
 
@@ -490,9 +871,10 @@ class RealDataset(Dataset):
     Dataset for real data recorded with franka_pipeline + synchronised_recording.
 
     Requires precomputed voxels (run precompute_voxels.py first).
-    When ``cfg.use_pose`` is ``True``, loads from voxels_pose_cam0/
-    (run precompute_pose_depth.py first) which has the pose depth
-    channel already baked in as the last channel.
+    When ``cfg.use_pose_warp`` is ``True``, loads poses from hdf5/poses.h5
+    and computes relative camera transforms per timestep.  These are returned
+    alongside the event voxels and used by the model to warp ConvLSTM hidden
+    states for ego-motion compensation.
 
     When ``cfg.rgb_mask`` is ``True``, additionally masks out white pixels
     in the projected RGB (from rgb_in_event_frame.h5, run
@@ -525,28 +907,54 @@ class RealDataset(Dataset):
         self._ts_key = "t_sys_ns"
 
         # --- Voxels (precomputed) ---
-        self.use_pose = cfg.use_pose
-        if self.use_pose:
-            # Prefer voxels_pose_cam0 (has pose depth channel appended)
-            if (self.sequence_dir / "events" / "voxels_pose_cam0").exists():
-                self.voxels_dir = self.sequence_dir / "events" / "voxels_pose_cam0"
-            else:
-                raise FileNotFoundError(
-                    f"--use_pose requires precomputed pose voxels. "
-                    f"Run: python precompute_pose_depth.py --data_dir {self.sequence_dir}"
-                )
+        self.use_pose_warp = cfg.use_pose_warp
+        _voxels_h5 = self.sequence_dir / "events" / "voxels_cam0.h5"
+        if _voxels_h5.exists():
+            self.voxels_h5_path: Optional[Path] = _voxels_h5
+            self.voxels_dir: Optional[Path] = None
         elif (self.sequence_dir / "events" / "voxels_cam0").exists():
+            self.voxels_h5_path = None
             self.voxels_dir = self.sequence_dir / "events" / "voxels_cam0"
         else:
+            self.voxels_h5_path = None
             self.voxels_dir = self.sequence_dir / "events" / "voxels"
+        # Lazy-opened per worker (None until first _get_voxel call in that worker)
+        self._voxels_ds = None
+
+        # --- Pose warp: load camera poses (optional) ---
+        self._T_cam_from_world: Optional[np.ndarray] = None  # (N, 4, 4)
+        if self.use_pose_warp:
+            poses_path = self.sequence_dir / "hdf5" / "poses.h5"
+            if not poses_path.exists():
+                raise FileNotFoundError(
+                    f"--use_pose_warp requires poses.h5. "
+                    f"Expected at: {poses_path}"
+                )
+            T_rgb_from_ee = np.load(CALIB_DIR / "T_rgb_from_ee.npz")["T"]
+            T_event_from_rgb = np.load(CALIB_DIR / "T_event_from_rgb.npz")["T"]
+            T_event_from_ee = T_event_from_rgb @ T_rgb_from_ee  # (4, 4)
+            with h5py.File(poses_path, 'r') as pf:
+                ee_T = pf["ee_T"][:]  # (N, 4, 4) T_base_from_ee
+            # T_cam[i] = T_event_from_base[i] = T_event_from_ee @ inv(ee_T[i])
+            T_ee_inv = np.linalg.inv(ee_T)  # (N, 4, 4)
+            self._T_cam_from_world = np.einsum(
+                'ij,njk->nik', T_event_from_ee, T_ee_inv
+            ).astype(np.float32)
         
         # Verify files exist
         if not self.depth_h5_path.exists():
             raise FileNotFoundError(f"Depth HDF5 not found: {self.depth_h5_path}")
         
-        self.voxel_files = sorted(self.voxels_dir.glob("voxel_*.npy")) if self.voxels_dir.exists() else []
-        if not self.voxel_files:
-            raise FileNotFoundError(f"No precomputed voxels in {self.voxels_dir}")
+        if self.voxels_h5_path is not None:
+            with h5py.File(self.voxels_h5_path, 'r') as _f:
+                n_voxels = int(_f["voxels"].shape[0])
+            if n_voxels == 0:
+                raise FileNotFoundError(f"Empty voxels dataset in {self.voxels_h5_path}")
+        else:
+            _voxel_files = sorted(self.voxels_dir.glob("voxel_*.npy")) if self.voxels_dir.exists() else []
+            n_voxels = len(_voxel_files)
+            if n_voxels == 0:
+                raise FileNotFoundError(f"No precomputed voxels in {self.voxels_dir}")
         
         # --- Metadata ---
         with h5py.File(self.depth_h5_path, 'r') as f:
@@ -556,7 +964,6 @@ class RealDataset(Dataset):
         with h5py.File(self._ts_h5_path, 'r') as f:
             self.depth_timestamps = f[self._ts_key][:] // 1000
         
-        n_voxels = len(self.voxel_files)
         if n_voxels != self.n_frames:
             print(f"Warning: {n_voxels} voxels != {self.n_frames} frames")
             self.n_frames = min(n_voxels, self.n_frames)
@@ -589,7 +996,7 @@ class RealDataset(Dataset):
         self._compute_valid_indices(val_ratio, seed)
         
         depth_src = "projected" if self._depth_is_metric else "raw realsense"
-        pose_str = "with pose" if self.use_pose else "no pose"
+        pose_str = "pose_warp" if self.use_pose_warp else "no pose"
         rgb_str = ", rgb_mask" if self.rgb_mask else ""
         spatial_str = ", spatial_mask" if self.spatial_mask else ""
         depth_enc = "log" if cfg.log_depth else "linear"
@@ -633,9 +1040,18 @@ class RealDataset(Dataset):
             self.indices = all_indices[val_mask]
     
     def _get_voxel(self, frame_idx: int) -> np.ndarray:
-        """Get precomputed voxel grid for a frame."""
-        voxel_path = self.voxels_dir / f"voxel_{frame_idx:06d}.npy"
-        return np.load(voxel_path)
+        """Get precomputed voxel grid for a frame (always returns float32)."""
+        if self.voxels_h5_path is not None:
+            # Open lazily per worker — avoids per-call open/close overhead.
+            # Each DataLoader worker process opens the file once and keeps it open.
+            if self._voxels_ds is None:
+                self._voxels_ds = h5py.File(self.voxels_h5_path, 'r')["voxels"]
+            v = self._voxels_ds[frame_idx]
+        else:
+            v = np.load(self.voxels_dir / f"voxel_{frame_idx:06d}.npy")
+        if v.dtype == np.float16:
+            v = v.astype(np.float32)
+        return v
     
     def _get_depth(self, frame_idx: int) -> np.ndarray:
         """Get depth frame (lazy load from HDF5)."""
@@ -652,23 +1068,24 @@ class RealDataset(Dataset):
     def __getitem__(self, i: int):
         start_idx = int(self.indices[i])
         seq_len = self.cfg.seq_len
-        
+
         events_seq = []
         depth_seq = []
         mask_seq = []
-        
+        poses_seq = []
+
         for t in range(seq_len):
             idx = start_idx + t
-            
+
             # Get voxel grid
             voxel = self._get_voxel(idx)
-            
+
             # Get depth frame (lazy load)
             depth = self._get_depth(idx)
-            
+
             # Create validity mask (depth range)
             mask = ((depth > self.cfg.depth_min) & (depth < self.cfg.depth_max)).astype(np.float32)
-            
+
             # Mask out white pixels from projected RGB
             if self.rgb_mask:
                 with h5py.File(self._rgb_h5_path, 'r') as rf:
@@ -682,7 +1099,7 @@ class RealDataset(Dataset):
                 with h5py.File(self._spatial_h5_path, 'r') as sf:
                     sp = sf["mask"][idx]  # (H, W) uint8
                 mask[sp == 0] = 0.0
-            
+
             # Normalize depth to [0, 1]
             depth = np.clip(depth, self.cfg.depth_min, self.cfg.depth_max)
             if self.cfg.log_depth:
@@ -690,26 +1107,45 @@ class RealDataset(Dataset):
             else:
                 depth = (depth - self.cfg.depth_min) / (self.cfg.depth_max - self.cfg.depth_min)
             depth = np.clip(depth, 0, 1)
-            
+
+            # Relative camera pose: T_curr_from_prev (identity for first frame)
+            if self.use_pose_warp and self._T_cam_from_world is not None and t > 0:
+                T_curr = self._T_cam_from_world[idx]
+                T_prev = self._T_cam_from_world[idx - 1]
+                T_rel = (T_curr @ np.linalg.inv(T_prev)).astype(np.float32)
+            else:
+                T_rel = np.eye(4, dtype=np.float32)
+
             events_seq.append(voxel)
             depth_seq.append(depth[None])  # (1, H, W)
             mask_seq.append(mask[None])
-        
+            poses_seq.append(T_rel)
+
         # Stack sequences: (T, C, H, W)
         events = np.stack(events_seq, axis=0)
         depths = np.stack(depth_seq, axis=0)
         masks = np.stack(mask_seq, axis=0)
+        poses = np.stack(poses_seq, axis=0)  # (T, 4, 4)
 
-        # Resize to target resolution (applied before crop/augmentation)
+        # Resize to target resolution (applied before crop/augmentation).
+        # Depths and masks are always at native HDF5 resolution and always need
+        # resizing. Events (voxels) may have been precomputed at the final crop
+        # resolution, in which case the resize step is skipped for them only.
         if self.cfg.resize_hw is not None:
             rh, rw = self.cfg.resize_hw
-            events = F.interpolate(torch.from_numpy(events), size=(rh, rw), mode="bilinear", align_corners=False).numpy()
             depths = F.interpolate(torch.from_numpy(depths), size=(rh, rw), mode="bilinear", align_corners=False).numpy()
-            masks = F.interpolate(torch.from_numpy(masks), size=(rh, rw), mode="nearest").numpy()
+            masks  = F.interpolate(torch.from_numpy(masks),  size=(rh, rw), mode="nearest").numpy()
+            ev_H, ev_W = events.shape[2], events.shape[3]
+            out_H = self.cfg.crop_size[0] if self.cfg.crop_size is not None else rh
+            out_W = self.cfg.crop_size[1] if self.cfg.crop_size is not None else rw
+            if (ev_H != rh or ev_W != rw) and (ev_H != out_H or ev_W != out_W):
+                events = F.interpolate(torch.from_numpy(events), size=(rh, rw), mode="bilinear", align_corners=False).numpy()
 
-        # Spatial dims after optional resize (used for crop bounds)
-        cur_H = events.shape[2]
-        cur_W = events.shape[3]
+        # Spatial dims after optional resize (used for crop bounds).
+        # Use depths shape as the reference — depths are always resized to resize_hw,
+        # whereas events may have been precomputed at the final crop resolution.
+        cur_H = depths.shape[2]
+        cur_W = depths.shape[3]
 
         # Center crop (applied to both train and val whenever crop_size is set)
         if self.cfg.crop_size is not None:
@@ -720,20 +1156,25 @@ class RealDataset(Dataset):
                 )
             y0 = (cur_H - ch) // 2
             x0 = (cur_W - cw) // 2
-            events = events[:, :, y0:y0+ch, x0:x0+cw]
             depths = depths[:, :, y0:y0+ch, x0:x0+cw]
-            masks = masks[:, :, y0:y0+ch, x0:x0+cw]
-        
-        # Horizontal flip (training)
-        if self.cfg.augment and self.split == "train" and np.random.rand() > 0.5:
+            masks  = masks[:, :, y0:y0+ch, x0:x0+cw]
+            # Events may already be at crop size (precomputed at training resolution).
+            if events.shape[2] != ch or events.shape[3] != cw:
+                events = events[:, :, y0:y0+ch, x0:x0+cw]
+
+        # Horizontal flip (training) — disabled when use_pose_warp is active because
+        # flipping requires updating cx in K; without that update, unprojection in the
+        # MV-consistency and pose-warp paths would be geometrically wrong.
+        if self.cfg.augment and self.split == "train" and not self.use_pose_warp and np.random.rand() > 0.5:
             events = np.flip(events, axis=3).copy()
             depths = np.flip(depths, axis=3).copy()
             masks = np.flip(masks, axis=3).copy()
-        
+
         return (
             torch.from_numpy(events).float(),
             torch.from_numpy(depths).float(),
             torch.from_numpy(masks).float(),
+            torch.from_numpy(poses).float(),
         )
 
 
@@ -775,7 +1216,8 @@ def find_sequence_dirs(data_root: Path) -> List[Path]:
             or (d / "hdf5" / "realsense.h5").exists()
         )
         has_voxels = (
-            (d / "events" / "voxels_cam0").exists()
+            (d / "events" / "voxels_cam0.h5").exists()
+            or (d / "events" / "voxels_cam0").exists()
             or (d / "events" / "voxels").exists()
         )
         if has_depth and has_voxels:
@@ -852,14 +1294,16 @@ def debug_visualize(
                     break
 
     # ---- Locate precomputed voxels ----
+    voxels_h5_path: Optional[Path] = None
     voxels_dir: Optional[Path] = None
-    for _vd in [
-        seq_dir / "events" / "voxels_cam0",
-        seq_dir / "events" / "voxels",
-    ]:
-        if _vd.exists() and list(_vd.glob("voxel_*.npy")):
-            voxels_dir = _vd
-            break
+    _h5 = seq_dir / "events" / "voxels_cam0.h5"
+    if _h5.exists():
+        voxels_h5_path = _h5
+    else:
+        for _vd in [seq_dir / "events" / "voxels_cam0", seq_dir / "events" / "voxels"]:
+            if _vd.exists() and list(_vd.glob("voxel_*.npy")):
+                voxels_dir = _vd
+                break
     # ---- Load metadata ----
     with h5py.File(raw_depth_path, "r") as _f:
         n_frames   = _f[raw_depth_key].shape[0]
@@ -1012,7 +1456,10 @@ def debug_visualize(
         # --- 5. Accumulated events ---
         voxel: Optional[np.ndarray] = None
         ax = axes[raw_row, 4]
-        if voxels_dir is not None:
+        if voxels_h5_path is not None:
+            with h5py.File(voxels_h5_path, 'r') as _f:
+                voxel = _f["voxels"][frame_idx].astype(np.float32)
+        elif voxels_dir is not None:
             vp = voxels_dir / f"voxel_{frame_idx:06d}.npy"
             if vp.exists():
                 voxel = np.load(vp)
@@ -1207,59 +1654,132 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     lambda_grad: float = 0.5,
+    lambda_smooth: float = 0.01,
+    lambda_normal: float = 0.1,
+    lambda_mean: float = 0.1,
+    lambda_mv: float = 0.2,
+    K: Optional[torch.Tensor] = None,
+    log_depth: bool = False,
+    depth_min: float = DEPTH_MIN,
+    depth_max: float = D_MAX,
     epoch: int = 0,
     log_interval: float = 10.0,
+    profile: bool = False,
 ) -> Dict[str, float]:
     """Train for one epoch with sequence processing."""
     model.train()
     
-    total_loss = 0.0
-    total_si = 0.0
-    total_grad = 0.0
-    total_mean = 0.0
-    n_batches = 0
+    total_loss   = 0.0
+    total_charb  = 0.0
+    total_grad   = 0.0
+    total_smooth = 0.0
+    total_normal = 0.0
+    total_mean_a = 0.0
+    total_mv     = 0.0
+    n_batches    = 0
     n_total = len(loader)
+
+    # Per-phase timing accumulators (seconds)
+    t_data    = 0.0  # DataLoader wait (data loading + collation)
+    t_transfer = 0.0  # host → device (.to())
+    t_forward  = 0.0  # model forward + loss
+    t_backward = 0.0  # backward + optimizer step
 
     last_log_time = time.time()
     epoch_start = time.time()
+    _t = time.perf_counter()  # tracks the start of the current "data loading" window
 
-    for events, depths, masks in loader:
+    for events, depths, masks, poses in loader:
+        if profile:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t_data += time.perf_counter() - _t
+
         # events: (B, T, C, H, W)
         # depths: (B, T, 1, H, W)
-        # masks: (B, T, 1, H, W)
+        # masks:  (B, T, 1, H, W)
+        # poses:  (B, T, 4, 4) relative T_curr_from_prev per step
         B, T = events.shape[:2]
+
+        if profile:
+            _t2 = time.perf_counter()
         events = events.to(device, non_blocking=True)
         depths = depths.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
-        
+        poses = poses.to(device, non_blocking=True)
+        if profile:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t_transfer += time.perf_counter() - _t2
+
         # Process sequence
-        states = None
-        batch_loss = 0.0
-        batch_si = 0.0
-        batch_grad = 0.0
-        batch_mean = 0.0
-        
+        states    = None
+        pred_prev = None
+        mask_prev = None
+        batch_loss   = 0.0
+        batch_charb  = 0.0
+        batch_grad   = 0.0
+        batch_smooth = 0.0
+        batch_normal = 0.0
+        batch_mean_a = 0.0
+        batch_mv     = 0.0
+
+        if profile:
+            _t2 = time.perf_counter()
         for t in range(T):
-            pred, states = model(events[:, t], states)
-            loss, metrics = e2depth_loss(pred, depths[:, t], masks[:, t], lambda_grad)
-            batch_loss += loss
-            batch_si += metrics["si"]
-            batch_grad += metrics["grad"]
-            batch_mean += metrics["mean"]
+            T_rel = poses[:, t] if model.use_pose_warp else None
+            pred, states = model(events[:, t], states, T_rel=T_rel)
+            loss, metrics = e2depth_loss(
+                pred, depths[:, t], masks[:, t], events[:, t],
+                lambda_grad=lambda_grad,
+                lambda_smooth=lambda_smooth,
+                lambda_normal=lambda_normal,
+                lambda_mean=lambda_mean,
+                pred_prev=pred_prev,
+                T_curr_from_prev=poses[:, t] if t > 0 else None,
+                mask_prev=mask_prev,
+                K=K,
+                lambda_mv=lambda_mv,
+                log_depth=log_depth,
+                depth_min=depth_min,
+                depth_max=depth_max,
+            )
+            batch_loss   += loss
+            batch_charb  += metrics["charb"]
+            batch_grad   += metrics["grad"]
+            batch_smooth += metrics["smooth"]
+            batch_normal += metrics["normal"]
+            batch_mean_a += metrics["mean"]
+            batch_mv     += metrics["mv"]
+            pred_prev = pred
+            mask_prev = masks[:, t]
         
         # Average over sequence
         batch_loss = batch_loss / T
-        
+        if profile:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t_forward += time.perf_counter() - _t2
+
+        if profile:
+            _t2 = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         batch_loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        if profile:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t_backward += time.perf_counter() - _t2
         
-        total_loss += batch_loss.item()
-        total_si += batch_si / T
-        total_grad += batch_grad / T
-        total_mean += batch_mean / T
-        n_batches += 1
+        total_loss   += batch_loss.item()
+        total_charb  += batch_charb  / T
+        total_grad   += batch_grad   / T
+        total_smooth += batch_smooth / T
+        total_normal += batch_normal / T
+        total_mean_a += batch_mean_a / T
+        total_mv     += batch_mv     / T
+        n_batches    += 1
 
         now = time.time()
         if now - last_log_time >= log_interval:
@@ -1276,11 +1796,32 @@ def train_one_epoch(
             )
             last_log_time = now
 
+        if profile:
+            _t = time.perf_counter()  # reset for next data-loading window
+
+    if profile and n_batches > 0:
+        total_t = t_data + t_transfer + t_forward + t_backward
+        def _pct(x): return 100.0 * x / total_t if total_t > 0 else 0.0
+        def _ms(x): return 1000.0 * x / n_batches
+        print(
+            f"\n  [Epoch {epoch:03d}] Timing breakdown ({n_batches} batches):\n"
+            f"    Data loading : {_ms(t_data):7.1f} ms/batch  ({_pct(t_data):.1f}%)\n"
+            f"    Host→device  : {_ms(t_transfer):7.1f} ms/batch  ({_pct(t_transfer):.1f}%)\n"
+            f"    Forward+loss : {_ms(t_forward):7.1f} ms/batch  ({_pct(t_forward):.1f}%)\n"
+            f"    Backward+opt : {_ms(t_backward):7.1f} ms/batch  ({_pct(t_backward):.1f}%)\n"
+            f"    Total        : {_ms(total_t):7.1f} ms/batch\n",
+            flush=True,
+        )
+
+    n = max(1, n_batches)
     return {
-        "total": total_loss / max(1, n_batches),
-        "si": total_si / max(1, n_batches),
-        "grad": total_grad / max(1, n_batches),
-        "mean": total_mean / max(1, n_batches),
+        "total":  total_loss   / n,
+        "charb":  total_charb  / n,
+        "grad":   total_grad   / n,
+        "smooth": total_smooth / n,
+        "normal": total_normal / n,
+        "mean":   total_mean_a / n,
+        "mv":     total_mv     / n,
     }
 
 
@@ -1293,65 +1834,94 @@ def validate(
     depth_min: float = DEPTH_MIN,
     depth_max: float = D_MAX,
 ) -> Dict[str, float]:
-    """Validate and compute metrics."""
+    """Validate and compute metrics over all frames after recurrent warmup.
+
+    Evaluates frames t >= eval_start = min(3, T-1) so the ConvLSTM state has
+    had a few steps to warm up before measurements begin.  All four standard
+    metrics are accumulated:
+      - L1 (metric)  — mean absolute error in metres
+      - AbsRel        — |pred-gt|/gt
+      - RMSE          — sqrt(mean squared error) in metres
+      - δ<1.25        — fraction with max(pred/gt, gt/pred) < 1.25
+    """
     model.eval()
-    
-    total_si = 0.0
-    total_l1 = 0.0
+
+    total_l1      = 0.0
     total_abs_rel = 0.0
-    n_batches = 0
-    
-    for events, depths, masks in loader:
-        B, T = events.shape[:2]
-        events = events.to(device, non_blocking=True)
-        depths = depths.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True)
-        
-        states = None
-        for t in range(T):
-            pred, states = model(events[:, t], states)
-        
-        # Metrics on last frame
-        gt = depths[:, -1]
-        mask = masks[:, -1]
-        
-        # Scale-invariant loss
-        total_si += scale_invariant_loss(pred, gt, mask).item()
-        
-        # Convert to metric depth for L1 and abs_rel
-        if log_depth:
-            pred_metric = log_normalized_to_depth(pred)
-            gt_metric = log_normalized_to_depth(gt)
-        else:
-            pred_metric = linear_normalized_to_depth(pred, d_min=depth_min, d_max=depth_max)
-            gt_metric = linear_normalized_to_depth(gt, d_min=depth_min, d_max=depth_max)
-        
-        # Debug: track prediction statistics
-        pred_mean = (pred * mask).sum() / mask.sum()
-        gt_mean = (gt * mask).sum() / mask.sum()
-        
-        diff = torch.abs(pred_metric - gt_metric) * mask
-        n_valid = mask.sum().clamp_min(1.0)
-        
-        total_l1 += (diff.sum() / n_valid).item()
-        total_abs_rel += ((diff / gt_metric.clamp_min(1e-6)).sum() / n_valid).item()
-        n_batches += 1
-        
-        # Store last batch stats for debugging
-        last_pred_mean = pred_mean.item()
-        last_gt_mean = gt_mean.item()
-        last_pred_metric_mean = (pred_metric * mask).sum().item() / n_valid.item()
-        last_gt_metric_mean = (gt_metric * mask).sum().item() / n_valid.item()
-    
-    n = max(1, n_batches)
+    total_sq      = 0.0
+    total_delta    = 0.0
+    total_pixels   = 0.0
+    n_frames       = 0  # count each evaluated frame, not each batch
+
+    last_pred_log_mean    = 0.0
+    last_gt_log_mean      = 0.0
+    last_pred_metric_mean = 0.0
+    last_gt_metric_mean   = 0.0
+
+    with torch.no_grad():
+        for events, depths, masks, poses in loader:
+            B, T = events.shape[:2]
+            events = events.to(device, non_blocking=True)
+            depths = depths.to(device, non_blocking=True)
+            masks  = masks.to(device, non_blocking=True)
+            poses  = poses.to(device, non_blocking=True)
+
+            eval_start = min(3, T - 1)
+
+            states = None
+            preds  = []
+            for t in range(T):
+                T_rel = poses[:, t] if model.use_pose_warp else None
+                pred, states = model(events[:, t], states, T_rel=T_rel)
+                if t >= eval_start:
+                    preds.append((pred, depths[:, t], masks[:, t]))
+
+            for pred, gt, mask in preds:
+                if log_depth:
+                    pred_metric = log_normalized_to_depth(pred)
+                    gt_metric   = log_normalized_to_depth(gt)
+                else:
+                    pred_metric = linear_normalized_to_depth(pred, d_min=depth_min, d_max=depth_max)
+                    gt_metric   = linear_normalized_to_depth(gt,   d_min=depth_min, d_max=depth_max)
+
+                gt_safe  = gt_metric.clamp_min(1e-6)
+                diff     = torch.abs(pred_metric - gt_metric) * mask
+                n_valid  = mask.sum().clamp_min(1.0)
+
+                total_l1      += (diff.sum() / n_valid).item()
+                total_abs_rel += ((diff / gt_safe).sum() / n_valid).item()
+                total_sq      += ((diff ** 2).sum() / n_valid).item()
+
+                ratio = torch.max(pred_metric / gt_safe, gt_safe / pred_metric.clamp_min(1e-6))
+                total_delta   += ((ratio < 1.25).float() * mask).sum().item()
+                total_pixels  += n_valid.item()
+
+                n_frames += 1  # one frame evaluated
+
+            # Keep last-frame stats from the final batch for the mean-gap debug print
+            pred_last, gt_last, mask_last = preds[-1]
+            if log_depth:
+                pm = log_normalized_to_depth(pred_last)
+                gm = log_normalized_to_depth(gt_last)
+            else:
+                pm = linear_normalized_to_depth(pred_last, d_min=depth_min, d_max=depth_max)
+                gm = linear_normalized_to_depth(gt_last,   d_min=depth_min, d_max=depth_max)
+            nv = mask_last.sum().clamp_min(1.0)
+            last_pred_log_mean    = (pred_last * mask_last).sum().item() / nv.item()
+            last_gt_log_mean      = (gt_last   * mask_last).sum().item() / nv.item()
+            last_pred_metric_mean = (pm * mask_last).sum().item() / nv.item()
+            last_gt_metric_mean   = (gm * mask_last).sum().item() / nv.item()
+
+    n = max(1, n_frames)
     return {
-        "si": total_si / n,
-        "l1_metric": total_l1 / n,
-        "abs_rel": total_abs_rel / n,
-        "pred_log_mean": last_pred_mean,
-        "gt_log_mean": last_gt_mean,
-        "pred_metric_mean": last_pred_metric_mean,
-        "gt_metric_mean": last_gt_metric_mean,
+        "l1_metric":         total_l1      / n,
+        "abs_rel":           total_abs_rel / n,
+        "rmse":              (total_sq     / n) ** 0.5,
+        "delta_125":         total_delta   / max(1.0, total_pixels),
+        "pred_log_mean":     last_pred_log_mean,
+        "gt_log_mean":       last_gt_log_mean,
+        "pred_metric_mean":  last_pred_metric_mean,
+        "gt_metric_mean":    last_gt_metric_mean,
     }
 
 
@@ -1376,15 +1946,23 @@ def log_images(
     epoch: int,
     split: str = "val",
     n_images: int = 3,
+    fixed_indices: Optional[List[int]] = None,
 ):
-    """Log n_images sample predictions to TensorBoard under '<split>/sample_N/…'."""
+    """Log n_images sample predictions to TensorBoard under '<split>/sample_N/…'.
+
+    Uses ``fixed_indices`` (determined once before training) so the same samples
+    are shown every epoch, making progress directly comparable across epochs.
+    """
     from torch.utils.data import Subset
 
     model.eval()
 
     dataset = loader.dataset
     n = len(dataset)
-    indices = torch.randperm(n)[:n_images].tolist()
+    if fixed_indices is not None:
+        indices = [i % n for i in fixed_indices[:n_images]]
+    else:
+        indices = torch.randperm(n)[:n_images].tolist()
     subset_loader = DataLoader(
         Subset(dataset, indices),
         batch_size=n_images,
@@ -1394,16 +1972,18 @@ def log_images(
     )
 
     with torch.no_grad():
-        for events, depths, masks in subset_loader:
+        for events, depths, masks, poses in subset_loader:
             B, T = events.shape[:2]
             events = events.to(device)
             depths = depths.to(device)
             masks = masks.to(device)
+            poses = poses.to(device)
 
             # Process full sequence
             states = None
             for t in range(T):
-                pred, states = model(events[:, t], states)
+                T_rel = poses[:, t] if model.use_pose_warp else None
+                pred, states = model(events[:, t], states, T_rel=T_rel)
 
             # Log last frame predictions
             for j in range(B):
@@ -1450,11 +2030,11 @@ def main():
                            help="Maximum depth in meters")
     data_group.add_argument("--depth_min", type=float, default=0.05,
                            help="Minimum depth in meters")
-    data_group.add_argument("--use_pose", action="store_true",
-                           help="Use precomputed pose depth channel (from voxels_pose_cam0/)")
+    data_group.add_argument("--use_pose_warp", action="store_true", default=True,
+                           help="Warp ConvLSTM hidden states with relative camera pose (from poses.h5)")
     data_group.add_argument("--rgb_mask", action="store_true",
                            help="Mask out white pixels using projected RGB (from rgb_in_event_frame.h5)")
-    data_group.add_argument("--spatial_mask", action="store_true",
+    data_group.add_argument("--spatial_mask", action="store_true", default=True,
                            help="Mask pixels outside cube around EE (from spatial_mask.h5, "
                                 "run precompute_spatial_mask.py first)")
     data_group.add_argument("--log_depth", action="store_true",
@@ -1471,24 +2051,36 @@ def main():
     
     # Training
     train_group = parser.add_argument_group("Training")
-    train_group.add_argument("--epochs", type=int, default=50,
+    train_group.add_argument("--epochs", type=int, default=15,
                             help="Number of epochs")
     train_group.add_argument("--batch", type=int, default=10,
                             help="Batch size")
     train_group.add_argument("--seq_len", type=int, default=10,
                             help="Sequence length for recurrent training")
     train_group.add_argument("--lr", type=float, default=1e-4,
-                            help="Learning rate")
+                            help="Peak learning rate")
+    train_group.add_argument("--lr_min", type=float, default=1e-6,
+                            help="Minimum LR at end of cosine decay")
+    train_group.add_argument("--warmup_epochs", type=int, default=0,
+                            help="Linear warmup epochs (0 = no warmup)")
     train_group.add_argument("--lambda_grad", type=float, default=0.5,
-                            help="Weight for gradient loss (λ in paper)")
+                            help="Weight for multi-scale gradient loss")
+    train_group.add_argument("--lambda_smooth", type=float, default=0.01,
+                            help="Weight for edge-aware smoothness loss")
+    train_group.add_argument("--lambda_normal", type=float, default=0.1,
+                            help="Weight for surface normal cosine loss")
+    train_group.add_argument("--lambda_mean", type=float, default=0.1,
+                            help="Weight for global mean alignment loss")
+    train_group.add_argument("--lambda_mv", type=float, default=0.2,
+                            help="Weight for multi-view consistency loss (needs poses)")
     train_group.add_argument("--num_workers", type=int, default=8)
-    train_group.add_argument("--crop_h", type=int, default=240,
+    train_group.add_argument("--crop_h", type=int, default=TRAIN_CROP_HW[0],
                             help="Center crop height in pixels (0=no crop)")
-    train_group.add_argument("--crop_w", type=int, default=320,
+    train_group.add_argument("--crop_w", type=int, default=TRAIN_CROP_HW[1],
                             help="Center crop width in pixels (0=no crop)")
-    train_group.add_argument("--resize_h", type=int, default=288,
+    train_group.add_argument("--resize_h", type=int, default=TRAIN_RESIZE_HW[0],
                             help="Resize height before crop/augmentation (0=no resize)")
-    train_group.add_argument("--resize_w", type=int, default=384,
+    train_group.add_argument("--resize_w", type=int, default=TRAIN_RESIZE_HW[1],
                             help="Resize width before crop/augmentation (0=no resize)")
     
     # Output
@@ -1512,6 +2104,9 @@ def main():
     dbg_group.add_argument("--debug_seq", type=str, default=None,
                            help="Specific sequence directory to visualize "
                                 "(default: first found via --data_dir / --data_root)")
+    dbg_group.add_argument("--profile", action="store_true",
+                           help="Print per-phase timing breakdown (data/transfer/forward/backward) "
+                                "at the end of each training epoch")
 
     args = parser.parse_args()
     
@@ -1549,7 +2144,7 @@ def main():
             seed=args.debug_seed,
             resize_hw=dbg_resize_hw,
             crop_size=dbg_crop_size,
-            use_pose=args.use_pose,
+            use_pose=False,  # pose depth channel visualization removed (now using hidden-state warp)
             rgb_mask=args.rgb_mask,
             spatial_mask=args.spatial_mask,
         )
@@ -1572,7 +2167,7 @@ def main():
         depth_min=args.depth_min,
         augment=True,
         num_bins=args.num_bins,
-        use_pose=args.use_pose,
+        use_pose_warp=args.use_pose_warp,
         rgb_mask=args.rgb_mask,
         spatial_mask=args.spatial_mask,
         log_depth=args.log_depth,
@@ -1587,7 +2182,7 @@ def main():
         depth_min=args.depth_min,
         augment=False,
         num_bins=args.num_bins,
-        use_pose=args.use_pose,
+        use_pose_warp=args.use_pose_warp,
         rgb_mask=args.rgb_mask,
         spatial_mask=args.spatial_mask,
         log_depth=args.log_depth,
@@ -1630,10 +2225,10 @@ def main():
     print(f"  Depth range: {args.depth_min:.2f}m - {args.depth_max:.2f}m")
     print(f"  Depth encoding: {'log' if args.log_depth else 'linear'}")
     print(f"  Voxel bins: {args.num_bins}")
-    print(f"  Use pose: {args.use_pose}")
+    print(f"  Pose warp: {args.use_pose_warp}")
     print(f"  RGB mask: {args.rgb_mask}")
     print(f"{'='*60}\n")
-    
+
     train_loader = DataLoader(
         train_ds, batch_size=args.batch, shuffle=True,
         num_workers=args.num_workers, pin_memory=True, drop_last=True, persistent_workers=True
@@ -1642,39 +2237,103 @@ def main():
         val_ds, batch_size=args.batch, shuffle=False,
         num_workers=args.num_workers, pin_memory=True, persistent_workers=True
     )
-    
+
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
-    
-    # Input channels = num_bins (+ 1 if using pose)
-    in_channels = args.num_bins + (1 if args.use_pose else 0)
-    print(f"Input channels: {in_channels} (bins={args.num_bins}, pose={'yes' if args.use_pose else 'no'})")
-    
+
+    # Input channels = num_bins (pose is no longer an extra input channel)
+    in_channels = args.num_bins
+    print(f"Input channels: {in_channels} (bins={args.num_bins})")
+
+    # Compute effective camera intrinsics after resize+crop.
+    # Always computed (needed for multi-view consistency and pose warp).
+    K_input: Optional[np.ndarray] = None
+    input_hw: Optional[Tuple[int, int]] = None
+    try:
+        K_native  = np.load(str(CALIB_DIR / "event_intrinsics.npz"))["camera_matrix"].copy()
+        native_ev = np.load(str(CALIB_DIR / "event_intrinsics.npz"))["image_size"]
+        native_H, native_W = int(native_ev[1]), int(native_ev[0])
+        K_input = K_native.copy()
+        cur_H, cur_W = native_H, native_W
+        if resize_hw is not None:
+            rh, rw = resize_hw
+            K_input[0] *= rw / native_W   # fx, cx
+            K_input[1] *= rh / native_H   # fy, cy
+            cur_H, cur_W = rh, rw
+        if crop_size is not None:
+            ch, cw = crop_size
+            y0 = (cur_H - ch) // 2
+            x0 = (cur_W - cw) // 2
+            K_input[0, 2] -= x0           # cx
+            K_input[1, 2] -= y0           # cy
+            cur_H, cur_W = ch, cw
+        input_hw = (cur_H, cur_W)
+        print(f"Effective K (input res {cur_W}x{cur_H}):\n{K_input}")
+    except Exception as e:
+        print(f"Warning: could not load camera intrinsics: {e}")
+        if args.use_pose_warp:
+            raise
+
     # Model
     model = E2DepthNet(
         in_channels=in_channels,
         base=args.base,
         num_encoders=args.num_encoders,
         num_residuals=args.num_residuals,
+        use_pose_warp=args.use_pose_warp,
+        K=K_input,
+        input_hw=input_hw,
     ).to(device)
 
     #model = torch.compile(model)
-    
+
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params:,}")
-    
+
     # Optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=20
+
+    # Cosine annealing with optional linear warmup.
+    # During warmup epochs the LR rises linearly from 0 → args.lr.
+    # Afterwards it decays as a cosine from args.lr → args.lr_min.
+    _cosine_epochs = max(1, args.epochs - args.warmup_epochs)
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=_cosine_epochs, eta_min=args.lr_min
     )
-    
+    if args.warmup_epochs > 0:
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=1e-6 / args.lr,
+            end_factor=1.0,
+            total_iters=args.warmup_epochs,
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[args.warmup_epochs],
+        )
+    else:
+        scheduler = cosine_scheduler
+
     start_epoch = 1
     best_val_loss = float("inf")
-    
+
+    # Fixed visualisation indices — chosen once with a deterministic seed so the
+    # same dataset samples appear in every epoch's TensorBoard images.
+    import json
+    _rng_viz = np.random.default_rng(42)
+    n_val   = len(val_loader.dataset)
+    n_train = len(train_loader.dataset)
+    viz_val_indices   = _rng_viz.choice(n_val,   size=min(3, n_val),   replace=False).tolist()
+    viz_train_indices = _rng_viz.choice(n_train, size=min(3, n_train), replace=False).tolist()
+    viz_indices_path = os.path.join(args.out_dir, "viz_indices.json")
+    os.makedirs(args.out_dir, exist_ok=True)
+    with open(viz_indices_path, "w") as _f:
+        json.dump({"val": viz_val_indices, "train": viz_train_indices}, _f)
+
     # Resume
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
@@ -1694,24 +2353,39 @@ def main():
     # Training loop
     for epoch in range(start_epoch, args.epochs + 1):
         train_metrics = train_one_epoch(
-            model, train_loader, optimizer, device, lambda_grad=args.lambda_grad, epoch=epoch
+            model, train_loader, optimizer, device,
+            lambda_grad=args.lambda_grad,
+            lambda_smooth=args.lambda_smooth,
+            lambda_normal=args.lambda_normal,
+            lambda_mean=args.lambda_mean,
+            lambda_mv=args.lambda_mv,
+            K=torch.from_numpy(K_input).float() if K_input is not None else None,
+            log_depth=args.log_depth,
+            depth_min=args.depth_min,
+            depth_max=args.depth_max,
+            epoch=epoch,
+            profile=args.profile,
         )
         val_metrics = validate(model, val_loader, device,
                                log_depth=args.log_depth,
                                depth_min=args.depth_min,
                                depth_max=args.depth_max)
         
-        # Step scheduler based on validation loss
-        scheduler.step(val_metrics["si"])
-        
+        # Step cosine/warmup scheduler once per epoch
+        scheduler.step()
+
         # Logging
-        writer.add_scalar("loss/train_total", train_metrics["total"], epoch)
-        writer.add_scalar("loss/train_si", train_metrics["si"], epoch)
-        writer.add_scalar("loss/train_grad", train_metrics["grad"], epoch)
-        writer.add_scalar("loss/train_mean", train_metrics["mean"], epoch)
-        writer.add_scalar("loss/val_si", val_metrics["si"], epoch)
+        writer.add_scalar("loss/train_total",  train_metrics["total"],  epoch)
+        writer.add_scalar("loss/train_charb",  train_metrics["charb"],  epoch)
+        writer.add_scalar("loss/train_grad",   train_metrics["grad"],   epoch)
+        writer.add_scalar("loss/train_smooth", train_metrics["smooth"], epoch)
+        writer.add_scalar("loss/train_normal", train_metrics["normal"], epoch)
+        writer.add_scalar("loss/train_mean",   train_metrics["mean"],   epoch)
+        writer.add_scalar("loss/train_mv",     train_metrics["mv"],     epoch)
         writer.add_scalar("loss/val_l1_metric", val_metrics["l1_metric"], epoch)
-        writer.add_scalar("loss/val_abs_rel", val_metrics["abs_rel"], epoch)
+        writer.add_scalar("loss/val_abs_rel",   val_metrics["abs_rel"],   epoch)
+        writer.add_scalar("loss/val_rmse",      val_metrics["rmse"],      epoch)
+        writer.add_scalar("loss/val_delta125",  val_metrics["delta_125"], epoch)
         writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch)
 
         # GPU stats
@@ -1723,8 +2397,11 @@ def main():
                 writer.add_scalar("gpu/utilization_pct", gpu_stats["gpu_util_pct"], epoch)
 
         print(f"Epoch {epoch:03d} | train: {train_metrics['total']:.5f} "
-              f"| val SI: {val_metrics['si']:.5f} | val L1: {val_metrics['l1_metric']:.3f}m "
-              f"| val AbsRel: {val_metrics['abs_rel']:.4f}")
+              f"(c:{train_metrics['charb']:.4f} g:{train_metrics['grad']:.4f} "
+              f"s:{train_metrics['smooth']:.5f} n:{train_metrics['normal']:.4f} "
+              f"m:{train_metrics['mean']:.5f} mv:{train_metrics['mv']:.4f}) "
+              f"| val L1: {val_metrics['l1_metric']:.4f} | AbsRel: {val_metrics['abs_rel']:.4f} "
+              f"| RMSE: {val_metrics['rmse']:.4f} | δ<1.25: {val_metrics['delta_125']:.3f}")
         print(f"          | pred_log: {val_metrics['pred_log_mean']:.3f} vs gt_log: {val_metrics['gt_log_mean']:.3f} "
               f"| pred_m: {val_metrics['pred_metric_mean']:.3f}m vs gt_m: {val_metrics['gt_metric_mean']:.3f}m")
         if gpu_stats:
@@ -1732,8 +2409,8 @@ def main():
             print(f"          | VRAM: {gpu_stats['vram_used_mb']:.0f}/{gpu_stats['vram_reserved_mb']:.0f} MB (used/reserved){util_str}")
         
         # Save best
-        if val_metrics["si"] < best_val_loss:
-            best_val_loss = val_metrics["si"]
+        if val_metrics["l1_metric"] < best_val_loss:
+            best_val_loss = val_metrics["l1_metric"]
             torch.save({
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
@@ -1746,10 +2423,12 @@ def main():
                     "num_residuals": args.num_residuals,
                     "depth_max": args.depth_max,
                     "depth_min": args.depth_min,
-                    "use_pose": args.use_pose,
+                    "log_depth": args.log_depth,
+                    "alpha": ALPHA,
+                    "use_pose_warp": args.use_pose_warp,
                 },
             }, os.path.join(args.out_dir, "best.pt"))
-            print(f"  -> Saved best model (val SI: {best_val_loss:.5f})")
+            print(f"  -> Saved best model (val L1: {best_val_loss:.4f})")
         
         # Periodic checkpoint
         if epoch % args.save_every == 0:
@@ -1760,13 +2439,12 @@ def main():
                 "best_val_loss": best_val_loss,
             }, os.path.join(args.out_dir, f"epoch_{epoch:03d}.pt"))
         
-        # Log images
-        if epoch % 5 == 0 or epoch == 1:
-            log_images(writer, model, val_loader, device, epoch, split="val", n_images=3)
-            log_images(writer, model, train_loader, device, epoch, split="train", n_images=3)
+        # Log images every epoch (fixed indices for comparability across epochs)
+        log_images(writer, model, val_loader,   device, epoch, split="val",   n_images=3, fixed_indices=viz_val_indices)
+        log_images(writer, model, train_loader, device, epoch, split="train", n_images=3, fixed_indices=viz_train_indices)
     
     writer.close()
-    print(f"\nTraining complete! Best val SI: {best_val_loss:.5f}")
+    print(f"\nTraining complete! Best val L1: {best_val_loss:.4f}")
     print(f"Checkpoints: {args.out_dir}")
 
 

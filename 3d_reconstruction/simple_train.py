@@ -264,23 +264,40 @@ class RealDataset(Dataset):
         if self.use_pose:
             pose_vox = self.sequence_dir / "events" / "voxels_pose_cam0"
             if pose_vox.exists():
+                self.voxels_h5_path = None
                 self.voxels_dir = pose_vox
             else:
                 raise FileNotFoundError(
                     f"--use_pose requires precomputed pose voxels. "
                     f"Run: python precompute_pose_depth.py --data_dir {self.sequence_dir}"
                 )
-        elif (self.sequence_dir / "events" / "voxels_cam0").exists():
-            self.voxels_dir = self.sequence_dir / "events" / "voxels_cam0"
         else:
-            self.voxels_dir = self.sequence_dir / "events" / "voxels"
+            _voxels_h5 = self.sequence_dir / "events" / "voxels_cam0.h5"
+            if _voxels_h5.exists():
+                self.voxels_h5_path = _voxels_h5
+                self.voxels_dir = None
+            elif (self.sequence_dir / "events" / "voxels_cam0").exists():
+                self.voxels_h5_path = None
+                self.voxels_dir = self.sequence_dir / "events" / "voxels_cam0"
+            else:
+                self.voxels_h5_path = None
+                self.voxels_dir = self.sequence_dir / "events" / "voxels"
+        # Lazy-opened per worker (None until first _get_voxel call in that worker)
+        self._voxels_ds = None
 
         if not self.depth_h5_path.exists():
             raise FileNotFoundError(f"Depth HDF5 not found: {self.depth_h5_path}")
 
-        self.voxel_files = sorted(self.voxels_dir.glob("voxel_*.npy")) if self.voxels_dir.exists() else []
-        if not self.voxel_files:
-            raise FileNotFoundError(f"No precomputed voxels in {self.voxels_dir}")
+        if self.voxels_h5_path is not None:
+            with h5py.File(self.voxels_h5_path, 'r') as _f:
+                n_voxels = int(_f["voxels"].shape[0])
+            if n_voxels == 0:
+                raise FileNotFoundError(f"Empty voxels dataset in {self.voxels_h5_path}")
+        else:
+            _voxel_files = sorted(self.voxels_dir.glob("voxel_*.npy")) if self.voxels_dir.exists() else []
+            n_voxels = len(_voxel_files)
+            if n_voxels == 0:
+                raise FileNotFoundError(f"No precomputed voxels in {self.voxels_dir}")
 
         with h5py.File(self.depth_h5_path, "r") as f:
             self.n_frames = f[self._depth_key].shape[0]
@@ -289,7 +306,6 @@ class RealDataset(Dataset):
         with h5py.File(self._ts_h5_path, "r") as f:
             self.depth_timestamps = f[self._ts_key][:] // 1000
 
-        n_voxels = len(self.voxel_files)
         if n_voxels != self.n_frames:
             print(f"Warning: {n_voxels} voxels != {self.n_frames} frames")
             self.n_frames = min(n_voxels, self.n_frames)
@@ -355,8 +371,12 @@ class RealDataset(Dataset):
         return len(self.indices)
 
     def _get_voxel(self, idx):
-        path = self.voxels_dir / f"voxel_{idx:06d}.npy"
-        voxel = np.load(path).astype(np.float32)
+        if self.voxels_h5_path is not None:
+            if self._voxels_ds is None:
+                self._voxels_ds = h5py.File(self.voxels_h5_path, 'r')["voxels"]
+            voxel = self._voxels_ds[idx].astype(np.float32)
+        else:
+            voxel = np.load(self.voxels_dir / f"voxel_{idx:06d}.npy").astype(np.float32)
         if voxel.ndim == 2:
             voxel = voxel[None]
         return voxel

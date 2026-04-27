@@ -42,9 +42,18 @@ xhost +local:root
 ##########Record Data############
 python3 my_main.py --real-robot
 
+python3 synchronised_recording.py
+
+python3 project_realsense_to_event.py --data_root data/real                     #--save-videos
+
+python3 precompute_spatial_mask.py --overwrite
+
 python3 precompute_voxels.py --overwrite
 
 python3 precompute_pose_depth.py 
+
+###########Data Tests##############
+python3 viz_and_tests/visualize_masks.py                          #--data_dir data/real/headphones
   
 ##########Calibration############
 python my_main.py --real-robot --calibration-poses calibration_poses.npy --agent-type multi_cam_calibrate --no-wiggle
@@ -57,5 +66,7 @@ python 3d_reconstruction/projection_check.py --data-dir camera_data --out-dir pr
 
 ##########Training################
 python3 project_realsense_to_event.py --data_dir data/real/1 
+
+python3 real_train.py 
 
 tensorboard --logdir=checkpoints_e2depth
