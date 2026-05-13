@@ -95,7 +95,14 @@ def resize_and_crop(img: np.ndarray, resize_hw, crop_hw) -> np.ndarray:
     """Apply bilinear resize then center crop, matching real_train.py pipeline.
 
     Works on 2-D (H, W) and 3-D (H, W, C) arrays.
+    Skips the transform when the image is already at the final target size
+    (i.e. precomputed files were stored pre-downscaled/cropped).
     """
+    # If data is already at the target resolution, nothing to do.
+    target_hw = crop_hw if crop_hw is not None else resize_hw
+    if target_hw is not None and img.shape[:2] == tuple(target_hw):
+        return img
+
     is_mask = img.dtype == np.float32 and img.ndim == 2
 
     if resize_hw is not None:

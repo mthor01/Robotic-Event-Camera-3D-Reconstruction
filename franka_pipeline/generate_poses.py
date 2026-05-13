@@ -95,6 +95,12 @@ def main():
         help=f"Minimum z-height (default: {cfg.MIN_Z_HEIGHT})",
     )
     parser.add_argument(
+        "--center-z-offset",
+        type=float,
+        default=cfg.CENTER_Z_OFFSET,
+        help=f"Z offset added to the hemisphere center only (target point unchanged, default: {cfg.CENTER_Z_OFFSET})",
+    )
+    parser.add_argument(
         "--lock-rotation",
         action=argparse.BooleanOptionalAction,
         default=cfg.LOCK_ROTATION_HORIZONTAL,
@@ -118,6 +124,7 @@ def main():
         base_max_radius=args.base_max_radius,
         min_z_height=args.min_z,
         lock_rotation_horizontal=args.lock_rotation,
+        center_z_offset=args.center_z_offset,
     )
 
     poses = np.asarray(agent.poses, dtype=np.float64)

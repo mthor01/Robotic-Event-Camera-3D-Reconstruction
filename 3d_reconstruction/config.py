@@ -20,7 +20,7 @@ DELTA_T_US = int(1e6 / FPS)  # microseconds per frame
 # frames to depth frames.  Positive = depth is ahead of events (shift event
 # lookup forward); negative = depth is behind events (shift lookup backward).
 # Set to 0 for no correction.  Example: set to -2 if depth is 2 frames behind.
-DEPTH_EVENT_ALIGN_OFFSET_FRAMES: int = 2
+DEPTH_EVENT_ALIGN_OFFSET_FRAMES: int = 0
 
 # ═══════════════════════════════════════════════════════════════════
 #  RealSense camera
@@ -58,7 +58,7 @@ POSE_ALPHA = 4.6   # ln(10.0 / 0.1) ≈ 4.6, covers 0.1 m to 10 m
 # ═══════════════════════════════════════════════════════════════════
 #  TSDF reconstruction
 # ═══════════════════════════════════════════════════════════════════
-TSDF_VOXEL_SIZE = 0.005        # metres
+TSDF_VOXEL_SIZE = 0.002        # metres
 TSDF_SDF_TRUNC_FACTOR = 4.0
 TSDF_DEPTH_MIN = 0.05          # metres (same as training DEPTH_MIN)
 TSDF_DEPTH_MAX = 0.8           # metres (larger range for 3-D reconstruction)
@@ -86,12 +86,17 @@ SPATIAL_TARGET_Z = SPATIAL_CUBE_CENTER_Z          # metres
 # ═══════════════════════════════════════════════════════════════════
 DEPTH_VIZ_P_LOW = 2
 DEPTH_VIZ_P_HIGH = 98
+# Fixed colour range for depth images/videos (independent of training range)
+DEPTH_VIZ_MIN = 0.05   # metres — maps to bottom of TURBO colourmap
+DEPTH_VIZ_MAX = 1.0    # metres — maps to top of TURBO colourmap
 
 # ═══════════════════════════════════════════════════════════════════
 #  Training image resolution
 # ═══════════════════════════════════════════════════════════════════
 TRAIN_RESIZE_HW = (288, 384)  # (H, W) resize before crop during training
 TRAIN_CROP_HW   = (240, 320)  # (H, W) center crop after resize during training
+TRAIN_BATCH_SIZE = 10         # default batch size for E2Depth training
+TRAIN_SEQ_LEN    = 10         # default sequence length for recurrent training
 
 # ═══════════════════════════════════════════════════════════════════
 #  Default paths
@@ -99,6 +104,7 @@ TRAIN_CROP_HW   = (240, 320)  # (H, W) center crop after resize during training
 CALIB_DIR = Path("camera_data")
 DATA_ROOT = Path("data/real")
 TEMPORAL_CHECK_ROOT = Path("data/temporal_check")
+LIGHT_CHECK_ROOT = Path("data/light_check")
 DEFAULT_OUT_DIR = Path("checkpoints_e2depth")
 
 # ═══════════════════════════════════════════════════════════════════
@@ -114,6 +120,15 @@ CHARUCO_MARKER_LEN = 0.015   # metres
 # ═══════════════════════════════════════════════════════════════════
 ZMQ_SYNC_ADDR = "tcp://localhost:6001"
 ZMQ_POSE_ADDR = "tcp://localhost:6000"
+
+# ═══════════════════════════════════════════════════════════════════
+#  Pose timestamp correction
+# ═══════════════════════════════════════════════════════════════════
+# Manual offset added to pose timestamps before frame assignment.
+# Positive values shift poses forward in time (use when events appear
+# to lead the robot motion); negative values shift them backward.
+# Applied on top of the automatically measured ZMQ transport delay.
+POSE_TIME_OFFSET_MS: float = -20.0
 
 # ═══════════════════════════════════════════════════════════════════
 #  Visualization defaults

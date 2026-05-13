@@ -81,7 +81,7 @@ SPHERE_RADIUS = 0.4
 INNER_RADIUS = 0.2
 
 # Number of random poses to generate
-NUM_POSES = 30
+NUM_POSES = 30 #30
 
 # =============================================================================
 # WAYPOINT INTERPOLATION
@@ -106,6 +106,10 @@ BASE_MAX_RADIUS = 0.55
 
 # Minimum z-height for poses (table level)
 MIN_Z_HEIGHT = 0.15
+
+# Z offset applied to the hemisphere center only (does NOT move the target point).
+# Use this to raise/lower the sampling hemisphere without changing where the camera looks.
+CENTER_Z_OFFSET = 0.0
 
 
 

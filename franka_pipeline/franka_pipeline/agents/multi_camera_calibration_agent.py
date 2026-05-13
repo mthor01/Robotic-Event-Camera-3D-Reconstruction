@@ -8,8 +8,7 @@ Docker B manages *both* cameras (RealSense RGB/depth + event camera) and runs
 all calibration math.  This agent only handles:
   - Pose management (load / save / manual selection)
   - Robot movement to calibration poses
-  - "Wiggle" oscillation to generate events for the event camera
-  - ZMQ signaling so Docker B knows when to capture and when the wiggle is done
+  - ZMQ signaling so Docker B knows when to capture
 
 ZMQ protocol (this agent = REQ, recording script = REP):
   1.  Agent  ->  {"cmd": "INIT", "num_poses": N}
@@ -56,11 +55,7 @@ class MultiCameraCalibrationConfig:
     position_tolerance: float = 0.005
     rotation_tolerance: float = 0.02
     settling_time: float = 0.5
-    wiggle: bool = True                 # if False, skip wiggling
-    wiggle_duration: float = 1.0        # seconds of oscillation
-    wiggle_amplitude: float = 0.003     # 3 mm
-    wiggle_frequency: float = 3.0       # Hz
-    static_event_duration: float = 0.5  # seconds to record events when wiggle=False
+    static_event_duration: float = 0.5  # seconds to record events before signalling done
     zmq_endpoint: str = "tcp://localhost:6002"  # REQ socket connects here
     zmq_timeout_s: float = 60.0         # per-message timeout
 
@@ -87,7 +82,6 @@ class MultiCameraCalibrationAgent(Agent):
         MOVING_TO_POSE = "moving_to_pose"
         SETTLING = "settling"
         SIGNALLING_POSE_REACHED = "signalling_pose_reached"
-        WIGGLING = "wiggling"
         STATIC_RECORDING = "static_recording"
         SIGNALLING_WIGGLE_DONE = "signalling_wiggle_done"
         WAITING_CALIBRATION = "waiting_calibration"
@@ -111,7 +105,6 @@ class MultiCameraCalibrationAgent(Agent):
         self.current_pose_index = 0
         self.state = self.State.IDLE
         self.wait_start_time = 0.0
-        self.wiggle_start_time = 0.0
         self.gripper_action = 0.5
 
         # OSC controller for moving to targets
@@ -374,40 +367,20 @@ class MultiCameraCalibrationAgent(Agent):
                     "ee_pose": T_base2ee.reshape(-1).tolist(),
                 })
                 if reply.get("status") == "RGB_CAPTURED":
-                    if self.config.wiggle:
-                        logger.info("Docker B captured RGB -> starting wiggle...")
-                        self.state = self.State.WIGGLING
-                        self.wiggle_start_time = time.time()
-                    else:
-                        logger.info("Docker B captured RGB -> static event recording...")
-                        self.state = self.State.STATIC_RECORDING
-                        self.wait_start_time = time.time()
+                    logger.info("Docker B captured RGB -> static event recording...")
+                    self.state = self.State.STATIC_RECORDING
+                    self.wait_start_time = time.time()
                 else:
                     logger.warning(f"Unexpected reply: {reply}")
             except zmq.error.Again:
                 logger.error("Timeout on POSE_REACHED.  Retrying next tick.")
             return np.zeros(7, dtype=np.float32), metadata
 
-        # --- STATIC RECORDING (no-wiggle mode) ---
+        # --- STATIC RECORDING ---
         if self.state == self.State.STATIC_RECORDING:
             if time.time() - self.wait_start_time >= self.config.static_event_duration:
                 self.state = self.State.SIGNALLING_WIGGLE_DONE
             return np.zeros(7, dtype=np.float32), metadata
-
-        # --- WIGGLING ---
-        if self.state == self.State.WIGGLING:
-            elapsed = time.time() - self.wiggle_start_time
-            if elapsed >= self.config.wiggle_duration:
-                self.state = self.State.SIGNALLING_WIGGLE_DONE
-                return np.zeros(7, dtype=np.float32), metadata
-
-            phase = elapsed * self.config.wiggle_frequency * 2.0 * np.pi
-            amp = self.config.wiggle_amplitude
-            action = np.zeros(7, dtype=np.float32)
-            action[0] = float(amp * np.sin(phase) * 20.0)
-            action[1] = float(amp * np.cos(phase) * 20.0)
-            action[6] = self.gripper_action
-            return action, metadata
 
         # --- SIGNAL WIGGLE_DONE  ->  Docker B captures event frame ---
         if self.state == self.State.SIGNALLING_WIGGLE_DONE:

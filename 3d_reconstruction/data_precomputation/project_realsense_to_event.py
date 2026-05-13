@@ -46,13 +46,71 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
-from reconstruction_config import (
-    CALIB_DIR, DATA_ROOT, FPS as DEFAULT_FPS, DEPTH_BLEED_RADIUS,
+import sys
+from pathlib import Path as _Path_cfg
+sys.path.insert(0, str(_Path_cfg(__file__).resolve().parent.parent))
+
+from config import (
+    CALIB_DIR as _CALIB_DIR,
+    DATA_ROOT as _DATA_ROOT,
+    FPS as DEFAULT_FPS,
+    DEPTH_BLEED_RADIUS,
+    TRAIN_RESIZE_HW,
+    TRAIN_CROP_HW,
+    DEPTH_VIZ_MIN,
+    DEPTH_VIZ_MAX,
 )
+
+_CFG_ROOT = _Path_cfg(__file__).resolve().parent.parent
+CALIB_DIR = _CFG_ROOT / _CALIB_DIR
+DATA_ROOT  = _CFG_ROOT / _DATA_ROOT
 
 # ─── module-level FPS (overridden by --fps CLI arg) ───────────────
 FPS = DEFAULT_FPS
 
+
+def _resize_crop(frame: np.ndarray, resize_hw, crop_hw) -> np.ndarray:
+    """Resize then center-crop a fully-computed (H,W) depth or (H,W,3) RGB frame.
+
+    For depth frames the input must already be fully gap-filled at native
+    resolution.  We then track valid coverage (non-zero pixels) through the
+    same bilinear resize so that any output pixel whose bilinear footprint
+    overlaps even one zero/invalid input pixel is zeroed out.  This prevents
+    ghost depth values at the boundary of the valid region.
+    RGB frames are bilinearly resized as-is.
+    """
+    import torch
+    import torch.nn.functional as F
+    is_rgb = frame.ndim == 3
+    t = torch.from_numpy(frame.astype(np.float32))
+    if is_rgb:
+        t = t.permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
+        if resize_hw is not None:
+            t = F.interpolate(t, size=resize_hw, mode="bilinear", align_corners=False)
+        if crop_hw is not None:
+            ch, cw = crop_hw
+            y0 = (t.shape[2] - ch) // 2
+            x0 = (t.shape[3] - cw) // 2
+            t = t[:, :, y0:y0 + ch, x0:x0 + cw]
+        return t.squeeze(0).permute(1, 2, 0).numpy().clip(0, 255).astype(np.uint8)
+    else:
+        # Depth: propagate a validity mask through the same transform so that
+        # bilinear blending with zeros never creates ghost non-zero depths.
+        valid = (t > 0).float().unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+        t = t.unsqueeze(0).unsqueeze(0)                    # (1,1,H,W)
+        if resize_hw is not None:
+            t     = F.interpolate(t,     size=resize_hw, mode="bilinear", align_corners=False)
+            valid = F.interpolate(valid, size=resize_hw, mode="bilinear", align_corners=False)
+        if crop_hw is not None:
+            ch, cw = crop_hw
+            y0 = (t.shape[2] - ch) // 2
+            x0 = (t.shape[3] - cw) // 2
+            t     = t    [:, :, y0:y0 + ch, x0:x0 + cw]
+            valid = valid[:, :, y0:y0 + ch, x0:x0 + cw]
+        out = t.squeeze(0).squeeze(0).numpy()
+        # Zero any pixel where the bilinear footprint was not 100 % valid.
+        out[valid.squeeze(0).squeeze(0).numpy() < 1.0] = 0.0
+        return out
 
 def load_calibration(calib_dir: Path) -> dict:
     """Load all calibration data needed for depth/RGB → event projection."""
@@ -205,9 +263,9 @@ def project_depth_frame(
     return depth_out
 
 
-def colorise_depth(depth: np.ndarray, max_m: float = 2.0) -> np.ndarray:
+def colorise_depth(depth: np.ndarray, min_m: float = DEPTH_VIZ_MIN, max_m: float = DEPTH_VIZ_MAX) -> np.ndarray:
     """Convert depth (float32, metres) to a colour image for visualisation."""
-    d = np.clip(depth / max_m, 0, 1)
+    d = np.clip((depth - min_m) / (max_m - min_m), 0, 1)
     d_u8 = (d * 255).astype(np.uint8)
     coloured = cv2.applyColorMap(d_u8, cv2.COLORMAP_TURBO)
     # Set invalid (0) pixels to black
@@ -302,7 +360,11 @@ def project_rgb_frame(
     return rgb_out
 
 
-def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True, save_videos: bool = False, workers: int = 4, bleed_correction: bool = True, overwrite: bool = False) -> None:
+def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
+                      save_videos: bool = False, workers: int = 4,
+                      bleed_correction: bool = True, overwrite: bool = False,
+                      resize_hw=None, crop_hw=None,
+                      use_voxels: bool = False) -> None:
     """Project all depth (and optionally RGB) frames for one recording directory."""
     rs_h5_path = seq_dir / "hdf5" / "realsense.h5"
     if not rs_h5_path.exists():
@@ -336,6 +398,12 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True, save
     rgb_h, rgb_w = calib["rgb_h"], calib["rgb_w"]
     T_color_from_depth = calib["T_color_from_depth"]
 
+    out_h, out_w = ev_h, ev_w
+    if resize_hw is not None:
+        out_h, out_w = resize_hw
+    if crop_hw is not None:
+        out_h, out_w = crop_hw
+
     # Pre-compute depth pixel rays
     rays = build_depth_pixel_grid(K_depth, dep_h, dep_w)
 
@@ -350,7 +418,8 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True, save
             print(f"  [{seq_dir.name}] Warning: --rgb requested but no 'rgb' dataset in realsense.h5")
 
         print(f"[{seq_dir.name}] Projecting {N} frames ({dep_w}x{dep_h}) → event frame ({ev_w}x{ev_h})"
-              f"{' + RGB' if has_rgb_src else ''}")
+              + (f" → stored ({out_w}x{out_h})" if (out_h, out_w) != (ev_h, ev_w) else "")
+              + (f" + RGB" if has_rgb_src else ""))
 
         # Video writers (optional)
         depth_video = None
@@ -358,35 +427,52 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True, save
         if save_videos:
             depth_video = cv2.VideoWriter(
                 str(out_depth_vid), cv2.VideoWriter_fourcc(*"mp4v"),
-                FPS, (ev_w, ev_h), isColor=True,
+                FPS, (out_w, out_h), isColor=True,
             )
             if has_rgb_src:
                 rgb_video = cv2.VideoWriter(
                     str(out_rgb_vid), cv2.VideoWriter_fourcc(*"mp4v"),
-                    FPS, (ev_w, ev_h), isColor=True,
+                    FPS, (out_w, out_h), isColor=True,
                 )
 
-        # Event frames for overlay
-        ev_h5_path = seq_dir / "hdf5" / "events_cam0.h5"
-        has_events = ev_h5_path.exists()
-        ev_h5 = h5py.File(ev_h5_path, "r") if has_events else None
+        # Event frames (or voxel middle bin) for overlay
+        ev_h5_path     = seq_dir / "hdf5"   / "events_cam0.h5"
+        voxel_h5_path  = seq_dir / "events" / "voxels_cam0.h5"
+        if use_voxels and voxel_h5_path.exists():
+            ev_h5 = h5py.File(voxel_h5_path, "r")
+            _ev_source = "voxels"
+        elif ev_h5_path.exists():
+            ev_h5 = h5py.File(ev_h5_path, "r")
+            _ev_source = "frames"
+        else:
+            ev_h5 = None
+            _ev_source = None
+        if use_voxels and not voxel_h5_path.exists():
+            print(f"  [{seq_dir.name}] Warning: --use_voxels requested but "
+                  f"events/voxels_cam0.h5 not found; falling back to event frames")
 
         # Output HDF5 files
         out_dh5 = h5py.File(out_depth_h5, "w")
         depth_out_ds = out_dh5.create_dataset(
-            "depth", shape=(N, ev_h, ev_w), dtype=np.float32,
-            chunks=(1, ev_h, ev_w), compression="gzip", compression_opts=4,
+            "depth", shape=(N, out_h, out_w), dtype=np.float32,
+            chunks=(1, out_h, out_w), compression="gzip", compression_opts=4,
         )
         out_dh5.attrs["description"] = "Depth projected into event camera frame (metres)"
         out_dh5.attrs["source"] = str(rs_h5_path)
+        out_dh5.attrs["native_ev_h"] = ev_h
+        out_dh5.attrs["native_ev_w"] = ev_w
+        out_dh5.attrs["resize_h"] = resize_hw[0] if resize_hw is not None else ev_h
+        out_dh5.attrs["resize_w"] = resize_hw[1] if resize_hw is not None else ev_w
+        out_dh5.attrs["crop_h"]   = crop_hw[0]   if crop_hw   is not None else (resize_hw[0] if resize_hw else ev_h)
+        out_dh5.attrs["crop_w"]   = crop_hw[1]   if crop_hw   is not None else (resize_hw[1] if resize_hw else ev_w)
 
         out_rh5 = None
         rgb_out_ds = None
         if has_rgb_src:
             out_rh5 = h5py.File(out_rgb_h5, "w")
             rgb_out_ds = out_rh5.create_dataset(
-                "rgb", shape=(N, ev_h, ev_w, 3), dtype=np.uint8,
-                chunks=(1, ev_h, ev_w, 3), compression="gzip", compression_opts=4,
+                "rgb", shape=(N, out_h, out_w, 3), dtype=np.uint8,
+                chunks=(1, out_h, out_w, 3), compression="gzip", compression_opts=4,
             )
             out_rh5.attrs["description"] = "RGB projected into event camera frame"
             out_rh5.attrs["source"] = str(rs_h5_path)
@@ -403,9 +489,48 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True, save
                     batch_depth_u16 = [depth_ds[i] for i in batch_range]
                     batch_rgb_u8 = [rgb_ds[i] for i in batch_range] if has_rgb_src else []
                     if ev_h5 is not None:
-                        ev_data = ev_h5["events/frames"]
-                        ev_n = ev_data.shape[0]
-                        batch_ev = [ev_data[i] if i < ev_n else None for i in batch_range]
+                        if _ev_source == "voxels":
+                            vox_ds  = ev_h5["voxels"]
+                            vox_n   = vox_ds.shape[0]
+                            mid_bin = vox_ds.shape[1] // 2
+                            # Spatial metadata for reversing the resize+crop baked into the voxels.
+                            # Voxels may be stored at (crop_h x crop_w) after an intermediate
+                            # resize to (resize_h x resize_w) from native (native_h x native_w).
+                            # Simply stretching crop→out would squash the FOV.  Instead:
+                            #   1. embed the cropped frame back into the resize canvas
+                            #   2. scale that canvas to (out_h x out_w)
+                            _vatts      = dict(vox_ds.attrs)
+                            _vox_crop_h = int(vox_ds.shape[2])
+                            _vox_crop_w = int(vox_ds.shape[3])
+                            _vox_rsz_h  = int(_vatts.get("resize_h", _vox_crop_h))
+                            _vox_rsz_w  = int(_vatts.get("resize_w", _vox_crop_w))
+
+                            def _vox_to_gray(v):
+                                """Render one voxel bin (crop_H, crop_W) float → uint8 at (out_h, out_w)."""
+                                v = v.astype(np.float32)
+                                v = np.clip(v, -3.0, 3.0)
+                                gray = ((v + 3.0) / 6.0 * 255).astype(np.uint8)
+                                # Step 1: undo center-crop → embed in resize canvas
+                                if _vox_crop_h != _vox_rsz_h or _vox_crop_w != _vox_rsz_w:
+                                    canvas = np.zeros((_vox_rsz_h, _vox_rsz_w), dtype=np.uint8)
+                                    y0 = (_vox_rsz_h - _vox_crop_h) // 2
+                                    x0 = (_vox_rsz_w - _vox_crop_w) // 2
+                                    canvas[y0:y0+_vox_crop_h, x0:x0+_vox_crop_w] = gray
+                                    gray = canvas
+                                # Step 2: scale resize canvas → output resolution
+                                if gray.shape[0] != out_h or gray.shape[1] != out_w:
+                                    gray = cv2.resize(gray, (out_w, out_h),
+                                                      interpolation=cv2.INTER_LINEAR)
+                                return gray
+
+                            batch_ev = [
+                                _vox_to_gray(vox_ds[i, mid_bin]) if i < vox_n else None
+                                for i in batch_range
+                            ]
+                        else:
+                            ev_data = ev_h5["events/frames"]
+                            ev_n = ev_data.shape[0]
+                            batch_ev = [ev_data[i] if i < ev_n else None for i in batch_range]
                     else:
                         batch_ev = [None] * len(batch_range)
 
@@ -432,12 +557,23 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True, save
                     # Sequential writes (HDF5 and VideoWriter are not thread-safe)
                     for j, i in enumerate(batch_range):
                         proj_depth = depth_futures[j].result()
+                        if resize_hw is not None or crop_hw is not None:
+                            proj_depth = _resize_crop(proj_depth, resize_hw, crop_hw)
                         depth_out_ds[i] = proj_depth
 
                         if save_videos:
                             colour = colorise_depth(proj_depth)
                             ev_gray = batch_ev[j]
                             if ev_gray is not None:
+                                if resize_hw is not None or crop_hw is not None:
+                                    ev_gray = _resize_crop(
+                                        ev_gray.astype(np.float32), resize_hw, crop_hw
+                                    ).astype(np.uint8)
+                                # Ensure ev_gray matches the output frame size
+                                # (voxels may be stored at a different resolution)
+                                if ev_gray.shape[0] != out_h or ev_gray.shape[1] != out_w:
+                                    ev_gray = cv2.resize(ev_gray, (out_w, out_h),
+                                                         interpolation=cv2.INTER_LINEAR)
                                 ev_bgr = cv2.cvtColor(ev_gray, cv2.COLOR_GRAY2BGR)
                                 mask = proj_depth > 0
                                 frame = ev_bgr.copy()
@@ -448,12 +584,22 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True, save
 
                         if has_rgb_src:
                             proj_rgb = rgb_futures[j].result()
+                            if resize_hw is not None or crop_hw is not None:
+                                proj_rgb = _resize_crop(proj_rgb, resize_hw, crop_hw)
                             rgb_out_ds[i] = proj_rgb
 
                             if save_videos:
                                 rgb_bgr = cv2.cvtColor(proj_rgb, cv2.COLOR_RGB2BGR)
                                 ev_gray = batch_ev[j]
                                 if ev_gray is not None:
+                                    if resize_hw is not None or crop_hw is not None:
+                                        ev_gray = _resize_crop(
+                                            ev_gray.astype(np.float32), resize_hw, crop_hw
+                                        ).astype(np.uint8)
+                                    # Ensure ev_gray matches the output frame size
+                                    if ev_gray.shape[0] != out_h or ev_gray.shape[1] != out_w:
+                                        ev_gray = cv2.resize(ev_gray, (out_w, out_h),
+                                                             interpolation=cv2.INTER_LINEAR)
                                     ev_bgr2 = cv2.cvtColor(ev_gray, cv2.COLOR_GRAY2BGR)
                                     rgb_mask = np.any(proj_rgb > 0, axis=-1)
                                     rgb_frame = ev_bgr2.copy()
@@ -535,7 +681,28 @@ def main():
         "--overwrite", action="store_true",
         help="Overwrite existing depth_in_event_frame.h5 / rgb_in_event_frame.h5 files",
     )
+    parser.add_argument("--resize_h", type=int, default=TRAIN_RESIZE_HW[0],
+                        help="Resize height before crop (0 = skip resize, default: TRAIN_RESIZE_HW from config)")
+    parser.add_argument("--resize_w", type=int, default=TRAIN_RESIZE_HW[1],
+                        help="Resize width before crop (0 = skip resize, default: TRAIN_RESIZE_HW from config)")
+    parser.add_argument("--crop_h", type=int, default=TRAIN_CROP_HW[0],
+                        help="Center-crop height after resize (0 = skip crop, default: TRAIN_CROP_HW from config)")
+    parser.add_argument("--crop_w", type=int, default=TRAIN_CROP_HW[1],
+                        help="Center-crop width after resize (0 = skip crop, default: TRAIN_CROP_HW from config)")
+    parser.add_argument("--no_resize_crop", action="store_true",
+                        help="Store depth/RGB at native event-camera resolution without any resize or crop")
+    parser.add_argument("--use_voxels", action="store_true",
+                        help="Use the middle bin of precomputed voxel grids (events/voxels_cam0.h5) "
+                             "instead of event frames for the overlay video. "
+                             "Requires precompute_voxels.py to have been run first.")
     args = parser.parse_args()
+
+    if args.no_resize_crop:
+        resize_hw = None
+        crop_hw   = None
+    else:
+        resize_hw = (args.resize_h, args.resize_w) if args.resize_h > 0 and args.resize_w > 0 else None
+        crop_hw   = (args.crop_h,   args.crop_w)   if args.crop_h   > 0 and args.crop_w   > 0 else None
 
     calib = load_calibration(Path(args.calib_dir))
 
@@ -550,6 +717,10 @@ def main():
     print(f"Processing {len(dirs)} recording(s)")
     print(f"RGB projection: {'off' if args.no_rgb else 'on'}")
     print(f"Video generation: {'on' if args.save_videos else 'off'}")
+    print(f"Overlay source: {'voxel middle bin' if args.use_voxels else 'event frames'}")
+    if resize_hw:
+        print(f"Resize → {resize_hw[1]}×{resize_hw[0]}"
+              + (f" → crop → {crop_hw[1]}×{crop_hw[0]}" if crop_hw else ""))
     FPS = args.fps
 
     for d in dirs:
@@ -560,6 +731,9 @@ def main():
             workers=args.workers,
             bleed_correction=not args.no_bleed_correction,
             overwrite=args.overwrite,
+            resize_hw=resize_hw,
+            crop_hw=crop_hw,
+            use_voxels=args.use_voxels,
         )
 
     print("\nDone.")

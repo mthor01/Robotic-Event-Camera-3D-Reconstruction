@@ -33,14 +33,20 @@ import h5py
 import numpy as np
 from tqdm import tqdm
 
-from reconstruction_config import (
+import sys
+from pathlib import Path as _Path_cfg
+sys.path.insert(0, str(_Path_cfg(__file__).resolve().parent.parent))
+
+from config import (
     CALIB_DIR as _CALIB_DIR,
     DATA_ROOT as _DATA_ROOT,
     FPS as DEFAULT_FPS,
     DEPTH_BLEED_RADIUS,
 )
 
-CALIB_DIR = Path(__file__).resolve().parent / _CALIB_DIR
+_CFG_ROOT = _Path_cfg(__file__).resolve().parent.parent
+CALIB_DIR = _CFG_ROOT / _CALIB_DIR
+DATA_ROOT  = _CFG_ROOT / _DATA_ROOT
 
 # ─── module-level FPS (overridden by --fps CLI arg) ───────────────
 FPS = DEFAULT_FPS
@@ -308,7 +314,7 @@ def main():
         help="Specific recording directory(ies)",
     )
     parser.add_argument(
-        "--data_root", type=str, default=str(_DATA_ROOT),
+        "--data_root", type=str, default=str(DATA_ROOT),
         help="Root directory containing recording subdirs",
     )
     parser.add_argument(

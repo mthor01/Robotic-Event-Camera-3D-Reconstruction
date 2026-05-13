@@ -32,18 +32,26 @@ import h5py
 import numpy as np
 from tqdm import tqdm
 
-from reconstruction_config import (
+import sys
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+
+from config import (
     CALIB_DIR as _CALIB_DIR,
     DATA_ROOT as _DATA_ROOT,
     SPATIAL_CUBE_SIDE,
     SPATIAL_TARGET_X,
     SPATIAL_TARGET_Y,
     SPATIAL_TARGET_Z,
+    DEPTH_VIZ_MIN,
+    DEPTH_VIZ_MAX,
 )
 
-CALIB_DIR = Path(__file__).resolve().parent / _CALIB_DIR
+_CFG_ROOT = _Path(__file__).resolve().parent.parent
+CALIB_DIR = _CFG_ROOT / _CALIB_DIR
+DATA_ROOT  = _CFG_ROOT / _DATA_ROOT
 
-# Default target point — imported from reconstruction_config
+# Default target point — imported from config
 DEFAULT_TARGET_X = SPATIAL_TARGET_X
 DEFAULT_TARGET_Y = SPATIAL_TARGET_Y
 DEFAULT_TARGET_Z = SPATIAL_TARGET_Z
@@ -145,6 +153,50 @@ def compute_spatial_mask(
     return mask_flat.reshape(H, W)
 
 
+def save_debug_png(seq_dir: Path, depth_frames: list, mask_frames: list) -> None:
+    """Save a side-by-side depth / mask contact sheet for 10 evenly-spaced frames.
+
+    Layout per row: [colourised depth | mask overlay on depth]
+    Output: debug/spatial_mask_debug.png
+    """
+    n = len(depth_frames)
+    indices = np.linspace(0, n - 1, min(10, n), dtype=int)
+    rows = []
+    for i in indices:
+        depth = depth_frames[i]
+        mask  = mask_frames[i]
+
+        # Left panel: colourised depth using configured depth range
+        d_norm = np.clip((depth - DEPTH_VIZ_MIN) / (DEPTH_VIZ_MAX - DEPTH_VIZ_MIN), 0, 1)
+        d_u8   = (d_norm * 255).astype(np.uint8)
+        left   = cv2.applyColorMap(d_u8, cv2.COLORMAP_TURBO)
+        left[depth == 0] = 0
+
+        # Right panel: mask (white=inside) overlaid on grey depth
+        grey = cv2.cvtColor(d_u8, cv2.COLOR_GRAY2BGR)
+        # Tint inside-cube pixels green
+        right = grey.copy()
+        overlay = right.copy()
+        overlay[mask == 1] = (0, 220, 0)
+        right = cv2.addWeighted(right, 0.5, overlay, 0.5, 0)
+
+        # Label with frame index
+        H, W = depth.shape
+        for panel in (left, right):
+            cv2.putText(panel, f"frame {i}", (4, 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+        row = np.hstack([left, right])
+        rows.append(row)
+
+    sheet = np.vstack(rows)
+    out_dir = seq_dir / "debug"
+    out_dir.mkdir(exist_ok=True)
+    out_path = out_dir / "spatial_mask_debug.png"
+    cv2.imwrite(str(out_path), sheet)
+    print(f"  [{seq_dir.name}] debug PNG → {out_path}")
+
+
 def process_sequence(
     seq_dir: Path,
     calib: dict,
@@ -152,6 +204,7 @@ def process_sequence(
     target_point: np.ndarray,
     overwrite: bool = False,
     save_videos: bool = False,
+    debug: bool = False,
 ) -> dict:
     """Precompute spatial mask for one recording directory."""
     result = {"name": seq_dir.name, "success": False, "n_frames": 0, "error": None}
@@ -176,6 +229,22 @@ def process_sequence(
         n_depth = df["depth"].shape[0]
         H = df["depth"].shape[1]
         W = df["depth"].shape[2]
+        # If depth was stored at a down-scaled resolution (by project_realsense_to_event.py),
+        # we need to scale K_event to match, otherwise unprojected rays will be wrong.
+        native_ev_h = int(df.attrs.get("native_ev_h", calib["ev_h"]))
+        native_ev_w = int(df.attrs.get("native_ev_w", calib["ev_w"]))
+        _resize_h   = int(df.attrs.get("resize_h",   native_ev_h))
+        _resize_w   = int(df.attrs.get("resize_w",   native_ev_w))
+        _crop_h     = int(df.attrs.get("crop_h",     H))
+        _crop_w     = int(df.attrs.get("crop_w",     W))
+
+    # Scale K_event from native resolution to the stored depth resolution.
+    K_event = calib["K_event"].copy().astype(np.float64)
+    if H != native_ev_h or W != native_ev_w:
+        K_event[0] *= _resize_w / native_ev_w   # fx, cx scale by resize
+        K_event[1] *= _resize_h / native_ev_h   # fy, cy scale by resize
+        K_event[0, 2] -= (_resize_w - _crop_w) / 2   # cx shift by crop
+        K_event[1, 2] -= (_resize_h - _crop_h) / 2   # cy shift by crop
 
     n_frames = min(n_depth, len(ee_T_all))
     if n_depth != len(ee_T_all):
@@ -190,8 +259,8 @@ def process_sequence(
                 result["error"] = "Already computed (use --overwrite)"
                 return result
 
-    # Build rays for event camera
-    rays = build_event_rays(calib["K_event"], H, W)
+    # Build rays for event camera at the stored depth resolution
+    rays = build_event_rays(K_event, H, W)
     half_side = cube_side / 2.0
 
     # Depth-frame mask: compute natively at depth resolution from realsense.h5
@@ -226,6 +295,8 @@ def process_sequence(
             )
 
             masks = np.empty((n_frames, H, W), dtype=np.uint8)
+            debug_depths: list = [] if debug else None  # type: ignore
+            debug_masks:  list = [] if debug else None  # type: ignore
             rs_depth_ds = rs_file["depth"] if rs_file is not None else None
             for i in tqdm(range(n_frames), desc=f"  {seq_dir.name}", leave=False):
                 depth = df["depth"][i].astype(np.float32)
@@ -235,6 +306,9 @@ def process_sequence(
                 )
                 mask_ds[i] = m
                 masks[i] = m
+                if debug:
+                    debug_depths.append(depth)
+                    debug_masks.append(m)
 
                 if rs_depth_ds is not None:
                     depth_raw = rs_depth_ds[i].astype(np.float32) * calib["depth_scale"]
@@ -246,6 +320,9 @@ def process_sequence(
     finally:
         if rs_file is not None:
             rs_file.close()
+
+    if debug:
+        save_debug_png(seq_dir, debug_depths, debug_masks)
 
     if save_videos:
         video_dir = seq_dir / "videos"
@@ -288,7 +365,7 @@ def main():
     )
     parser.add_argument("--data_dir", nargs="+", type=str, default=None,
                         help="Specific recording directory(ies)")
-    parser.add_argument("--data_root", type=str, default=str(_DATA_ROOT),
+    parser.add_argument("--data_root", type=str, default=str(DATA_ROOT),
                         help="Root directory containing recording subdirs")
     parser.add_argument("--calib_dir", type=str, default=str(CALIB_DIR),
                         help="Path to camera_data/ calibration directory")
@@ -304,6 +381,8 @@ def main():
                         help="Overwrite existing spatial_mask.h5 files")
     parser.add_argument("--save_videos", action="store_true",
                         help="Save a video of the spatial mask to videos/spatial_mask.mp4")
+    parser.add_argument("--debug", action="store_true",
+                        help="Save a debug PNG (depth + mask overlay, 10 frames) to debug/spatial_mask_debug.png")
     args = parser.parse_args()
 
     calib = load_calibration(Path(args.calib_dir))
@@ -321,7 +400,7 @@ def main():
           f"target = ({target_point[0]:.3f}, {target_point[1]:.3f}, {target_point[2]:.3f})")
 
     for d in dirs:
-        result = process_sequence(d, calib, args.cube_side, target_point, overwrite=args.overwrite, save_videos=args.save_videos)
+        result = process_sequence(d, calib, args.cube_side, target_point, overwrite=args.overwrite, save_videos=args.save_videos, debug=args.debug)
         status = "OK" if result["success"] else "FAIL"
         msg = f"  [{result['name']}] {status}"
         if result["n_frames"]:

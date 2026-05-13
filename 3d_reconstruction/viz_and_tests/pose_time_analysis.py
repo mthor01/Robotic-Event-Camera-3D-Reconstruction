@@ -102,8 +102,9 @@ def run_frame_level(seq_dir: Path, out_dir: Path, smooth_k: int = 3) -> None:
     rs_path = hdf5_dir / "realsense.h5"
     if rs_path.exists():
         with h5py.File(rs_path, "r") as f:
-            # Prefer hardware-anchored timestamps (cleaner inter-frame spacing)
-            if "t_hw_as_sys_ns" in f:
+            if "t_global_ms" in f:
+                t_ns = (f["t_global_ms"][:] * 1e6).astype(np.int64)
+            elif "t_hw_as_sys_ns" in f:
                 t_ns = f["t_hw_as_sys_ns"][:]
             else:
                 t_ns = f["t_sys_ns"][:]
@@ -114,10 +115,36 @@ def run_frame_level(seq_dir: Path, out_dir: Path, smooth_k: int = 3) -> None:
     R = ee_T[:, :3, :3]
     z_angle = np.arctan2(R[:, 1, 0], R[:, 0, 0])
     t_sec = (t_ns - t_ns[0]) / 1e9 if t_ns.dtype != np.float64 or t_ns.max() > 1e6 else t_ns.copy()
-    dt = np.diff(t_sec); dt[dt == 0] = 1.0
-    rot_vel = np.zeros(N, dtype=np.float64)
-    rot_vel[1:] = np.diff(z_angle) / dt
-    rot_vel[np.abs(rot_vel) > 10.0] = 0.0
+
+    # Load transport delay for timestamp correction
+    meta_path = hdf5_dir / "metadata.h5"
+    transport_delay_ns = 0
+    pose_time_offset_ns = 0
+    if meta_path.exists():
+        with h5py.File(meta_path, "r") as f:
+            transport_delay_ns = int(f.attrs.get("transport_delay_ns", 0))
+            pose_time_offset_ns = int(f.attrs.get("pose_time_offset_ms", 0.0) * 1e6)
+
+    # Try to use actual joint velocities from raw_poses.h5
+    raw_path = hdf5_dir / "raw_poses.h5"
+    rot_vel = None
+    if raw_path.exists():
+        with h5py.File(raw_path, "r") as f:
+            if "joint_velocity" in f and "t_recv_ns" in f:
+                raw_t_ns = f["t_recv_ns"][:] - transport_delay_ns + pose_time_offset_ns
+                raw_jv   = f["joint_velocity"][:]
+                idxs = np.searchsorted(raw_t_ns, t_ns, side="left")
+                idxs = np.clip(idxs, 0, len(raw_t_ns) - 1)
+                left = np.clip(idxs - 1, 0, len(raw_t_ns) - 1)
+                use_left = np.abs(raw_t_ns[left] - t_ns) < np.abs(raw_t_ns[idxs] - t_ns)
+                idxs[use_left] = left[use_left]
+                rot_vel = np.linalg.norm(raw_jv[idxs], axis=1)
+    if rot_vel is None:
+        # Fallback: approximate from finite differences on z_angle
+        dt = np.diff(t_sec); dt[dt == 0] = 1.0
+        rot_vel = np.zeros(N, dtype=np.float64)
+        rot_vel[1:] = np.diff(z_angle) / dt
+        rot_vel[np.abs(rot_vel) > 10.0] = 0.0
 
     # Load event activity
     ev_h5 = hdf5_dir / "events_cam0.h5"
@@ -218,7 +245,7 @@ def run_frame_level(seq_dir: Path, out_dir: Path, smooth_k: int = 3) -> None:
     # Panel 2: normalised overlay
     ax2 = fig.add_subplot(gs[1, :])
     vn = unit_norm(vel_smooth); en = unit_norm(ev_smooth)
-    ax2.plot(frames, vn, color=color_pos, lw=1.3, label="Rotation speed (norm)")
+    ax2.plot(frames, vn, color=color_pos, lw=1.3, label="Joint speed ‖dq‖ (norm)")
     ax2.plot(frames, en, color=color_ev, lw=1.3, alpha=0.8, label="Event activity (norm)")
     ax2.axhline(0, color="gray", lw=0.6, ls="--")
     for sv in spikes_vel:
@@ -226,7 +253,7 @@ def run_frame_level(seq_dir: Path, out_dir: Path, smooth_k: int = 3) -> None:
     for se in spikes_ev:
         i = int(min(round(se), L - 1)); ax2.plot(se, en[i], "v", color=color_ev, ms=7, zorder=5)
     ax2.set_ylabel("Normalised"); ax2.set_xlabel("Frame index")
-    ax2.set_title("Rotation speed vs event activity (▼ = troughs)", fontsize=11)
+    ax2.set_title("Joint speed ‖dq‖ vs event activity (▼ = troughs)", fontsize=11)
     ax2.legend(fontsize=8)
 
     # Panel 3: histogram
@@ -256,7 +283,7 @@ def run_frame_level(seq_dir: Path, out_dir: Path, smooth_k: int = 3) -> None:
         label = "✓ GOOD" if abs(med) == 0 else ("~ OK (±1)" if abs(med) == 1 else f"✗ OFF ({med:+d}fr)")
         ax4.set_title(f"Offset over time  |  n={len(int_offsets)}  med={med:+d}fr  {label}", fontsize=9)
 
-    fig.suptitle("Frame-Level Temporal Alignment — Rotation Speed vs Event Activity",
+    fig.suptitle("Frame-Level Temporal Alignment — Joint Speed ‖dq‖ vs Event Activity",
                  fontsize=13, fontweight="bold", y=0.98)
     out = out_dir / "temporal_alignment_frame.png"
     fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
@@ -276,8 +303,13 @@ def run_voxel_level(seq_dir: Path, out_dir: Path, smooth_k: int = 5) -> None:
     if not raw_path.exists():
         raise FileNotFoundError(f"No raw_poses.h5 in {hdf5_dir}")
     with h5py.File(raw_path, "r") as f:
-        pose_t_ns = f["t_ns"][:]
+        # Use t_recv_ns (captured on the recording machine, Docker B) so that
+        # it shares the same clock as event_logging_start_ns.  t_ns is the
+        # robot-side (Docker A) timestamp and cannot be subtracted from a
+        # Docker B reference without cross-machine clock synchronization.
+        pose_t_ns = f["t_recv_ns"][:]
         pose_ee_T = f["ee_T"][:]
+        pose_jv   = f["joint_velocity"][:] if "joint_velocity" in f else None
     P = len(pose_t_ns)
 
     # Metadata
@@ -286,6 +318,8 @@ def run_voxel_level(seq_dir: Path, out_dir: Path, smooth_k: int = 5) -> None:
         raise FileNotFoundError(f"No metadata.h5 in {hdf5_dir}")
     with h5py.File(meta_path, "r") as f:
         event_logging_start_ns = int(f.attrs["event_logging_start_ns"])
+        transport_delay_ns = int(f.attrs.get("transport_delay_ns", 0))
+        pose_time_offset_ns = int(f.attrs.get("pose_time_offset_ms", 0.0) * 1e6)
 
     # Event frame timestamps
     ev_h5 = hdf5_dir / "events_cam0.h5"
@@ -320,7 +354,9 @@ def run_voxel_level(seq_dir: Path, out_dir: Path, smooth_k: int = 5) -> None:
     N_bins = len(bin_t_us)
 
     ev_elapsed_ns = (bin_t_us - t_start_us[0]).astype(np.float64) * 1000.0
-    pose_elapsed_ns = (pose_t_ns - event_logging_start_ns).astype(np.float64)
+    # Subtract transport_delay_ns and apply manual pose_time_offset_ms, matching
+    # how assign_poses_to_frames works in the recording script.
+    pose_elapsed_ns = (pose_t_ns - transport_delay_ns + pose_time_offset_ns - event_logging_start_ns).astype(np.float64)
 
     # Nearest pose matching
     indices = np.searchsorted(pose_elapsed_ns, ev_elapsed_ns, side="left")
@@ -334,10 +370,14 @@ def run_voxel_level(seq_dir: Path, out_dir: Path, smooth_k: int = 5) -> None:
     z_angle = np.arctan2(R[:, 1, 0], R[:, 0, 0])
 
     bin_t_sec = (ev_elapsed_ns - ev_elapsed_ns[0]) / 1e9
-    dt = np.diff(bin_t_sec); dt[dt == 0] = 1e-6
-    rot_vel = np.zeros(N_bins, dtype=np.float64)
-    rot_vel[1:] = np.diff(z_angle) / dt
-    rot_vel[np.abs(rot_vel) > 10.0] = 0.0
+    if pose_jv is not None:
+        rot_vel = np.linalg.norm(pose_jv[indices], axis=1)
+    else:
+        # Fallback: approximate from finite differences on z_angle
+        dt = np.diff(bin_t_sec); dt[dt == 0] = 1e-6
+        rot_vel = np.zeros(N_bins, dtype=np.float64)
+        rot_vel[1:] = np.diff(z_angle) / dt
+        rot_vel[np.abs(rot_vel) > 10.0] = 0.0
 
     TRIM = 100 * num_bins
     START = min(TRIM, N_bins)
@@ -422,14 +462,14 @@ def run_voxel_level(seq_dir: Path, out_dir: Path, smooth_k: int = 5) -> None:
 
     ax2 = fig.add_subplot(gs[1, :])
     vn, an = unit_norm(vel_s), unit_norm(act_s)
-    ax2.plot(bins_x, vn, color=color_sp, lw=1.0, label="Rotation speed (norm)")
+    ax2.plot(bins_x, vn, color=color_sp, lw=1.0, label="Joint speed ‖dq‖ (norm)")
     ax2.plot(bins_x, an, color=color_ev, lw=1.0, alpha=0.8, label="Activity (norm)")
     ax2.axhline(0, color="gray", lw=0.6, ls="--")
     for sv in spikes_vel:
         i = int(min(round(sv), L - 1)); ax2.plot(sv, vn[i], "v", color=color_sp, ms=6, zorder=5)
     for sa in spikes_act:
         i = int(min(round(sa), L - 1)); ax2.plot(sa, an[i], "v", color=color_ev, ms=6, zorder=5)
-    ax2.set_xlabel("Bin index"); ax2.set_title("Speed vs activity (▼ troughs)", fontsize=11)
+    ax2.set_xlabel("Bin index"); ax2.set_title("Joint speed ‖dq‖ vs activity (▼ troughs)", fontsize=11)
     ax2.legend(fontsize=8)
 
     ax3 = fig.add_subplot(gs[2, 0])
@@ -452,7 +492,7 @@ def run_voxel_level(seq_dir: Path, out_dir: Path, smooth_k: int = 5) -> None:
     else:
         ax4.set_title("Offset over time", fontsize=10)
 
-    fig.suptitle("Voxel-Bin Temporal Alignment — Rotation Speed vs Activity",
+    fig.suptitle("Voxel-Bin Temporal Alignment — Joint Speed ‖dq‖ vs Activity",
                  fontsize=13, fontweight="bold", y=0.98)
     out = out_dir / "temporal_alignment_voxel.png"
     fig.savefig(out, dpi=150, bbox_inches="tight"); plt.close(fig)
@@ -479,14 +519,17 @@ def run_verify(seq_dir: Path, out_dir: Path) -> None:
             raise FileNotFoundError(f"Required: {p}")
 
     with h5py.File(rs_path, "r") as f:
-        t_sys_ns = f["t_sys_ns"][:]
-        t_hw_ms  = f["t_hw_ms"][:]
         frame_no = f["frame_number"][:]
-        # Prefer hardware-anchored timestamps (same domain as sys, but cleaned-up jitter)
-        t_hw_as_sys_ns = f["t_hw_as_sys_ns"][:] if "t_hw_as_sys_ns" in f else t_sys_ns
+        if "t_global_ms" in f:
+            t_hw_ms = f["t_global_ms"][:]
+            t_hw_as_sys_ns = (t_hw_ms * 1e6).astype(np.int64)
+            t_sys_ns = None  # not stored in new format (global time replaces it)
+        else:
+            t_sys_ns = f["t_sys_ns"][:]
+            t_hw_ms  = f["t_hw_ms"][:]
+            t_hw_as_sys_ns = f["t_hw_as_sys_ns"][:] if "t_hw_as_sys_ns" in f else t_sys_ns
     with h5py.File(poses_path, "r") as f:
         ee_T      = f["ee_T"][:]
-        joints    = f["joint_positions"][:]
         offset_ms = f["nearest_offset_ms"][:]
 
     fps = float(DEFAULT_FPS); raw_poses = -1
@@ -495,10 +538,12 @@ def run_verify(seq_dir: Path, out_dir: Path) -> None:
             fps = float(f.attrs.get("fps", 30.0))
             raw_poses = int(f.attrs.get("raw_poses_received", -1))
 
-    N = len(t_sys_ns)
-    t_s = (t_hw_as_sys_ns - t_hw_as_sys_ns[0]) / 1e9  # use hw-anchored times as the time axis
-    # sys-vs-hw drift: how much does raw receive time deviate from hw-anchored time?
-    sys_vs_hw_drift_ms = (t_sys_ns - t_hw_as_sys_ns).astype(np.float64) / 1e6
+    N = len(t_hw_as_sys_ns)
+    t_s = (t_hw_as_sys_ns - t_hw_as_sys_ns[0]) / 1e9
+    sys_vs_hw_drift_ms = (
+        (t_sys_ns - t_hw_as_sys_ns).astype(np.float64) / 1e6
+        if t_sys_ns is not None else None
+    )
     dt_hw_ms = np.diff(t_hw_ms)
     frame_gaps = np.diff(frame_no.astype(np.int64))
     dropped = int(np.sum(frame_gaps > 1))
@@ -558,15 +603,21 @@ def run_verify(seq_dir: Path, out_dir: Path) -> None:
     ax2.set_xlabel("Offset (ms)"); ax2.set_ylabel("Count"); ax2.set_title("Offset distribution")
     ax2.grid(True, alpha=0.3)
 
-    # 3: sys-vs-hw drift over time  (how noisy is the Python receive time vs hw clock)
+    # 3: sys-vs-hw drift (only available for old recordings without global time)
     ax3 = fig.add_subplot(gs[1, :2])
-    ax3.plot(t_s[1:], sys_vs_hw_drift_ms[1:], color="teal", lw=0.7, alpha=0.80)
-    ax3.axhline(float(np.median(sys_vs_hw_drift_ms[1:])), color="darkgreen", ls="--", lw=1.5,
-                label=f"median {np.median(sys_vs_hw_drift_ms[1:]):.1f}ms")
-    ax3.axhline(0, color="gray", ls=":", lw=1.0)
-    ax3.set_xlabel("Time (s)"); ax3.set_ylabel("sys − hw_as_sys (ms)")
-    ax3.set_title("Sys receive-time jitter vs hardware clock [clock drift check]")
-    ax3.legend(fontsize=8); ax3.grid(True, alpha=0.3)
+    if sys_vs_hw_drift_ms is not None:
+        ax3.plot(t_s[1:], sys_vs_hw_drift_ms[1:], color="teal", lw=0.7, alpha=0.80)
+        ax3.axhline(float(np.median(sys_vs_hw_drift_ms[1:])), color="darkgreen", ls="--", lw=1.5,
+                    label=f"median {np.median(sys_vs_hw_drift_ms[1:]):.1f}ms")
+        ax3.axhline(0, color="gray", ls=":", lw=1.0)
+        ax3.set_xlabel("Time (s)"); ax3.set_ylabel("sys − hw_as_sys (ms)")
+        ax3.set_title("Sys receive-time jitter vs hardware clock [clock drift check]")
+        ax3.legend(fontsize=8)
+    else:
+        ax3.text(0.5, 0.5, "N/A — global time enabled\n(no separate sys timestamp)",
+                 ha="center", va="center", transform=ax3.transAxes, color="gray", fontsize=10)
+        ax3.set_title("Sys receive-time jitter [N/A for global-time recordings]")
+    ax3.grid(True, alpha=0.3)
 
     # 4: hw frame interval histogram (regularity of depth capture)
     ax4 = fig.add_subplot(gs[1, 2])

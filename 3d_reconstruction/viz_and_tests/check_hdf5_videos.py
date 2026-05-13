@@ -107,14 +107,10 @@ def check_poses(hdf5_dir: Path) -> None:
     print(f"\n[Poses] Reading {h5_path}")
     with h5py.File(h5_path, "r") as f:
         ee_T      = f["ee_T"][:]              # (N, 4, 4)
-        joints    = f["joint_positions"][:]   # (N, 7)
-        gripper_q = f["gripper_q"][:]         # (N,)
         offset_ms = f["nearest_offset_ms"][:] # (N,)
 
     N = len(ee_T)
     print(f"  ee_T shape      : {ee_T.shape}")
-    print(f"  joint_positions : {joints.shape}")
-    print(f"  gripper_q range : [{gripper_q.min():.4f}, {gripper_q.max():.4f}]")
     print(f"  offset_ms  median={np.median(offset_ms):.1f}  max={np.max(offset_ms):.1f}")
     # Sanity: last row of each transform should be [0,0,0,1]
     last_rows = ee_T[:, 3, :]

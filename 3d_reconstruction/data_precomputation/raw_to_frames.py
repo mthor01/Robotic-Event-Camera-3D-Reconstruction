@@ -1,13 +1,16 @@
 import time
+import sys
 import cv2
 import numpy as np
 import h5py
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from metavision_core.event_io import EventsIterator
 from metavision_sdk_core import PeriodicFrameGenerationAlgorithm
 
-from reconstruction_config import FPS, DELTA_T_US
+from config import FPS, DELTA_T_US
 
 # ================= CONFIG =================
 DATA_DIR = Path("data")

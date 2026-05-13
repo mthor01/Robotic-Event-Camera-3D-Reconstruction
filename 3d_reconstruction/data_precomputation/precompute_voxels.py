@@ -11,15 +11,19 @@ Usage:
 """
 
 import argparse
+import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 import numpy as np
 import h5py
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 import multiprocessing
 
-from reconstruction_config import NUM_BINS, TRAIN_RESIZE_HW, TRAIN_CROP_HW
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from config import NUM_BINS, TRAIN_RESIZE_HW, TRAIN_CROP_HW
 
 
 def events_to_voxel_grid(
@@ -27,18 +31,28 @@ def events_to_voxel_grid(
     height: int,
     width: int,
     num_bins: int = NUM_BINS,
+    t_start_us: Optional[float] = None,
+    t_end_us: Optional[float] = None,
 ) -> np.ndarray:
     """
     Convert raw events to a voxel grid representation.
-    
+
+    Bins are fixed-duration slices of [t_start_us, t_end_us] (the full frame
+    time window) so that bin k covers a predictable interval regardless of
+    whether events are sparse or dense.  When t_start_us / t_end_us are not
+    provided the function falls back to data-dependent [t_min, t_max], which
+    makes bin timing depend on actual event activity — avoid for alignment.
+
     Args:
-        events: Structured array with fields (x, y, p, t)
-        height: Image height
-        width: Image width
-        num_bins: Number of temporal bins
-        
+        events:     Structured array with fields (x, y, p, t), t in µs.
+        height:     Image height.
+        width:      Image width.
+        num_bins:   Number of temporal bins.
+        t_start_us: Frame start time in µs (event-camera clock).
+        t_end_us:   Frame end   time in µs (event-camera clock).
+
     Returns:
-        Voxel grid of shape (num_bins, height, width)
+        Voxel grid of shape (num_bins, height, width).
     """
     voxel = np.zeros((num_bins, height, width), dtype=np.float32)
     
@@ -59,8 +73,14 @@ def events_to_voxel_grid(
     # Convert polarity: 0 -> -1, 1 -> +1
     p = p * 2 - 1
     
-    # Normalize timestamps to [0, num_bins-1]
-    t_min, t_max = t.min(), t.max()
+    # Normalize timestamps to [0, num_bins-1] using fixed frame boundaries so
+    # every bin covers the same wall-clock duration (delta_t / num_bins).
+    # Fall back to data range only when no frame boundaries are provided.
+    if t_start_us is not None and t_end_us is not None and t_end_us > t_start_us:
+        t_min = float(t_start_us)
+        t_max = float(t_end_us)
+    else:
+        t_min, t_max = float(t.min()), float(t.max())
     if t_max > t_min:
         t_norm = (t - t_min) / (t_max - t_min) * (num_bins - 1)
     else:
@@ -145,6 +165,8 @@ def process_sequence(
     output_hw: Optional[Tuple[int, int]] = None,
     as_float16: bool = False,
     crop_hw: Optional[Tuple[int, int]] = None,
+    show_progress: bool = True,
+    hw_trigger: bool = False,
 ) -> dict:
     """
     Process a single sequence directory.
@@ -156,6 +178,11 @@ def process_sequence(
     downsampled to that resolution before saving (dramatically reduces storage
     when the training pipeline already downscales).  Use `as_float16` to halve
     storage with negligible precision loss on normalised event data.
+
+    When ``hw_trigger=True`` the per-frame window is centred on the hardware
+    trigger timestamp (stored in events_cam{k}.h5 as ``hw_trigger_times_us``):
+        window = [trigger[i] - half_period, trigger[i] + half_period)
+    so the middle temporal bin of the voxel grid falls exactly on the trigger.
 
     Saved to events/voxels_cam{k}.h5 as HDF5 dataset "voxels" with shape
     (N, num_bins, H, W).
@@ -182,12 +209,15 @@ def process_sequence(
         result["error"] = f"No raw event files found in {raw_dir}"
         return result
 
-    # Load depth shape and system-clock timestamps (nanoseconds)
+    # Load depth shape and frame count
     with h5py.File(realsense_h5_path, 'r') as f:
         depth_shape = f['depth'].shape   # (N, H, W)
-        depth_t_ns  = f['t_sys_ns'][:]   # (N,) nanoseconds
-
-    n_frames = len(depth_t_ns)
+        # t_global_ms is the RS2 global (system-clock) timestamp; older recordings
+        # used t_sys_ns. We only need the array to determine n_frames here.
+        if 't_global_ms' in f:
+            n_frames = f['t_global_ms'].shape[0]
+        else:
+            n_frames = f['t_sys_ns'].shape[0]
 
     # Event camera native resolution (read from the aligned HDF5 file)
     # We must NOT use the RealSense depth resolution here — raw event
@@ -245,6 +275,42 @@ def process_sequence(
                 ev_t_start_us = f['events/t_ev_start_us'][:]  # (N,) int64
                 ev_t_end_us   = f['events/t_ev_end_us'][:]    # (N,) int64
 
+            # HW trigger timestamps: read directly from the .raw file (primary source,
+            # always present if the recording used --hw-trigger-sync, regardless of
+            # which alignment path was used).  Fall back to the HDF5 copy if the raw
+            # file's triggers are unavailable.
+            hw_trig_us = None
+            if hw_trigger:
+                try:
+                    from metavision_core.event_io import RawReader as _RR
+                    _rr = _RR(str(raw_path))
+                    while not _rr.is_done():
+                        _rr.load_delta_t(100_000)
+                    _trig = _rr.get_ext_trigger_events()
+                    if _trig is not None and len(_trig) > 0:
+                        _rising = _trig[_trig["p"] == 1]
+                        if len(_rising) > 0:
+                            hw_trig_us = _rising["t"].astype(np.int64)
+                            print(f"  [cam{cam_idx}] HW triggers: {len(hw_trig_us)} rising edges "
+                                  f"from raw file (need {n_frames})")
+                        else:
+                            print(f"  [cam{cam_idx}] WARNING: no rising-edge trigger events in raw file")
+                    else:
+                        print(f"  [cam{cam_idx}] WARNING: no trigger events in raw file")
+                except Exception as _e:
+                    print(f"  [cam{cam_idx}] WARNING: could not read triggers from raw file: {_e}")
+
+                # Fallback: try the HDF5 copy (written by generate_event_frames_hw_triggered)
+                if hw_trig_us is None:
+                    with h5py.File(aligned_h5, 'r') as f:
+                        if 'events/hw_trigger_times_us' in f:
+                            hw_trig_us = f['events/hw_trigger_times_us'][:].astype(np.int64)
+                            print(f"  [cam{cam_idx}] HW triggers: {len(hw_trig_us)} from HDF5 fallback")
+
+                if hw_trig_us is None:
+                    print(f"  [cam{cam_idx}] WARNING: --hw_trigger requested but no trigger timestamps "
+                          f"found in raw file or HDF5; falling back to standard windows")
+
             if len(ev_t_start_us) != n_frames:
                 print(f"  [cam{cam_idx}] WARNING: HDF5 has {len(ev_t_start_us)} frames "
                       f"but depth has {n_frames}")
@@ -280,14 +346,37 @@ def process_sequence(
                     dtype=dtype,
                     chunks=(1, num_bins, out_H, out_W),
                 )
-                for frame_idx in tqdm(range(n_frames), desc=f"  cam{cam_idx}", leave=False):
-                    t_start = int(ev_t_start_us[frame_idx])
-                    t_end   = int(ev_t_end_us[frame_idx])
+                # Spatial metadata: lets downstream code reverse the resize+crop
+                # to reconstruct a proper native-resolution overlay image.
+                ds.attrs["native_h"] = EV_H
+                ds.attrs["native_w"] = EV_W
+                ds.attrs["resize_h"] = output_hw[0] if output_hw is not None else EV_H
+                ds.attrs["resize_w"] = output_hw[1] if output_hw is not None else EV_W
+                # crop_h/w are just out_H/out_W (== ds.shape[2/3]), stored for clarity
+                ds.attrs["crop_h"] = out_H
+                ds.attrs["crop_w"] = out_W
+                if hw_trig_us is not None:
+                    vf.create_dataset("hw_trigger_times_us", data=hw_trig_us[:n_frames])
+                    # Compute trigger-centred windows
+                    trig = hw_trig_us[:n_frames]
+                    periods = np.diff(trig).astype(np.int64)
+                    mean_period = int(np.mean(periods)) if len(periods) > 0 else int(1e6 // 30)
+                    half = mean_period // 2
+                    win_starts = trig - half
+                    win_ends   = trig + half
+                else:
+                    win_starts = ev_t_start_us[:n_frames].astype(np.int64)
+                    win_ends   = ev_t_end_us[:n_frames].astype(np.int64)
+
+                for frame_idx in tqdm(range(n_frames), desc=f"  cam{cam_idx}", leave=False, position=1, disable=not show_progress):
+                    t_start = int(win_starts[frame_idx])
+                    t_end   = int(win_ends[frame_idx])
 
                     i0 = np.searchsorted(raw_t, t_start, side='left')
                     i1 = np.searchsorted(raw_t, t_end,   side='right')
 
-                    voxel = events_to_voxel_grid(events[i0:i1], EV_H, EV_W, num_bins)
+                    voxel = events_to_voxel_grid(events[i0:i1], EV_H, EV_W, num_bins,
+                                                   t_start_us=t_start, t_end_us=t_end)
                     if output_hw is not None:
                         voxel = resize_voxel(voxel, output_hw, as_float16=False)
                     if crop_hw is not None:
@@ -332,7 +421,9 @@ def main():
     parser.add_argument("--overwrite", action="store_true",
                        help="Overwrite existing voxel files")
     parser.add_argument("--workers", type=int, default=None,
-                       help="Number of parallel workers (default: CPU count)")
+                       help="Number of parallel workers (default: min(4, n_sequences)). "
+                            "Each worker loads a full raw event file into RAM; keep this "
+                            "small to avoid OOM. Use 1 to force sequential processing.")
     parser.add_argument("--output_h", type=int, default=TRAIN_RESIZE_HW[0],
                        help="Intermediate resize height before center-crop "
                             "(default: TRAIN_RESIZE_HW[0]=%(default)s). "
@@ -351,7 +442,12 @@ def main():
                             "Set to 0 to disable crop (store at resize resolution).")
     parser.add_argument("--float16", action="store_true",
                        help="Store voxels as float16 instead of float32 (2x extra space saving).")
-    
+    parser.add_argument("--hw_trigger", action="store_true",
+                       help="Centre each voxel window on the hardware trigger timestamp "
+                            "(stored as hw_trigger_times_us in events_camK.h5). "
+                            "The middle temporal bin will coincide with the RealSense trigger pulse. "
+                            "Requires recordings made with --hw-trigger-sync.")
+
     args = parser.parse_args()
 
     # Build output_hw (resize target) and crop_hw (final stored size)
@@ -398,42 +494,59 @@ def main():
     if args.float16:
         print("Dtype: float16 (2x additional saving vs float32)")
     print(f"Overwrite: {args.overwrite}")
+    if args.hw_trigger:
+        print("HW trigger: ON — voxel windows centred on trigger timestamps")
     print()
 
     # Process sequences
-    n_workers = args.workers or min(multiprocessing.cpu_count(), len(sequence_dirs))
+    # Cap workers: each worker loads a full raw event file into RAM, so running
+    # too many in parallel causes OOM.  Default to min(4, n_sequences).
+    n_workers = args.workers if args.workers is not None else min(4, len(sequence_dirs))
 
-    if n_workers == 1 or len(sequence_dirs) == 1:
-        # Sequential processing with progress bar
+    def _run_sequential(dirs, show_prog=True):
         results = []
-        for seq_dir in tqdm(sequence_dirs, desc="Processing"):
+        for seq_dir in tqdm(dirs, desc="Processing", position=0, leave=True):
             result = process_sequence(
-                seq_dir, args.num_bins, args.overwrite, output_hw, args.float16, crop_hw
+                seq_dir, args.num_bins, args.overwrite, output_hw, args.float16, crop_hw,
+                show_progress=show_prog, hw_trigger=args.hw_trigger,
             )
             results.append(result)
             if result["success"]:
                 tqdm.write(f"  ✓ {result['name']}: {result['n_frames']} frames")
             else:
                 tqdm.write(f"  ✗ {result['name']}: {result['error']}")
+        return results
+
+    if n_workers == 1 or len(sequence_dirs) == 1:
+        results = _run_sequential(sequence_dirs, show_prog=True)
     else:
-        # Parallel processing
+        # Parallel processing with automatic fallback to sequential on crash
         print(f"Using {n_workers} workers")
         results = []
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            futures = {
-                executor.submit(
-                    process_sequence, seq_dir, args.num_bins, args.overwrite, output_hw, args.float16, crop_hw
-                ): seq_dir
-                for seq_dir in sequence_dirs
-            }
-
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Processing"):
-                result = future.result()
-                results.append(result)
-                if result["success"]:
-                    tqdm.write(f"  ✓ {result['name']}: {result['n_frames']} frames")
-                else:
-                    tqdm.write(f"  ✗ {result['name']}: {result['error']}")
+        try:
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                futures = {
+                    executor.submit(
+                        process_sequence, seq_dir, args.num_bins, args.overwrite,
+                        output_hw, args.float16, crop_hw, False, args.hw_trigger
+                    ): seq_dir
+                    for seq_dir in sequence_dirs
+                }
+                for future in tqdm(as_completed(futures), total=len(futures), desc="Processing"):
+                    result = future.result()
+                    results.append(result)
+                    if result["success"]:
+                        tqdm.write(f"  ✓ {result['name']}: {result['n_frames']} frames")
+                    else:
+                        tqdm.write(f"  ✗ {result['name']}: {result['error']}")
+        except BrokenProcessPool:
+            completed = {r['name'] for r in results if r['success']}
+            remaining = [d for d in sequence_dirs if d.name not in completed]
+            print(f"\nWorker process crashed (likely OOM with {n_workers} workers loading "
+                  f"raw event files simultaneously).")
+            print(f"Falling back to sequential processing for {len(remaining)} remaining "
+                  f"sequence(s) …")
+            results += _run_sequential(remaining, show_prog=True)
     
     # Summary
     print()

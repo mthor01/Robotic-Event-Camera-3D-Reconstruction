@@ -45,6 +45,7 @@ class RandomHemisphereAgent(Agent):
         base_max_radius: float = 0.65,
         min_z_height: float = 0.1,
         lock_rotation_horizontal: bool = True,
+        center_z_offset: float = 0.0,
         calibration_dir: str = None,
     ) -> None:
         """
@@ -62,6 +63,8 @@ class RandomHemisphereAgent(Agent):
             base_max_radius: Exclude poses beyond this x,y radius of robot base (0,0). Default: 0.65
             min_z_height: Minimum z-height for poses (table level). Default: 0.1
             lock_rotation_horizontal: If True, keep depth camera image upright. If False, allow random roll. Default: True
+            center_z_offset: Additional Z offset applied to the hemisphere center only. The target_point
+                is NOT affected. Useful for raising/lowering the sampling hemisphere. Default: 0.0
             calibration_dir: Path to directory containing T_rgb_from_ee.npz and T_color_from_depth.npz.
                 Default: 3d_reconstruction/camera_data/ relative to the project root.
         """
@@ -70,6 +73,7 @@ class RandomHemisphereAgent(Agent):
         if center is None:
             center = np.array([0.4, 0.0, 0.0])
         self.center = np.array(center, dtype=float)
+        self.center[2] += center_z_offset
         
         if target_point is None:
             target_point = np.array([0.35, 0.0, -0.1])
@@ -114,6 +118,7 @@ class RandomHemisphereAgent(Agent):
         logger.info(f"  Base exclusion radius: {self.base_exclusion_radius}")
         logger.info(f"  Base max radius: {self.base_max_radius}")
         logger.info(f"  Min z-height: {self.min_z_height}")
+        logger.info(f"  Center Z offset: {center_z_offset}")
         logger.info(f"  Lock rotation horizontal: {self.lock_rotation_horizontal}")
 
         self.current_pose_idx = 0
