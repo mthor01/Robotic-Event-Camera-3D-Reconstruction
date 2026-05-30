@@ -1,0 +1,78 @@
+# Docker startup
+
+docker run -it --rm -v /cshome:/cshome -v /dev:/dev -e DISPLAY=$DISPLAY -v /tmp/.X11-unix:/tmp/.X11-unix --net=host --privileged deoxys_test_mika
+
+docker run -it --rm --runtime=nvidia --gpus all \
+  -e DISPLAY=$DISPLAY \
+  -e XAUTHORITY=/root/.Xauthority \
+  -e POSE_PUB_BIND=tcp://0.0.0.0:6000 \
+  -e MUJOCO_GL=glx \
+  -e NVIDIA_DRIVER_CAPABILITIES=all \
+  -v "$HOME/.Xauthority:/root/.Xauthority:ro" \
+  -v "$(pwd):/workspace/project" \
+  -v /tmp/.X11-unix:/tmp/.X11-unix \
+  -v /dev:/dev \
+  --net=host --privileged \
+  openvla_mika\
+  bash -c "cd /workspace/project/franka_pipeline && exec bash"
+
+docker run --gpus all -it --rm \
+  --shm-size=8g \
+  --net=host \
+  --privileged \
+  --user 0:0 \
+  -v /dev:/dev \
+  -v "$(pwd):/work/project" \
+  -e POSE_PUB_BIND=tcp://0.0.0.0:6000 \
+  -e DISPLAY=$DISPLAY \
+  -e XAUTHORITY=${XAUTHORITY:-$HOME/.Xauthority} \
+  -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+  -v "${XAUTHORITY:-$HOME/.Xauthority}:${XAUTHORITY:-$HOME/.Xauthority}:ro" \
+  meta_and_pytorch \
+  bash -c "cd /work/project/3d_reconstruction && exec bash"
+
+docker run --rm -it \
+  -v "$PWD:/work" \
+  openvla \
+  bash -lc "chown -R 101403:5018 /work"
+
+xhost +local:root
+
+
+  
+##########Record Data############
+python3 my_main.py --real-robot
+
+python3 synchronised_recording.py
+
+python3 project_realsense_to_event.py --data_root data/real                     #--save-videos
+
+python3 precompute_spatial_mask.py --overwrite
+
+python3 precompute_voxels.py --overwrite
+
+python3 precompute_pose_depth.py 
+
+###########Data Tests##############
+python3 viz_and_tests/visualize_masks.py                          #--data_dir data/real/headphones
+
+###########Temporal Test###########
+
+  
+##########Calibration############
+python main.py --calibration-poses calibration_poses.npy --agent-type multi_cam_calibrate
+
+python3 calibration_recording_and_calibration.py --output-dir camera_data
+
+python3 verify_calibration.py --data-dir camera_data
+
+python 3d_reconstruction/projection_check.py --data-dir camera_data --out-dir proj_vis
+
+python3 viz_and_tests/pose_time_analysis.py --data-dir data/temporal_check
+
+##########Training################
+python3 project_realsense_to_event.py --data_dir data/real/1 
+
+python3 real_train.py 
+
+tensorboard --logdir=checkpoints_e2depth

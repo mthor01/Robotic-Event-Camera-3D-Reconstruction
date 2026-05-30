@@ -1,0 +1,5 @@
+
+
+waits for rgb and depth until both are available. is that ok?
+
+check the voxel generation code

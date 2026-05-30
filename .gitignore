@@ -1,0 +1,6 @@
+**/__pycache__/
+3d_reconstruction/data/
+**/*.obj
+**/*.pt
+**/*.png
+3d_reconstruction/training/checkpoints/

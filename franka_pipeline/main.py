@@ -13,6 +13,10 @@ Assumptions:
     - robot_state["joint_position"] : (7,) array
     - robot_state["gripper_q"] : scalar-ish
 - HalfSphereRecordingAgent returns metadata with "end_episode"/"reset_episode"/"quit" similarly.
+
+Calibration mode:
+python main.py --real-robot --agent-type multi_cam_calibrate --calibration-poses calibration_poses.npy
+
 """
 
 import os

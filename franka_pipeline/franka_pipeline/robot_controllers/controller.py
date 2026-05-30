@@ -203,9 +203,7 @@ class RealRobotController(Controller):
             control_interface: Controller type to configure.
             config_dir: Path to the YAML configuration file.
         """
-        self.controller_configs[control_interface] = YamlConfig(
-            os.path.dirname(config_dir), os.path.basename(config_dir)
-        )
+        self.controller_configs[control_interface] = YamlConfig(config_dir)
 
     def control(self, command: np.ndarray, controller_type: str | None = None) -> None:
         """Send a control command to the real robot.

@@ -176,6 +176,7 @@ def create_random_hemisphere_agent(args) -> tuple[RandomHemisphereAgent, np.ndar
         min_z_height=cfg.MIN_Z_HEIGHT,
         lock_rotation_horizontal=cfg.LOCK_ROTATION_HORIZONTAL,
         center_z_offset=args.center_z_offset,
+        use_ee_poses=args.ee_poses,
     )
     
     # The hemisphere agent looks at the target point
@@ -283,6 +284,13 @@ Examples:
         type=int,
         default=cfg.RANDOM_SEED,
         help="Random seed for reproducibility"
+    )
+    parser.add_argument(
+        "--ee-poses",
+        action="store_true",
+        default=False,
+        help="EE pose mode: sample hemisphere as EE positions and point the EE z-axis at "
+             "the target (no camera calibration needed). Use --target to set the EE target point.",
     )
     
     # Visualization options

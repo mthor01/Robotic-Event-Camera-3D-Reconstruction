@@ -442,11 +442,12 @@ def main():
                             "Set to 0 to disable crop (store at resize resolution).")
     parser.add_argument("--float16", action="store_true",
                        help="Store voxels as float16 instead of float32 (2x extra space saving).")
-    parser.add_argument("--hw_trigger", action="store_true",
-                       help="Centre each voxel window on the hardware trigger timestamp "
-                            "(stored as hw_trigger_times_us in events_camK.h5). "
-                            "The middle temporal bin will coincide with the RealSense trigger pulse. "
-                            "Requires recordings made with --hw-trigger-sync.")
+    parser.add_argument("--no-hw-trigger", action="store_true", dest="no_hw_trigger",
+                       help="Disable hardware-trigger-based voxel alignment (enabled by default). "
+                            "By default each voxel window is centred on the hardware trigger timestamp "
+                            "(stored as hw_trigger_times_us in events_camK.h5) so the middle temporal "
+                            "bin coincides with the RealSense trigger pulse. "
+                            "Pass this flag to fall back to elapsed-time estimation.")
 
     args = parser.parse_args()
 
@@ -494,8 +495,11 @@ def main():
     if args.float16:
         print("Dtype: float16 (2x additional saving vs float32)")
     print(f"Overwrite: {args.overwrite}")
-    if args.hw_trigger:
+    hw_trigger = not args.no_hw_trigger
+    if hw_trigger:
         print("HW trigger: ON — voxel windows centred on trigger timestamps")
+    else:
+        print("HW trigger: OFF — using elapsed-time estimation")
     print()
 
     # Process sequences
@@ -508,7 +512,7 @@ def main():
         for seq_dir in tqdm(dirs, desc="Processing", position=0, leave=True):
             result = process_sequence(
                 seq_dir, args.num_bins, args.overwrite, output_hw, args.float16, crop_hw,
-                show_progress=show_prog, hw_trigger=args.hw_trigger,
+                show_progress=show_prog, hw_trigger=hw_trigger,
             )
             results.append(result)
             if result["success"]:
@@ -528,7 +532,7 @@ def main():
                 futures = {
                     executor.submit(
                         process_sequence, seq_dir, args.num_bins, args.overwrite,
-                        output_hw, args.float16, crop_hw, False, args.hw_trigger
+                        output_hw, args.float16, crop_hw, False, hw_trigger
                     ): seq_dir
                     for seq_dir in sequence_dirs
                 }

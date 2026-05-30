@@ -96,11 +96,23 @@ class RandomHemisphereAgent(Agent):
                 os.path.dirname(__file__), '..', '..', '..',
                 '3d_reconstruction', 'camera_data'
             )
-        T_rgb_from_ee = np.load(os.path.join(calibration_dir, 'T_rgb_from_ee.npz'))['T']
-        T_color_from_depth = np.load(os.path.join(calibration_dir, 'T_color_from_depth.npz'))['T']
-        T_depth_from_ee = np.linalg.inv(T_color_from_depth) @ T_rgb_from_ee
-        self.R_depth_from_ee = T_depth_from_ee[:3, :3]
-        logger.info(f"Loaded depth camera calibration from {calibration_dir}")
+        try:
+            T_rgb_from_ee = np.load(os.path.join(calibration_dir, 'T_rgb_from_ee.npz'))['T']
+            T_color_from_depth = np.load(os.path.join(calibration_dir, 'T_color_from_depth.npz'))['T']
+            T_depth_from_ee = np.linalg.inv(T_color_from_depth) @ T_rgb_from_ee
+            self.R_depth_from_ee = T_depth_from_ee[:3, :3]
+            logger.info(f"Loaded depth camera calibration from {calibration_dir}")
+        except (FileNotFoundError, KeyError) as e:
+            # Fall back to a 90-degree rotation around z-axis when no calibration data is available
+            logger.warning(
+                f"Could not load calibration data from {calibration_dir} ({e}). "
+                "Falling back to default: 90-degree rotation around z-axis."
+            )
+            self.R_depth_from_ee = np.array([
+                [0., -1., 0.],
+                [1.,  0., 0.],
+                [0.,  0., 1.],
+            ])
         
         # Set random seed if provided
         if seed is not None:

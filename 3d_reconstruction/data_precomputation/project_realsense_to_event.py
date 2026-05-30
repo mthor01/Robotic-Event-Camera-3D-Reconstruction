@@ -435,7 +435,7 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
                     FPS, (out_w, out_h), isColor=True,
                 )
 
-        # Event frames (or voxel middle bin) for overlay
+        # Event frames (or all voxel bins) for overlay
         ev_h5_path     = seq_dir / "hdf5"   / "events_cam0.h5"
         voxel_h5_path  = seq_dir / "events" / "voxels_cam0.h5"
         if use_voxels and voxel_h5_path.exists():
@@ -492,7 +492,6 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
                         if _ev_source == "voxels":
                             vox_ds  = ev_h5["voxels"]
                             vox_n   = vox_ds.shape[0]
-                            mid_bin = vox_ds.shape[1] // 2
                             # Spatial metadata for reversing the resize+crop baked into the voxels.
                             # Voxels may be stored at (crop_h x crop_w) after an intermediate
                             # resize to (resize_h x resize_w) from native (native_h x native_w).
@@ -506,10 +505,20 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
                             _vox_rsz_w  = int(_vatts.get("resize_w", _vox_crop_w))
 
                             def _vox_to_gray(v):
-                                """Render one voxel bin (crop_H, crop_W) float → uint8 at (out_h, out_w)."""
-                                v = v.astype(np.float32)
-                                v = np.clip(v, -3.0, 3.0)
-                                gray = ((v + 3.0) / 6.0 * 255).astype(np.uint8)
+                                """Render all voxel bins (n_bins, crop_H, crop_W) → uint8 grayscale at (out_h, out_w).
+
+                                Sums absolute event activity across every bin so all polarities and
+                                time-windows contribute.  No-event pixels map to black (0); active
+                                pixels are bright in proportion to total activity — much more visible
+                                as an overlay than a single mid-bin rendered with a grey offset.
+                                """
+                                v = v.astype(np.float32)  # (n_bins, H, W)
+                                # Clip each bin before summing to prevent a few hot pixels dominating
+                                n_bins = v.shape[0]
+                                activity = np.sum(np.abs(np.clip(v, -1.0, 1.0)), axis=0)  # (H, W)
+                                # Normalise to [0, 1]: max possible is n_bins * 1.0
+                                activity = np.clip(activity / n_bins, 0.0, 1.0)
+                                gray = (activity * 255).astype(np.uint8)
                                 # Step 1: undo center-crop → embed in resize canvas
                                 if _vox_crop_h != _vox_rsz_h or _vox_crop_w != _vox_rsz_w:
                                     canvas = np.zeros((_vox_rsz_h, _vox_rsz_w), dtype=np.uint8)
@@ -524,7 +533,7 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
                                 return gray
 
                             batch_ev = [
-                                _vox_to_gray(vox_ds[i, mid_bin]) if i < vox_n else None
+                                _vox_to_gray(vox_ds[i]) if i < vox_n else None
                                 for i in batch_range
                             ]
                         else:
@@ -665,7 +674,7 @@ def main():
         help="Skip RGB projection (depth only)",
     )
     parser.add_argument(
-        "--save-videos", action="store_true",
+        "--save_videos", action="store_true",
         help="Generate MP4 videos (depth_in_event_frame.mp4, rgb_in_event_frame.mp4). "
              "Default: only create HDF5 files.",
     )

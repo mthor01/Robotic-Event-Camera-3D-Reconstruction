@@ -75,7 +75,7 @@ TARGET_Y = 0.0
 TARGET_Z = 0.12
 
 # Sphere/Hemisphere radius
-SPHERE_RADIUS = 0.4
+SPHERE_RADIUS = 0.37
 
 # Inner radius for hollow hemisphere (RandomHemisphereAgent only)
 INNER_RADIUS = 0.2

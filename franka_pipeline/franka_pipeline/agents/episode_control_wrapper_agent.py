@@ -93,18 +93,27 @@ class EpisodeControlWrapperAgent(Agent):
         }
 
     def _on_press(self, key: keyboard.Key | keyboard.KeyCode | None) -> None:
-        """Handle keyboard key press events."""
+        """Handle keyboard key press events.
+
+        Controls:
+            Ctrl+E  – end episode
+            Ctrl+R  – reset episode
+            Ctrl+Q  – quit
+            g       – trigger grasp
+            h       – trigger execution
+        """
         # Disable episode controls if the wrapped agent is currently taking terminal input # TODO examine this interface again, maybe make it more general
         if getattr(self.wrapped_agent, "is_input_active", False):
             return
 
         try:
+            # Ctrl+key combinations produce key.char values in the range \x01-\x1a
             if hasattr(key, "char") and key.char is not None:
-                if key.char == "q":
+                if key.char == "\x11":      # Ctrl+Q
                     self._keyboard_control["quit"] = True
-                elif key.char == "r":
+                elif key.char == "\x12":    # Ctrl+R
                     self._keyboard_control["reset_episode"] = True
-                elif key.char == "e":
+                elif key.char == "\x05":    # Ctrl+E
                     self._keyboard_control["end_episode"] = True
                 elif key.char == "g":
                     self._keyboard_control["trigger_grasp"] = True

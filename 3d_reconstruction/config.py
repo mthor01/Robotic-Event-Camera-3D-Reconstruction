@@ -73,7 +73,7 @@ WHITE_THRESH = 100  # RGB channel threshold for white detection
 # ═══════════════════════════════════════════════════════════════════
 SPATIAL_CUBE_SIDE = 0.32    # metres (32 cm cube)
 SPATIAL_CUBE_X_OFFSET = 0.05   # metres — shift of cube centre along X in robot base frame
-SPATIAL_CUBE_Z_OFFSET = -0.05
+SPATIAL_CUBE_Z_OFFSET = -0.03
 SPATIAL_CUBE_CENTER_Z = SPATIAL_CUBE_Z_OFFSET + SPATIAL_CUBE_SIDE / 2  # metres — Z of cube centre in robot base frame
 DEPTH_BLEED_RADIUS = 1      # px — half-width of bleed-correction kernel (3×3 default)
 # Target point (cube centre) in robot base frame
