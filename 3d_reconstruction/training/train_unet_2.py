@@ -124,10 +124,11 @@ class MultiFrameDepthDataset(Dataset):
         pose_next_abs: (6, H, W)    next absolute pose    (T_SCALE_ABS)
     """
 
-    def __init__(self, seq_dir: Path, stride: int = 3):
+    def __init__(self, seq_dir: Path, stride: int = 3, use_mask: bool = True):
         super().__init__()
         self.seq_dir     = seq_dir
         self.stride      = stride
+        self.use_mask    = use_mask
         self.voxels_path = seq_dir / "events" / "voxels_cam0.h5"
         self.depth_path  = seq_dir / "hdf5"   / "depth_in_event_frame.h5"
         self.mask_path   = seq_dir / "hdf5"   / "spatial_mask.h5"
@@ -139,7 +140,7 @@ class MultiFrameDepthDataset(Dataset):
         with h5py.File(self.poses_path,  "r") as f: n_p = f["ee_T"].shape[0]
 
         n_frames      = min(n_d, n_v, n_p)
-        self.has_mask = self.mask_path.exists()
+        self.has_mask = use_mask and self.mask_path.exists()
 
         # Precompute T_world_from_event for every frame
         T_event_from_ee = _load_T_event_from_ee()          # (4, 4)
@@ -180,7 +181,7 @@ class MultiFrameDepthDataset(Dataset):
         if vox.dtype == np.float16:
             vox = vox.astype(np.float32)
         dep   = self._dep[idx].astype(np.float32)
-        valid = (dep > 0).astype(np.float32)
+        valid = (dep > 0).astype(np.float32) if self.use_mask else np.ones_like(dep)
         if self.has_mask:
             valid *= self._msk[idx].astype(np.float32)
 
@@ -381,6 +382,8 @@ def main() -> None:
     parser.add_argument("--out_dir",       type=Path,
                         default=_SCRIPT_DIR / "checkpoints" / "unet_2")
     parser.add_argument("--seed",          type=int,  default=42)
+    parser.add_argument("--no_mask",   action="store_true",
+                        help="Ignore spatial mask and depth validity; treat all pixels as valid")
     parser.add_argument("--no_pose",   action="store_true",
                         help="Feed only voxel channels (15 ch); omit pose maps")
     parser.add_argument("--abs_pose",  action="store_true",
@@ -438,8 +441,8 @@ def main() -> None:
 
     # ── DataLoaders ───────────────────────────────────────────────────────
     S = args.stride
-    train_ds = ConcatDataset([MultiFrameDepthDataset(d, S) for d in train_seqs])
-    val_ds   = ConcatDataset([MultiFrameDepthDataset(d, S) for d in val_seqs])
+    train_ds = ConcatDataset([MultiFrameDepthDataset(d, S, use_mask=not args.no_mask) for d in train_seqs])
+    val_ds   = ConcatDataset([MultiFrameDepthDataset(d, S, use_mask=not args.no_mask) for d in val_seqs])
     print(f"  Train frames: {len(train_ds)},  Val frames: {len(val_ds)}")
     print(f"  Neighbours: t±{S} frames  ({S * NUM_BINS} event-bin offset)  "
           f"T_SCALE={T_SCALE} m\n")

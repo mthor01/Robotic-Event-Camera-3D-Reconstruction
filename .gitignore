@@ -4,3 +4,7 @@
 **/*.pt
 **/*.png
 3d_reconstruction/training/checkpoints/
+**/logs/
+**/*.sbatch
+**/*.sif
+**/*.def

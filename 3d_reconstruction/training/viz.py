@@ -78,9 +78,14 @@ _BORDER_PX    = 2          # pixel width of separators
 _BORDER_VALUE = 0.45       # separator brightness (mid-gray)
 _INVALID_VALUE = 0.10      # color for masked-out pixels
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+from config import DEPTH_MIN as _DEPTH_MIN_CFG, D_MAX as _DEPTH_MAX_CFG
+
 # Depth range used for colormap normalisation
-_DEPTH_MIN = 0.05          # metres  (matches config.DEPTH_MIN)
-_DEPTH_MAX = 0.60          # metres  (matches config.D_MAX)
+_DEPTH_MIN = _DEPTH_MIN_CFG   # metres  (from config.py)
+_DEPTH_MAX = _DEPTH_MAX_CFG   # metres  (from config.py)
 
 
 def _to_np(t: torch.Tensor) -> np.ndarray:
@@ -173,27 +178,35 @@ def _build_row(
     depth_gt: np.ndarray,  # (H, W) metres
     mask:     np.ndarray,  # (H, W) binary
     pred:     np.ndarray,  # (H, W) metres
+    table_depth: np.ndarray | None = None,  # (H, W) normalised [0, 1]
+    *,
+    show_mask: bool = True,
 ) -> np.ndarray:
     """
-    Build one horizontal strip of six panels for a single sample.
-    Returns (3, H, 6*W + 5*BORDER_PX).
+    Build one horizontal strip of panels for a single sample.
+    Returns (3, H, N*W + (N-1)*BORDER_PX).
+    Panel order: events | gt depth | [table depth] | [mask] | pred | error | overlay
     """
     H = voxels.shape[1]
     sep = np.full((3, H, _BORDER_PX), _BORDER_VALUE, dtype=np.float32)
 
-    panels = [
-        _events_panel(voxels),
-        sep,
-        _depth_panel(depth_gt, mask),
-        sep,
-        _mask_panel(mask),
+    panels = [_events_panel(voxels), sep, _depth_panel(depth_gt, mask)]
+
+    if table_depth is not None:
+        panels.extend([sep, _colorize(np.clip(table_depth, 0.0, 1.0), _cmap_turbo())])
+
+    if show_mask:
+        panels.extend([sep, _mask_panel(mask)])
+
+    panels.extend([
         sep,
         _depth_panel(pred, None),
         sep,
         _error_panel(pred, depth_gt, mask),
         sep,
         _overlay_panel(voxels, pred, mask),
-    ]
+    ])
+
     return np.concatenate(panels, axis=2)   # (3, H, W_total)
 
 
@@ -224,10 +237,12 @@ class VizLogger:
         writer:    SummaryWriter,
         n_samples: int = 4,
         tag:       str = "viz",
+        show_mask: bool = True,
     ) -> None:
-        self.writer    = writer
-        self.n_samples = n_samples
-        self.tag       = tag
+        self.writer     = writer
+        self.n_samples  = n_samples
+        self.tag        = tag
+        self.show_mask  = show_mask
         self._buf: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
         self._seen = 0
         self._rng = np.random.default_rng()
@@ -245,6 +260,7 @@ class VizLogger:
         depth:  torch.Tensor,  # (B, 1, H, W)  ground-truth depth in metres
         mask:   torch.Tensor,  # (B, 1, H, W)  binary validity mask
         pred:   torch.Tensor,  # (B, 1, H, W)  predicted depth in metres
+        table_depth: torch.Tensor | None = None,  # (B, 1, H, W) normalised [0, 1]
     ) -> None:
         """
         Store representative frames from this batch using reservoir sampling.
@@ -260,9 +276,10 @@ class VizLogger:
         d_np = _to_np(depth[:, 0])     # (B, H, W)
         m_np = _to_np(mask[:, 0])      # (B, H, W)
         p_np = _to_np(pred[:, 0])      # (B, H, W)
+        t_np = _to_np(table_depth[:, 0]) if table_depth is not None else None  # (B, H, W) or None
 
         for b in range(v_np.shape[0]):
-            sample = (v_np[b], d_np[b], m_np[b], p_np[b])
+            sample = (v_np[b], d_np[b], m_np[b], p_np[b], t_np[b] if t_np is not None else None)
             self._seen += 1
 
             # Fill the reservoir first, then randomly replace existing samples.
@@ -285,7 +302,7 @@ class VizLogger:
         if not self._buf:
             return
 
-        rows = [_build_row(*s) for s in self._buf]
+        rows = [_build_row(*s, show_mask=self.show_mask) for s in self._buf]
 
         # Horizontal separator between sample rows
         W_total = rows[0].shape[2]

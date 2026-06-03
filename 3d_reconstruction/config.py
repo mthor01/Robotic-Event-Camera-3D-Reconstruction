@@ -45,7 +45,7 @@ NUM_BINS = 5  # number of temporal bins for voxel grid
 # ═══════════════════════════════════════════════════════════════════
 #  Depth parameters — E2Depth training (tabletop scene)
 # ═══════════════════════════════════════════════════════════════════
-D_MAX = 0.6    # maximum depth in metres (tabletop range)
+D_MAX = 0.7    # maximum depth in metres (tabletop range)
 ALPHA = 2.5    # log depth parameter: ln(D_MAX / D_MIN) ≈ ln(0.6/0.05)
 DEPTH_MIN = 0.05  # minimum depth in metres (5 cm)
 
@@ -80,6 +80,10 @@ DEPTH_BLEED_RADIUS = 1      # px — half-width of bleed-correction kernel (3×3
 SPATIAL_TARGET_X = 0.3 + SPATIAL_CUBE_X_OFFSET   # metres (robot workspace X + cube shift)
 SPATIAL_TARGET_Y = 0.0                            # metres (centred on robot Y axis)
 SPATIAL_TARGET_Z = SPATIAL_CUBE_CENTER_Z          # metres
+
+# Vertical offset applied on top of the cube-bottom to place the table plane
+# (positive = raise the plane above the cube bottom, negative = lower it)
+TABLE_Z_OFFSET = 0.01   # metres
 
 # ═══════════════════════════════════════════════════════════════════
 #  Depth visualization (percentile normalization)

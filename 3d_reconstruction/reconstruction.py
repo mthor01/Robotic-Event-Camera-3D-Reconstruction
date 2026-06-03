@@ -34,8 +34,8 @@ from pathlib import Path
 
 # Allow imports from training/ and 3d_reconstruction/ roots
 _HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(_HERE.parent))               # 3d_reconstruction/
-sys.path.insert(0, str(_HERE.parent / "training"))  # training/ (models/, etc.)
+sys.path.insert(0, str(_HERE))               # 3d_reconstruction/
+sys.path.insert(0, str(_HERE / "training"))  # training/ (models/, etc.)
 
 from typing import List, Optional, Tuple
 
@@ -49,7 +49,8 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
 from config import D_MAX, DEPTH_MIN, NUM_BINS, CALIB_DIR as _CALIB_DIR, TRAIN_RESIZE_HW, TRAIN_CROP_HW, \
-    TSDF_VOXEL_SIZE, TSDF_SDF_TRUNC_FACTOR, TSDF_DEPTH_MAX
+    TSDF_VOXEL_SIZE, TSDF_SDF_TRUNC_FACTOR, TSDF_DEPTH_MAX, \
+    SPATIAL_CUBE_SIDE, SPATIAL_TARGET_X, SPATIAL_TARGET_Y, SPATIAL_TARGET_Z
 from models import MODEL_REGISTRY
 from models.e2depth import linear_normalized_to_depth
 
@@ -58,7 +59,7 @@ from train_unet import UNet
 from train_pose_unet import PoseUNet, project_depth as _project_depth
 from train_unet_2 import _pose_to_map, T_SCALE as _T_SCALE, T_SCALE_ABS as _T_SCALE_ABS
 
-CALIB_DIR = _HERE.parent / _CALIB_DIR
+CALIB_DIR = _HERE / _CALIB_DIR
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -107,7 +108,12 @@ def _detect_ckpt_type(ckpt: dict) -> str:
     if "input_mode" in ckpt:                       return "unet_3"
     if "model_s1" in ckpt:                          return "pose_unet"
     if "pose_mode" in ckpt:                          return "unet_2"
-    if "model" in ckpt and "config" not in ckpt:    return "unet"
+    if "table_z" in ckpt:                           return "unet_table"
+    if "model" in ckpt and "config" not in ckpt:
+        # Fallback: a unet_table checkpoint saved without the table_z key will
+        # have in_ch == NUM_BINS + 1 (one extra channel for the table prior).
+        if ckpt.get("in_ch", NUM_BINS) > NUM_BINS:  return "unet_table"
+        return "unet"
     return "registry"
 
 
@@ -262,6 +268,33 @@ def _infer_unet(model: UNet, vox_np: np.ndarray,
 
 
 @torch.no_grad()
+def _infer_unet_table(
+    model:             UNet,
+    vox_np:            np.ndarray,            # (C, H, W)
+    T_base_from_event: Optional[np.ndarray],  # (4, 4) or None
+    K_native:          np.ndarray,            # (3, 3) at native camera resolution
+    native_H:          int,
+    native_W:          int,
+    table_z:           float,
+    depth_min:         float,
+    depth_max:         float,
+    device:            torch.device,
+) -> np.ndarray:
+    """Single-frame inference for train_unet_table.py checkpoints. Returns (H, W) in [0, 1]."""
+    vox_H, vox_W = vox_np.shape[1], vox_np.shape[2]
+    if T_base_from_event is not None:
+        tbl = _compute_table_plane_channel(
+            T_base_from_event, K_native, native_H, native_W,
+            vox_H, vox_W, table_z, depth_min, depth_max,
+        )
+    else:
+        tbl = np.zeros((vox_H, vox_W), dtype=np.float32)
+    inp_np = np.concatenate([vox_np, tbl[np.newaxis]], axis=0)  # (C+1, H, W)
+    inp    = torch.from_numpy(inp_np).unsqueeze(0).to(device)   # (1, C+1, H, W)
+    return model(inp)[0, 0].cpu().numpy()
+
+
+@torch.no_grad()
 def _infer_unet_2(
     model:        UNet,
     vox_t_np:     np.ndarray,   # (C, H, W)
@@ -400,6 +433,8 @@ def tsdf_fuse(
     voxel_length: float = 0.004,   # metres per voxel (4 mm)
     sdf_trunc_factor: float = 5.0, # sdf_trunc = voxel_length * factor
     depth_max: float = 0.6,
+    cube_center: Optional[np.ndarray] = None,   # (3,) centre in world/base frame
+    cube_half_side: float = 0.0,                # half side length in metres
 ) -> None:
     """TSDF volumetric fusion of per-frame depth maps into a surface mesh.
 
@@ -450,6 +485,17 @@ def tsdf_fuse(
 
     mesh = volume.extract_triangle_mesh()
     mesh.compute_vertex_normals()
+
+    # Crop to spatial cube (vertices are in world = robot base frame)
+    if cube_center is not None and cube_half_side > 0.0:
+        verts  = np.asarray(mesh.vertices)
+        diff   = np.abs(verts - cube_center[None, :])
+        inside = np.where(np.all(diff <= cube_half_side, axis=1))[0]
+        mesh   = mesh.select_by_index(inside)
+        mesh.compute_vertex_normals()
+        print(f"  Cube crop (side={cube_half_side*2*100:.0f} cm) → "
+              f"{len(np.asarray(mesh.vertices)):,} verts, "
+              f"{len(np.asarray(mesh.triangles)):,} triangles")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     o3d.io.write_triangle_mesh(str(out_path), mesh, write_vertex_normals=True)
@@ -574,10 +620,24 @@ def main():
                         help="TSDF voxel side length in metres (default: from config.py)")
     parser.add_argument("--sdf_trunc_factor", type=float, default=TSDF_SDF_TRUNC_FACTOR,
                         help="sdf_trunc = voxel_size * this factor (default: from config.py)")
+    parser.add_argument("--cube_side", type=float, default=SPATIAL_CUBE_SIDE,
+                        help="Side length of the spatial cube used to crop the TSDF mesh (metres)")
+    parser.add_argument("--target_x", type=float, default=SPATIAL_TARGET_X,
+                        help="Cube centre X in robot base frame (metres)")
+    parser.add_argument("--target_y", type=float, default=SPATIAL_TARGET_Y,
+                        help="Cube centre Y in robot base frame (metres)")
+    parser.add_argument("--target_z", type=float, default=SPATIAL_TARGET_Z,
+                        help="Cube centre Z in robot base frame (metres)")
+    parser.add_argument("--table_z", type=float, default=None,
+                        help="Table plane Z height in robot base frame [m]. "
+                             "Overrides the value stored in the checkpoint. "
+                             "Only used for unet_table checkpoints.")
     args = parser.parse_args()
 
-    ckpt_path = Path(args.checkpoint)
-    data_dir  = Path(args.data_dir)
+    ckpt_path      = Path(args.checkpoint)
+    data_dir       = Path(args.data_dir)
+    cube_center    = np.array([args.target_x, args.target_y, args.target_z], dtype=np.float64)
+    cube_half_side = args.cube_side / 2.0
     resize_hw = (args.resize_h, args.resize_w) if args.resize_h > 0 and args.resize_w > 0 else None
     crop_hw   = (args.crop_h,   args.crop_w)   if args.crop_h   > 0 and args.crop_w   > 0 else None
     # Mirror training: resize → TRAIN_RESIZE_HW, crop → TRAIN_CROP_HW
@@ -598,6 +658,12 @@ def main():
     K, out_H, out_W = load_K(CALIB_DIR, resize_hw, crop_hw)
     print(f"Input resolution : {out_W}×{out_H}")
     print(f"K:\n{K}")
+
+    # Native (unscaled) intrinsics — needed for the table-plane prior channel
+    _ev_calib   = np.load(CALIB_DIR / "event_intrinsics.npz")
+    K_native    = _ev_calib["camera_matrix"].astype(np.float64)
+    native_W_ev = int(_ev_calib["image_size"][0])
+    native_H_ev = int(_ev_calib["image_size"][1])
 
     # ── Device ────────────────────────────────────────────────────
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -621,6 +687,16 @@ def main():
         print(f"  stride       : {ckpt_cfg.get('stride', 'N/A')}")
         print(f"  pose_mode    : {ckpt_cfg.get('pose_mode', 'N/A')}")
 
+    if model_name == "unet_table":
+        _ckpt_table_z = ckpt_cfg.get("table_z", None)
+        _table_z = args.table_z if args.table_z is not None else (_ckpt_table_z if _ckpt_table_z is not None else 0.0)
+        if _ckpt_table_z is None:
+            print(f"  WARNING: table_z not found in checkpoint — using "
+                  f"{'--table_z ' + str(_table_z) if args.table_z is not None else '0.0 (pass --table_z to override)'}")
+        print(f"[unet_table config]  table_z={_table_z} m  in_ch={ckpt_cfg.get('in_ch', 'N/A')}")
+        if not use_poses:
+            print("WARNING: poses.h5 not found — table-plane channel will be all zeros")
+
     if model_name == "mvsnet":
         print("ERROR: mvsnet requires multi-view inputs and is not supported by "
               "this script.  Use reconstruct_gt.py with --model mvsnet instead.")
@@ -629,7 +705,6 @@ def main():
     # ── Data paths ─────────────────────────────────────────────────
     depth_h5_path   = data_dir / "hdf5" / "depth_in_event_frame.h5"
     voxels_h5_path  = data_dir / "events" / "voxels_cam0.h5"
-    spatial_h5_path = data_dir / "hdf5" / "spatial_mask.h5"
     poses_h5_path   = data_dir / "hdf5" / "poses.h5"
 
     if not depth_h5_path.exists():
@@ -642,7 +717,6 @@ def main():
 
     with h5py.File(depth_h5_path, "r") as f:
         n_total = f["depth"].shape[0]
-    use_spatial = spatial_h5_path.exists()
 
     # ── Poses + extrinsics for world-frame point accumulation ──────
     if poses_h5_path.exists():
@@ -694,13 +768,12 @@ def main():
     # ── Inference ─────────────────────────────────────────────────
     depth_f   = h5py.File(depth_h5_path,   "r")
     voxels_f  = h5py.File(voxels_h5_path,  "r")
-    spatial_f = h5py.File(spatial_h5_path, "r") if use_spatial else None
 
     samples      = []
-    mesh_data    = []   # (masked pred depth, T_world_from_cam) per mesh frame
-    gt_mesh_data = []   # (masked GT depth,   T_world_from_cam) per mesh frame
+    mesh_data    = []   # (pred depth, T_world_from_cam) per mesh frame
+    gt_mesh_data = []   # (GT depth,   T_world_from_cam) per mesh frame
     # ── Inference loop setup ──────────────────────────────────────────────────
-    _stateless = model_name in ("unet", "unet_2", "unet_3", "pose_unet")
+    _stateless = model_name in ("unet", "unet_table", "unet_2", "unet_3", "pose_unet")
     if _stateless:
         _sv  = ckpt_cfg.get("stride", 3)          # frame stride (unet_2)
         _wh  = ckpt_cfg.get("window_half", 2)     # window half (pose_unet)
@@ -731,6 +804,16 @@ def main():
             # ── Per-frame prediction ─────────────────────────────────────────
             if model_name == "unet":
                 pred_norm = _infer_unet(model, vox_t_np, device)
+
+            elif model_name == "unet_table":
+                _T_bfe = None
+                if use_poses and frame_idx < len(ee_T_all):
+                    _T_bfe = (ee_T_all[frame_idx] @ T_ee_from_event).astype(np.float64)
+                pred_norm = _infer_unet_table(
+                    model, vox_t_np, _T_bfe, K_native,
+                    native_H_ev, native_W_ev,
+                    _table_z, depth_min, depth_max, device,
+                )
 
             elif model_name == "unet_2":
                 _pm = ckpt_cfg.get("pose_mode", "relative")
@@ -814,11 +897,6 @@ def main():
                 gt = resize_crop(gt, resize_hw, crop_hw, mode="bilinear")
 
             mask = ((gt > depth_min) & (gt < depth_max)).astype(np.float32)
-            if use_spatial:
-                sp = spatial_f["mask"][frame_idx].astype(np.float32)
-                if sp.shape[0] != out_H or sp.shape[1] != out_W:
-                    sp = resize_crop(sp, resize_hw, crop_hw, mode="nearest")
-                mask[sp < 0.5] = 0.0
 
             # Per-frame camera-space point cloud (used for the per-frame PLY only)
             pts = depth_to_pointcloud(pred_m, mask, K)
@@ -863,20 +941,22 @@ def main():
     finally:
         depth_f.close()
         voxels_f.close()
-        if spatial_f is not None:
-            spatial_f.close()
 
     # ── 3-D mesh via TSDF fusion ──────────────────────────────────
     if mesh_data:
         tsdf_fuse(mesh_data, K, out_dir / "mesh.obj",
                   voxel_length=args.voxel_size,
                   sdf_trunc_factor=args.sdf_trunc_factor,
-                  depth_max=depth_max)
+                  depth_max=depth_max,
+                  cube_center=cube_center,
+                  cube_half_side=cube_half_side)
     if gt_mesh_data:
         tsdf_fuse(gt_mesh_data, K, out_dir / "gt_mesh.obj",
                   voxel_length=args.voxel_size,
                   sdf_trunc_factor=args.sdf_trunc_factor,
-                  depth_max=depth_max)
+                  depth_max=depth_max,
+                  cube_center=cube_center,
+                  cube_half_side=cube_half_side)
 
     # ── Overview PNG (visualization frames only) ──────────────────
     if samples:

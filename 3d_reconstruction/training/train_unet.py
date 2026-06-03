@@ -26,11 +26,10 @@ from torch.utils.tensorboard import SummaryWriter
 from viz import VizLogger
 
 # ---------------------------------------------------------------------------
-# Constants (match 3d_reconstruction/config.py)
+# Constants (from 3d_reconstruction/config.py)
 # ---------------------------------------------------------------------------
-DEPTH_MIN = 0.05   # metres — minimum valid depth
-D_MAX     = 0.60   # metres — maximum valid depth
-NUM_BINS  = 5      # temporal bins per voxel grid
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from config import DEPTH_MIN, D_MAX, NUM_BINS
 
 # Default data root relative to this file's parent directory
 _SCRIPT_DIR = Path(__file__).resolve().parent
