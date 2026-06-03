@@ -33,6 +33,7 @@ def events_to_voxel_grid(
     num_bins: int = NUM_BINS,
     t_start_us: Optional[float] = None,
     t_end_us: Optional[float] = None,
+    normalize: bool = True,
 ) -> np.ndarray:
     """
     Convert raw events to a voxel grid representation.
@@ -50,6 +51,7 @@ def events_to_voxel_grid(
         num_bins:   Number of temporal bins.
         t_start_us: Frame start time in µs (event-camera clock).
         t_end_us:   Frame end   time in µs (event-camera clock).
+        normalize:  If True, standardise active voxel entries per frame.
 
     Returns:
         Voxel grid of shape (num_bins, height, width).
@@ -97,13 +99,15 @@ def events_to_voxel_grid(
             voxel[t_floor[i], y[i], x[i]] += p[i] * (1 - t_frac[i])
             voxel[t_ceil[i], y[i], x[i]] += p[i] * t_frac[i]
     
-    # Normalize voxel grid
-    nonzero_mask = voxel != 0
-    if nonzero_mask.any():
-        mean = voxel[nonzero_mask].mean()
-        std = voxel[nonzero_mask].std()
-        if std > 0:
-            voxel = (voxel - mean) / std
+    # Normalize voxel grid over active entries only. Keep inactive pixels at
+    # zero so empty background does not become dense nonzero signal.
+    if normalize:
+        nonzero_mask = voxel != 0
+        if nonzero_mask.any():
+            mean = voxel[nonzero_mask].mean()
+            std = voxel[nonzero_mask].std()
+            if std > 0:
+                voxel[nonzero_mask] = (voxel[nonzero_mask] - mean) / std
 
     return voxel
 
@@ -167,6 +171,7 @@ def process_sequence(
     crop_hw: Optional[Tuple[int, int]] = None,
     show_progress: bool = True,
     hw_trigger: bool = False,
+    normalize: bool = True,
 ) -> dict:
     """
     Process a single sequence directory.
@@ -355,6 +360,7 @@ def process_sequence(
                 # crop_h/w are just out_H/out_W (== ds.shape[2/3]), stored for clarity
                 ds.attrs["crop_h"] = out_H
                 ds.attrs["crop_w"] = out_W
+                ds.attrs["normalized"] = bool(normalize)
                 if hw_trig_us is not None:
                     vf.create_dataset("hw_trigger_times_us", data=hw_trig_us[:n_frames])
                     # Compute trigger-centred windows
@@ -375,8 +381,11 @@ def process_sequence(
                     i0 = np.searchsorted(raw_t, t_start, side='left')
                     i1 = np.searchsorted(raw_t, t_end,   side='right')
 
-                    voxel = events_to_voxel_grid(events[i0:i1], EV_H, EV_W, num_bins,
-                                                   t_start_us=t_start, t_end_us=t_end)
+                    voxel = events_to_voxel_grid(
+                        events[i0:i1], EV_H, EV_W, num_bins,
+                        t_start_us=t_start, t_end_us=t_end,
+                        normalize=normalize,
+                    )
                     if output_hw is not None:
                         voxel = resize_voxel(voxel, output_hw, as_float16=False)
                     if crop_hw is not None:
@@ -442,6 +451,8 @@ def main():
                             "Set to 0 to disable crop (store at resize resolution).")
     parser.add_argument("--float16", action="store_true",
                        help="Store voxels as float16 instead of float32 (2x extra space saving).")
+    parser.add_argument("--no_normalize", "--no-normalize", action="store_true",
+                       help="Store raw accumulated voxel event counts without mean/std normalization.")
     parser.add_argument("--no-hw-trigger", action="store_true", dest="no_hw_trigger",
                        help="Disable hardware-trigger-based voxel alignment (enabled by default). "
                             "By default each voxel window is centred on the hardware trigger timestamp "
@@ -494,6 +505,8 @@ def main():
                   f"~{native_px/out_px:.1f}x smaller per voxel)")
     if args.float16:
         print("Dtype: float16 (2x additional saving vs float32)")
+    normalize = not args.no_normalize
+    print(f"Voxel normalization: {'ON' if normalize else 'OFF'}")
     print(f"Overwrite: {args.overwrite}")
     hw_trigger = not args.no_hw_trigger
     if hw_trigger:
@@ -512,7 +525,7 @@ def main():
         for seq_dir in tqdm(dirs, desc="Processing", position=0, leave=True):
             result = process_sequence(
                 seq_dir, args.num_bins, args.overwrite, output_hw, args.float16, crop_hw,
-                show_progress=show_prog, hw_trigger=hw_trigger,
+                show_progress=show_prog, hw_trigger=hw_trigger, normalize=normalize,
             )
             results.append(result)
             if result["success"]:
@@ -532,7 +545,7 @@ def main():
                 futures = {
                     executor.submit(
                         process_sequence, seq_dir, args.num_bins, args.overwrite,
-                        output_hw, args.float16, crop_hw, False, hw_trigger
+                        output_hw, args.float16, crop_hw, False, hw_trigger, normalize
                     ): seq_dir
                     for seq_dir in sequence_dirs
                 }
