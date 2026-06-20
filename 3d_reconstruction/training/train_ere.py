@@ -39,6 +39,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from train_unet import DEPTH_MIN, D_MAX, NUM_BINS, _SCRIPT_DIR, DATA_ROOT, compute_loss, _l1_metres
 from train_unet_table import _load_event_K_native
+from tensorboard_runs import DEFAULT_TB_ROOT, tensorboard_run_dir
 from viz import VizLogger
 
 
@@ -691,7 +692,8 @@ def run_epoch(
                 print(
                     f"  [{phase} {n_batches:4d}/{len(loader)} batches] "
                     f"loss {total_loss / n_batches:.4f} "
-                    f"L1 {total_l1 / n_batches:.4f} m"
+                    f"L1 {total_l1 / n_batches:.4f} m",
+                    flush=True,
                 )
                 if writer is not None:
                     writer.add_scalar(f"loss/{phase}_running", total_loss / n_batches, step_value)
@@ -751,6 +753,8 @@ def main() -> None:
                         help="Fill pixels with no measurement using the table-plane prior")
     parser.add_argument("--name", type=str, default=None,
                         help="Run name used in checkpoint filenames. Prompted if not provided.")
+    parser.add_argument("--tb_root", type=Path, default=DEFAULT_TB_ROOT,
+                        help="Shared TensorBoard root. Runs are logged under <tb_root>/ereformer/<name>.")
     args = parser.parse_args()
 
     if args.name is None:
@@ -851,7 +855,9 @@ def main() -> None:
     )
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter(log_dir=str(args.out_dir / "tb" / args.name))
+    tb_log_dir = tensorboard_run_dir("ereformer", args.name, args.tb_root)
+    writer = SummaryWriter(log_dir=str(tb_log_dir))
+    print(f"TensorBoard: {tb_log_dir}")
     viz_train = VizLogger(writer, n_samples=4, tag="viz/train", show_mask=not args.no_mask)
     viz_val = VizLogger(writer, n_samples=4, tag="viz/val", show_mask=not args.no_mask)
 
@@ -896,7 +902,8 @@ def main() -> None:
             f"loss: {tr_loss:.4f}/{va_loss:.4f} "
             f"L1: {tr_l1:.4f}/{va_l1:.4f} m "
             f"LR: {lr_cur:.2e} "
-            f"VRAM: {vram_a:.0f}/{vram_r:.0f} MB"
+            f"VRAM: {vram_a:.0f}/{vram_r:.0f} MB",
+            flush=True,
         )
 
         writer.add_scalar("loss/train", tr_loss, epoch)
@@ -921,11 +928,11 @@ def main() -> None:
         if va_l1 < best_val_l1:
             best_val_l1 = va_l1
             torch.save(last_ckpt, args.out_dir / f"best_{args.name}.pth")
-            print(f"  -> new best checkpoint (val L1 = {va_l1:.4f} m)")
+            print(f"  -> new best checkpoint (val L1 = {va_l1:.4f} m)", flush=True)
 
     torch.save(last_ckpt, args.out_dir / f"last_{args.name}.pth")
     writer.close()
-    print(f"\nDone. Best val L1: {best_val_l1:.4f} m")
+    print(f"\nDone. Best val L1: {best_val_l1:.4f} m", flush=True)
 
 
 if __name__ == "__main__":

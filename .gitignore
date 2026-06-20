@@ -8,3 +8,5 @@
 **/*.sbatch
 **/*.sif
 **/*.def
+3d_reconstruction/training/results
+3d_reconstruction/training/debug

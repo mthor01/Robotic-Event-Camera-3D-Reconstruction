@@ -319,3 +319,389 @@ class VizLogger:
         self.writer.add_image(self.tag, panel, global_step=step)
         self.writer.flush()   # force write to disk so TensorBoard shows images immediately
         self.reset()
+
+
+class EventActivityAccuracyLogger:
+    """
+    Tracks how total event activity relates to per-frame prediction error.
+
+    TensorBoard outputs:
+        <tag>/scatter_activity_vs_l1
+        <tag>/corr_activity_vs_l1
+        <tag>/corr_activity_vs_accuracy
+        <tag>/mean_l1_by_activity_bin_XX
+    """
+
+    def __init__(
+        self,
+        writer: SummaryWriter,
+        tag: str = "event_activity_accuracy",
+        max_samples: int = 20000,
+        n_bins: int = 8,
+    ) -> None:
+        self.writer = writer
+        self.tag = tag.rstrip("/")
+        self.max_samples = max_samples
+        self.n_bins = n_bins
+        self._activity: List[float] = []
+        self._l1: List[float] = []
+        self._seen = 0
+        self._rng = np.random.default_rng()
+
+    def reset(self) -> None:
+        self._activity.clear()
+        self._l1.clear()
+        self._seen = 0
+
+    def add_batch(
+        self,
+        voxels: torch.Tensor,  # (B, C, H, W)
+        depth: torch.Tensor,   # (B, 1, H, W), metres
+        mask: torch.Tensor,    # (B, 1, H, W)
+        pred: torch.Tensor,    # (B, 1, H, W), metres
+    ) -> None:
+        with torch.no_grad():
+            activity = voxels.detach().abs().sum(dim=(1, 2, 3)).float().cpu().numpy()
+            valid = mask.detach() > 0.5
+            err = (pred.detach() - depth.detach()).abs()
+
+            valid_count = valid.flatten(1).sum(dim=1)
+            err_sum = (err * valid.float()).flatten(1).sum(dim=1)
+            l1 = torch.where(
+                valid_count > 0,
+                err_sum / valid_count.clamp(min=1),
+                torch.full_like(err_sum, float("nan")),
+            ).float().cpu().numpy()
+
+        for a, e in zip(activity, l1):
+            if not np.isfinite(e):
+                continue
+
+            self._seen += 1
+            if len(self._activity) < self.max_samples:
+                self._activity.append(float(a))
+                self._l1.append(float(e))
+                continue
+
+            j = int(self._rng.integers(0, self._seen))
+            if j < self.max_samples:
+                self._activity[j] = float(a)
+                self._l1[j] = float(e)
+
+    @staticmethod
+    def _corr(x: np.ndarray, y: np.ndarray) -> float:
+        if x.size < 2 or float(np.std(x)) < 1e-12 or float(np.std(y)) < 1e-12:
+            return 0.0
+        return float(np.corrcoef(x, y)[0, 1])
+
+    def flush(self, step: int) -> None:
+        if not self._activity:
+            return
+
+        activity = np.asarray(self._activity, dtype=np.float32)
+        l1 = np.asarray(self._l1, dtype=np.float32)
+        accuracy = 1.0 / (1.0 + l1)
+
+        self.writer.add_scalar(f"{self.tag}/corr_activity_vs_l1", self._corr(activity, l1), step)
+        self.writer.add_scalar(
+            f"{self.tag}/corr_activity_vs_accuracy",
+            self._corr(activity, accuracy),
+            step,
+        )
+        self.writer.add_scalar(f"{self.tag}/mean_activity", float(activity.mean()), step)
+        self.writer.add_scalar(f"{self.tag}/mean_l1", float(l1.mean()), step)
+
+        order = np.argsort(activity)
+        chunks = np.array_split(order, self.n_bins)
+        for i, idx in enumerate(chunks):
+            if idx.size == 0:
+                continue
+            self.writer.add_scalar(
+                f"{self.tag}/mean_l1_by_activity_bin_{i:02d}",
+                float(l1[idx].mean()),
+                step,
+            )
+
+        try:
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(6.0, 4.0), dpi=120)
+            ax.scatter(activity, l1, s=8, alpha=0.35, linewidths=0)
+            ax.set_xlabel("Total event activity per frame")
+            ax.set_ylabel("Mean absolute depth error [m]")
+            ax.set_title("Event activity vs prediction error")
+            ax.grid(True, alpha=0.25)
+            self.writer.add_figure(f"{self.tag}/scatter_activity_vs_l1", fig, step, close=True)
+        except Exception:
+            self.writer.add_histogram(f"{self.tag}/activity", activity, step)
+            self.writer.add_histogram(f"{self.tag}/l1", l1, step)
+
+        self.writer.flush()
+        self.reset()
+
+
+class UncertaintyErrorLogger:
+    """
+    Tracks how predicted uncertainty relates to absolute depth error.
+
+    TensorBoard outputs:
+        <tag>/scatter_uncertainty_vs_error
+        <tag>/corr_uncertainty_vs_error
+        <tag>/mean_error_by_uncertainty_bin_XX
+    """
+
+    def __init__(
+        self,
+        writer: SummaryWriter,
+        tag: str = "uncertainty_error",
+        max_samples: int = 20000,
+        max_batch_samples: int = 4096,
+        n_bins: int = 8,
+        images_only: bool = False,
+    ) -> None:
+        self.writer = writer
+        self.tag = tag.rstrip("/")
+        self.max_samples = max_samples
+        self.max_batch_samples = max_batch_samples
+        self.n_bins = n_bins
+        self.images_only = images_only
+        self._uncertainty: List[float] = []
+        self._error: List[float] = []
+        self._seen = 0
+        self._rng = np.random.default_rng()
+
+    def reset(self) -> None:
+        self._uncertainty.clear()
+        self._error.clear()
+        self._seen = 0
+
+    def add_batch(
+        self,
+        uncertainty: torch.Tensor,  # (B, 1, H, W), metres
+        pred: torch.Tensor,         # (B, 1, H, W), metres
+        depth: torch.Tensor,        # (B, 1, H, W), metres
+        mask: torch.Tensor,         # (B, 1, H, W)
+    ) -> None:
+        with torch.no_grad():
+            valid = (mask.detach() > 0.5).flatten()
+            unc = uncertainty.detach().flatten()[valid].float().cpu().numpy()
+            err = (pred.detach() - depth.detach()).abs().flatten()[valid].float().cpu().numpy()
+
+        if unc.size == 0:
+            return
+
+        if unc.size > self.max_batch_samples:
+            idx = self._rng.choice(unc.size, size=self.max_batch_samples, replace=False)
+            unc = unc[idx]
+            err = err[idx]
+
+        for u, e in zip(unc, err):
+            if not np.isfinite(u) or not np.isfinite(e):
+                continue
+
+            self._seen += 1
+            if len(self._uncertainty) < self.max_samples:
+                self._uncertainty.append(float(u))
+                self._error.append(float(e))
+                continue
+
+            j = int(self._rng.integers(0, self._seen))
+            if j < self.max_samples:
+                self._uncertainty[j] = float(u)
+                self._error[j] = float(e)
+
+    @staticmethod
+    def _corr(x: np.ndarray, y: np.ndarray) -> float:
+        if x.size < 2 or float(np.std(x)) < 1e-12 or float(np.std(y)) < 1e-12:
+            return 0.0
+        return float(np.corrcoef(x, y)[0, 1])
+
+    def flush(self, step: int) -> None:
+        if not self._uncertainty:
+            return
+
+        uncertainty = np.asarray(self._uncertainty, dtype=np.float32)
+        error = np.asarray(self._error, dtype=np.float32)
+
+        if not self.images_only:
+            self.writer.add_scalar(
+                f"{self.tag}/corr_uncertainty_vs_error",
+                self._corr(uncertainty, error),
+                step,
+            )
+            self.writer.add_scalar(
+                f"{self.tag}/mean_uncertainty_m",
+                float(uncertainty.mean()),
+                step,
+            )
+            self.writer.add_scalar(f"{self.tag}/mean_error_m", float(error.mean()), step)
+
+            order = np.argsort(uncertainty)
+            chunks = np.array_split(order, self.n_bins)
+            for i, idx in enumerate(chunks):
+                if idx.size == 0:
+                    continue
+                self.writer.add_scalar(
+                    f"{self.tag}/mean_error_by_uncertainty_bin_{i:02d}",
+                    float(error[idx].mean()),
+                    step,
+                )
+
+        try:
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(6.0, 4.0), dpi=120)
+            ax.scatter(uncertainty, error, s=4, alpha=0.25, linewidths=0)
+            ax.set_xlabel("Predicted uncertainty [m]")
+            ax.set_ylabel("Absolute depth error [m]")
+            ax.set_title("Uncertainty vs prediction error")
+            ax.grid(True, alpha=0.25)
+            self.writer.add_figure(f"{self.tag}/scatter_uncertainty_vs_error", fig, step, close=True)
+        except Exception:
+            if self.images_only:
+                raise
+            self.writer.add_histogram(f"{self.tag}/uncertainty_m", uncertainty, step)
+            self.writer.add_histogram(f"{self.tag}/error_m", error, step)
+
+        self.writer.flush()
+        self.reset()
+
+
+class ErrorDistributionSpatialLogger:
+    """
+    Logs absolute depth error distribution and where errors occur in the image.
+
+    TensorBoard outputs:
+        <tag>/distribution
+        <tag>/spatial_mean_error
+    """
+
+    def __init__(
+        self,
+        writer: SummaryWriter,
+        tag: str = "error",
+        max_samples: int = 20000,
+        max_batch_samples: int = 4096,
+        images_only: bool = False,
+    ) -> None:
+        self.writer = writer
+        self.tag = tag.rstrip("/")
+        self.max_samples = max_samples
+        self.max_batch_samples = max_batch_samples
+        self.images_only = images_only
+        self._errors: List[float] = []
+        self._seen = 0
+        self._rng = np.random.default_rng()
+        self._sum: np.ndarray | None = None
+        self._count: np.ndarray | None = None
+
+    def reset(self) -> None:
+        self._errors.clear()
+        self._seen = 0
+        self._sum = None
+        self._count = None
+
+    def add_batch(
+        self,
+        pred: torch.Tensor,   # (B, 1, H, W), metres
+        depth: torch.Tensor,  # (B, 1, H, W), metres
+        mask: torch.Tensor,   # (B, 1, H, W)
+    ) -> None:
+        with torch.no_grad():
+            err = (pred.detach() - depth.detach()).abs()
+            valid = mask.detach() > 0.5
+
+            err_np = err[:, 0].float().cpu().numpy()
+            valid_np = valid[:, 0].float().cpu().numpy()
+            vals = err[valid].float().cpu().numpy()
+
+        if vals.size > self.max_batch_samples:
+            idx = self._rng.choice(vals.size, size=self.max_batch_samples, replace=False)
+            vals = vals[idx]
+
+        if self._sum is None:
+            self._sum = np.zeros_like(err_np[0], dtype=np.float64)
+            self._count = np.zeros_like(err_np[0], dtype=np.float64)
+
+        self._sum += (err_np * valid_np).sum(axis=0)
+        self._count += valid_np.sum(axis=0)
+
+        for e in vals:
+            if not np.isfinite(e):
+                continue
+
+            self._seen += 1
+            if len(self._errors) < self.max_samples:
+                self._errors.append(float(e))
+                continue
+
+            j = int(self._rng.integers(0, self._seen))
+            if j < self.max_samples:
+                self._errors[j] = float(e)
+
+    def flush(self, step: int) -> None:
+        if not self._errors or self._sum is None or self._count is None:
+            return
+
+        errors = np.asarray(self._errors, dtype=np.float32)
+        mean_m = float(errors.mean())
+        median_m = float(np.median(errors))
+        p95_m = float(np.percentile(errors, 95))
+        if self.images_only:
+            import matplotlib.pyplot as plt
+
+            p99_m = float(np.percentile(errors, 99))
+            upper_m = max(p99_m, 1e-4)
+            fig, ax = plt.subplots(figsize=(7.0, 4.5), dpi=120)
+            ax.hist(
+                np.clip(errors, 0.0, upper_m),
+                bins=60,
+                color="#4472c4",
+                alpha=0.9,
+            )
+            ax.axvline(
+                min(mean_m, upper_m),
+                color="#c55a11",
+                linewidth=1.5,
+                label=f"mean {mean_m * 100:.2f} cm",
+            )
+            ax.axvline(
+                min(median_m, upper_m),
+                color="#70ad47",
+                linewidth=1.5,
+                label=f"median {median_m * 100:.2f} cm",
+            )
+            ax.axvline(
+                min(p95_m, upper_m),
+                color="#8064a2",
+                linewidth=1.5,
+                label=f"p95 {p95_m * 100:.2f} cm",
+            )
+            ax.set_xlabel("Absolute depth error [m]")
+            ax.set_ylabel("Sampled valid pixels")
+            ax.set_title(f"Error distribution at step {step} (clipped at p99)")
+            ax.grid(axis="y", alpha=0.25)
+            ax.legend()
+            fig.tight_layout()
+            self.writer.add_figure(
+                f"{self.tag}/distribution_at_step",
+                fig,
+                global_step=step,
+                close=True,
+            )
+        else:
+            self.writer.add_histogram(f"{self.tag}/distribution", errors, step)
+            self.writer.add_scalar(f"{self.tag}/mean_m", mean_m, step)
+            self.writer.add_scalar(f"{self.tag}/median_m", median_m, step)
+            self.writer.add_scalar(f"{self.tag}/p95_m", p95_m, step)
+
+        mean_error = self._sum / np.maximum(self._count, 1.0)
+        valid_pixels = self._count > 0
+        vmax = float(np.percentile(mean_error[valid_pixels], 98)) if np.any(valid_pixels) else 0.0
+        heat01 = _norm01(mean_error.astype(np.float32), vmin=0.0, vmax=max(vmax, 1e-6))
+        heat = _colorize(heat01, _cmap_plasma())
+        heat[:, ~valid_pixels] = _INVALID_VALUE
+
+        self.writer.add_image(f"{self.tag}/spatial_mean_error", heat, global_step=step)
+        self.writer.flush()
+        self.reset()

@@ -331,6 +331,21 @@ def _l1_metres(pred_norm: torch.Tensor, depth_gt: torch.Tensor,
     return (torch.abs(pred_m - depth_gt) * mask).sum() / mask.sum().clamp_min(1.0)
 
 
+def _worst_percent_l1_metres(
+    pred_norm: torch.Tensor,
+    depth_gt: torch.Tensor,
+    mask: torch.Tensor,
+    percent: float = 0.10,
+) -> torch.Tensor:
+    """Mean metric L1 over the worst valid pixels in each batch."""
+    pred_m = pred_norm * (D_MAX - DEPTH_MIN) + DEPTH_MIN
+    err = torch.abs(pred_m - depth_gt)[mask > 0.5]
+    if err.numel() == 0:
+        return pred_m.sum() * 0.0
+    k = max(1, int(np.ceil(err.numel() * percent)))
+    return torch.topk(err, k=min(k, err.numel()), largest=True).values.mean()
+
+
 _pixel_grid_cache: dict = {}
 
 

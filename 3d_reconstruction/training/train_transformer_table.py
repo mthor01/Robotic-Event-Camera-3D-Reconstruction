@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-train_unet_table.py - Single-frame UNet with table-plane prior channel.
+train_transformer_table.py - Single-frame transformer depth model with table-plane prior channel.
 
-Feeds the U-Net the target event voxels together with one additional channel
+Feeds a transformer-based dense depth model the target event voxels together with one additional channel
 that encodes the table plane directly in the image plane:
 
     [x_t | table_plane_channel]
@@ -17,10 +17,9 @@ that encodes the table plane directly in the image plane:
 Default input channels: NUM_BINS + 1
 
 Usage:
-    python3 training/train_unet_table.py
-    python3 training/train_unet_table.py --data_dir data/lego/lego_1
-    python3 training/train_unet_table.py --table_z 0.02
-    python3 training/train_unet_table.py --model_scale 2.0
+    python3 training/train_transformer_table.py
+    python3 training/train_transformer_table.py --data_dir data/lego/lego_1
+    python3 training/train_transformer_table.py --patch_size 4 --embed_dim 192 --depth 8 --num_heads 6
 """
 
 import argparse
@@ -37,7 +36,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from train_unet import (
     DEPTH_MIN, D_MAX, NUM_BINS, _SCRIPT_DIR, DATA_ROOT,
-    UNet, compute_loss, _l1_metres, _worst_percent_l1_metres,
+    compute_loss, _l1_metres, _worst_percent_l1_metres,
 )
 from tensorboard_runs import DEFAULT_TB_ROOT, tensorboard_run_dir
 from viz import (
@@ -229,31 +228,146 @@ class TablePriorDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Optional uncertainty head
+# Transformer depth model
 # ---------------------------------------------------------------------------
 
-class UncertaintyUNet(UNet):
-    """UNet variant that predicts depth plus log variance in normalised depth units."""
+class ConvBlock(nn.Module):
+    """Small convolutional refinement block used before/after the transformer."""
 
-    def __init__(self, in_ch: int, base: int):
-        super().__init__(in_ch=in_ch, base=base)
-        self.head = nn.Conv2d(base, 2, kernel_size=1)
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.GELU(),
+            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.GELU(),
+        )
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        feat = self.stem(x)
-        skips = [feat]
-        for i, enc in enumerate(self.encoders):
-            feat = enc(feat)
-            if i < len(self.encoders) - 1:
-                skips.append(feat)
-        feat = self.bottleneck(feat)
-        for i, dec in enumerate(self.decoders):
-            feat = dec(feat, skips[-(i + 1)])
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def _build_2d_sincos_position_embedding(
+    h: int,
+    w: int,
+    dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return fixed 2D sin/cos positional embeddings with shape (1, H*W, dim)."""
+    if dim % 4 != 0:
+        raise ValueError("embed_dim must be divisible by 4 for 2D sin/cos positional encoding")
+
+    y, x = torch.meshgrid(
+        torch.arange(h, device=device, dtype=dtype),
+        torch.arange(w, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    omega = torch.arange(dim // 4, device=device, dtype=dtype)
+    omega = 1.0 / (10000 ** (omega / max(dim // 4, 1)))
+
+    out_x = x.reshape(-1, 1) * omega.reshape(1, -1)
+    out_y = y.reshape(-1, 1) * omega.reshape(1, -1)
+    pos = torch.cat([out_x.sin(), out_x.cos(), out_y.sin(), out_y.cos()], dim=1)
+    return pos.unsqueeze(0)
+
+
+class EventDepthTransformer(nn.Module):
+    """
+    Single-frame transformer for dense event-camera depth prediction.
+
+    Pipeline:
+        input image/grid -> convolutional stem -> patch tokens -> transformer encoder
+        -> reshape tokens to feature map -> convolutional upsampling decoder -> depth map.
+
+    This is intentionally close to a SegFormer/DPT-style dense predictor, but small
+    enough to train from scratch on project-scale data.
+    """
+
+    def __init__(
+        self,
+        in_ch: int,
+        base: int = 32,
+        embed_dim: int = 192,
+        depth: int = 8,
+        num_heads: int = 6,
+        mlp_ratio: float = 4.0,
+        patch_size: int = 4,
+        dropout: float = 0.0,
+        predict_uncertainty: bool = False,
+    ):
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError("embed_dim must be divisible by num_heads")
+        if embed_dim % 4 != 0:
+            raise ValueError("embed_dim must be divisible by 4")
+
+        self.patch_size = patch_size
+        self.predict_uncertainty = predict_uncertainty
+
+        self.stem = nn.Sequential(
+            ConvBlock(in_ch, base),
+            ConvBlock(base, base),
+        )
+        self.patch_embed = nn.Conv2d(
+            base, embed_dim, kernel_size=patch_size, stride=patch_size
+        )
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=depth)
+        self.norm = nn.LayerNorm(embed_dim)
+
+        self.decoder = nn.Sequential(
+            ConvBlock(embed_dim + base, base * 4),
+            nn.Conv2d(base * 4, base * 2, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(base * 2, base, kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+        self.head = nn.Conv2d(base, 2 if predict_uncertainty else 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor):
+        b, _, h, w = x.shape
+        stem = self.stem(x)
+
+        # Pad so patch embedding works for arbitrary H/W.
+        pad_h = (self.patch_size - h % self.patch_size) % self.patch_size
+        pad_w = (self.patch_size - w % self.patch_size) % self.patch_size
+        stem_pad = F.pad(stem, (0, pad_w, 0, pad_h), mode="replicate")
+
+        feat = self.patch_embed(stem_pad)          # (B, D, Hp, Wp)
+        _, d, hp, wp = feat.shape
+        tokens = feat.flatten(2).transpose(1, 2)   # (B, Hp*Wp, D)
+        tokens = tokens + _build_2d_sincos_position_embedding(
+            hp, wp, d, tokens.device, tokens.dtype
+        )
+        tokens = self.encoder(tokens)
+        tokens = self.norm(tokens)
+
+        feat = tokens.transpose(1, 2).reshape(b, d, hp, wp)
+        feat = F.interpolate(feat, size=stem.shape[-2:], mode="bilinear", align_corners=False)
+        feat = torch.cat([feat, stem], dim=1)
+        feat = self.decoder(feat)
 
         out = self.head(feat)
-        pred = torch.sigmoid(out[:, :1])
-        log_var = out[:, 1:2].clamp(min=-6.0, max=3.0)
-        return pred, log_var
+        if out.shape[-2:] != (h, w):
+            out = out[..., :h, :w]
+
+        if self.predict_uncertainty:
+            pred = torch.sigmoid(out[:, :1])
+            log_var = out[:, 1:2].clamp(min=-6.0, max=3.0)
+            return pred, log_var
+        return torch.sigmoid(out)
 
 
 def uncertainty_nll_loss(
@@ -276,7 +390,7 @@ def uncertainty_metres(log_var: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 def run_epoch(
-    model:     UNet,
+    model:     nn.Module,
     loader:    DataLoader,
     optimizer: torch.optim.Optimizer | None,
     device:    torch.device,
@@ -370,7 +484,7 @@ def run_epoch(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Single-frame UNet with table-plane prior channel"
+        description="Single-frame transformer depth model with table-plane prior channel"
     )
     parser.add_argument("--data_dir",      type=Path, default=DATA_ROOT,
                         help="Single sequence dir or parent of multiple sequences")
@@ -379,10 +493,19 @@ def main() -> None:
     parser.add_argument("--lr",            type=float, default=1e-3)
     parser.add_argument("--workers",       type=int,  default=4)
     parser.add_argument("--base_channels", type=int,  default=32)
-    parser.add_argument("--model_scale",   type=float, default=1.0,
-                        help="Width multiplier for base_channels")
+    parser.add_argument("--embed_dim",     type=int,   default=192,
+                        help="Transformer token dimension; must be divisible by --num_heads and 4")
+    parser.add_argument("--depth",         type=int,   default=8,
+                        help="Number of transformer encoder layers")
+    parser.add_argument("--num_heads",     type=int,   default=6,
+                        help="Number of transformer attention heads")
+    parser.add_argument("--mlp_ratio",     type=float, default=4.0,
+                        help="Transformer MLP expansion ratio")
+    parser.add_argument("--patch_size",    type=int,   default=4,
+                        help="Patch size / token stride. Use 4 for 240x320; 8 for lower VRAM.")
+    parser.add_argument("--dropout",       type=float, default=0.0)
     parser.add_argument("--out_dir",       type=Path,
-                        default=_SCRIPT_DIR / "checkpoints" / "unet_table")
+                        default=_SCRIPT_DIR / "checkpoints" / "transformer_table")
     parser.add_argument("--seed",          type=int,  default=42)
     parser.add_argument("--table_z",       type=float, default=None,
                         help="Optional: override for --debug / informational use. "
@@ -400,11 +523,8 @@ def main() -> None:
     parser.add_argument("--name",          type=str, default=None,
                         help="Run name used in checkpoint filenames. Prompted if not provided.")
     parser.add_argument("--tb_root",       type=Path, default=DEFAULT_TB_ROOT,
-                        help="Shared TensorBoard root. Runs are logged under <tb_root>/unet_table/<name>.")
+                        help="Shared TensorBoard root. Runs are logged under <tb_root>/transformer_table/<name>.")
     args = parser.parse_args()
-
-    if args.model_scale <= 0:
-        parser.error("--model_scale must be > 0")
 
     if args.name is None:
         args.name = input("Enter a run name for the checkpoints: ").strip()
@@ -488,11 +608,17 @@ def main() -> None:
     # ── Model ──────────────────────────────────────────────────────────────
     in_ch  = NUM_BINS + 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    base_channels = max(1, int(round(args.base_channels * args.model_scale)))
-    if args.predict_uncertainty:
-        model = UncertaintyUNet(in_ch=in_ch, base=base_channels).to(device)
-    else:
-        model = UNet(in_ch=in_ch, base=base_channels).to(device)
+    model = EventDepthTransformer(
+        in_ch=in_ch,
+        base=args.base_channels,
+        embed_dim=args.embed_dim,
+        depth=args.depth,
+        num_heads=args.num_heads,
+        mlp_ratio=args.mlp_ratio,
+        patch_size=args.patch_size,
+        dropout=args.dropout,
+        predict_uncertainty=args.predict_uncertainty,
+    ).to(device)
 
     # K for loss: scale native K to a representative crop resolution
     K_loss = K_native.copy()
@@ -501,11 +627,10 @@ def main() -> None:
     K_tensor = torch.from_numpy(K_loss).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    model_name = "UNet+uncertainty" if args.predict_uncertainty else "UNet"
-    print(
-        f"{model_name}  in_ch={in_ch}  model_scale={args.model_scale:g}  "
-        f"base={base_channels}  parameters: {n_params:,}"
-    )
+    model_name = "EventDepthTransformer+uncertainty" if args.predict_uncertainty else "EventDepthTransformer"
+    print(f"{model_name}  in_ch={in_ch}  base={args.base_channels}  "
+          f"embed={args.embed_dim} depth={args.depth} heads={args.num_heads} "
+          f"patch={args.patch_size}  parameters: {n_params:,}")
     print(f"  {NUM_BINS} (voxels) + 1 (table-plane channel) = {in_ch} channels")
     if args.predict_uncertainty:
         print(f"  Uncertainty head enabled; primary NLL weight = {args.uncertainty_weight:g}")
@@ -519,7 +644,7 @@ def main() -> None:
 
     # ── Logging ───────────────────────────────────────────────────────────
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    tb_log_dir = tensorboard_run_dir("unet_table", args.name, args.tb_root)
+    tb_log_dir = tensorboard_run_dir("transformer_table", args.name, args.tb_root)
     writer = SummaryWriter(log_dir=str(tb_log_dir))
     print(f"TensorBoard: {tb_log_dir}")
     viz_train = VizLogger(writer, n_samples=4, tag="viz/train", show_mask=not args.no_mask)
@@ -592,9 +717,14 @@ def main() -> None:
             "epoch":   epoch,
             "model":   model.state_dict(),
             "val_l1":  va_l1,
-            "base":    base_channels,
-            "base_channels_arg": args.base_channels,
-            "model_scale": args.model_scale,
+            "base":    args.base_channels,
+            "embed_dim": args.embed_dim,
+            "depth": args.depth,
+            "num_heads": args.num_heads,
+            "mlp_ratio": args.mlp_ratio,
+            "patch_size": args.patch_size,
+            "dropout": args.dropout,
+            "architecture": "EventDepthTransformer",
             "in_ch":   in_ch,
             "table_z": table_z_ckpt,
             "predict_uncertainty": args.predict_uncertainty,

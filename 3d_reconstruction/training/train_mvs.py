@@ -45,6 +45,10 @@ from torch.utils.tensorboard import SummaryWriter
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR))
+sys.path.insert(0, str(_SCRIPT_DIR.parent))
+from config import DEPTH_MIN, D_MAX, NUM_BINS
+from tensorboard_runs import DEFAULT_TB_ROOT, tensorboard_run_dir
+from train_unet import compute_loss
 from viz import VizLogger
 
 
@@ -77,26 +81,46 @@ def scale_K(K: np.ndarray, native_hw: Tuple[int, int], target_hw: Tuple[int, int
     return K2.astype(np.float32)
 
 
-def projection_matrix(K: np.ndarray, T_cam_from_world: np.ndarray) -> np.ndarray:
-    return (K @ T_cam_from_world[:3, :]).astype(np.float32)
-
-
 def make_depth_values(depth_min: float, depth_max: float, num_depth: int) -> np.ndarray:
+    if num_depth < 2:
+        raise ValueError(f"num_depth must be >= 2, got {num_depth}")
+    if depth_max <= depth_min:
+        raise ValueError(f"depth_max must be > depth_min, got {depth_min}..{depth_max}")
     return np.linspace(depth_min, depth_max, num_depth, dtype=np.float32)
+
+
+def normalize_depth(depth_m: torch.Tensor, depth_min: float, depth_max: float) -> torch.Tensor:
+    return ((depth_m - depth_min) / (depth_max - depth_min)).clamp(0.0, 1.0)
+
+
+def l1_metres_from_norm(
+    pred_norm: torch.Tensor,
+    depth_gt: torch.Tensor,
+    mask: torch.Tensor,
+    depth_min: float,
+    depth_max: float,
+) -> torch.Tensor:
+    pred_m = pred_norm * (depth_max - depth_min) + depth_min
+    valid = mask > 0.5
+    if valid.sum() == 0:
+        return pred_m.sum() * 0.0
+    return (pred_m[valid] - depth_gt[valid]).abs().mean()
 
 
 def homo_warping(
     src_feat: torch.Tensor,
-    src_proj: torch.Tensor,
-    ref_proj: torch.Tensor,
+    src_T_cam_from_world: torch.Tensor,
+    ref_T_cam_from_world: torch.Tensor,
+    K: torch.Tensor,
     depth_values: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Differentiable homography warping.
+    Differentiable source-feature warping into the reference frustum.
 
-    src_feat:     (B,C,H,W)
-    src_proj:     (B,3,4), K_s [R_s|t_s]
-    ref_proj:     (B,3,4), K_r [R_r|t_r]
+    src_feat:             (B,C,H,W)
+    src_T_cam_from_world: (B,4,4)
+    ref_T_cam_from_world: (B,4,4)
+    K:                    (B,3,3), scaled to feature resolution
     depth_values: (B,D) or (D,)
 
     Returns:
@@ -106,18 +130,11 @@ def homo_warping(
     device = src_feat.device
     dtype = src_feat.dtype
 
+    K = K.to(device=device, dtype=dtype)
     if depth_values.dim() == 1:
         depth_values = depth_values[None].repeat(B, 1)
+    depth_values = depth_values.to(device=device, dtype=dtype)
     D = depth_values.shape[1]
-
-    ref_4x4 = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
-    src_4x4 = torch.eye(4, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1)
-    ref_4x4[:, :3, :] = ref_proj
-    src_4x4[:, :3, :] = src_proj
-
-    proj = (src_4x4.float() @ torch.linalg.inv(ref_4x4.float())).to(dtype)
-    R = proj[:, :3, :3]
-    t = proj[:, :3, 3:4]
 
     y, x = torch.meshgrid(
         torch.arange(H, device=device, dtype=dtype),
@@ -127,16 +144,28 @@ def homo_warping(
     xyz = torch.stack((x.reshape(-1), y.reshape(-1), torch.ones(H * W, device=device, dtype=dtype)), dim=0)
     xyz = xyz.unsqueeze(0).repeat(B, 1, 1)  # (B,3,HW)
 
-    rot_xyz = R @ xyz  # (B,3,HW)
-    rot_depth_xyz = rot_xyz.unsqueeze(2) * depth_values[:, None, :, None]  # (B,3,D,HW)
-    proj_xyz = rot_depth_xyz + t[:, :, None, :]  # (B,3,D,HW)
+    K_inv = torch.linalg.inv(K.float()).to(dtype)
+    rays_ref = K_inv @ xyz  # (B,3,HW)
+    pts_ref = rays_ref.unsqueeze(2) * depth_values[:, None, :, None]  # (B,3,D,HW)
+    ones = torch.ones((B, 1, D, H * W), device=device, dtype=dtype)
+    pts_ref_h = torch.cat([pts_ref, ones], dim=1).flatten(2)  # (B,4,D*HW)
 
-    z = proj_xyz[:, 2:3].clamp(min=1e-6)
-    x_norm = proj_xyz[:, 0:1] / z
-    y_norm = proj_xyz[:, 1:2] / z
+    T_src_from_ref = (
+        src_T_cam_from_world.float() @ torch.linalg.inv(ref_T_cam_from_world.float())
+    ).to(dtype)
+    pts_src = (T_src_from_ref @ pts_ref_h).view(B, 4, D, H * W)[:, :3]
 
-    x_grid = 2.0 * (x_norm / max(W - 1, 1)) - 1.0
-    y_grid = 2.0 * (y_norm / max(H - 1, 1)) - 1.0
+    front = pts_src[:, 2:3] > 1e-6
+    z = pts_src[:, 2:3].clamp(min=1e-6)
+    pix_src = K[:, None] @ (pts_src / z).permute(0, 2, 1, 3)
+    pix_src = pix_src.permute(0, 2, 1, 3)
+
+    x_grid = 2.0 * (pix_src[:, 0:1] / max(W - 1, 1)) - 1.0
+    y_grid = 2.0 * (pix_src[:, 1:2] / max(H - 1, 1)) - 1.0
+    x_grid = torch.where(front, x_grid, torch.full_like(x_grid, 2.0))
+    y_grid = torch.where(front, y_grid, torch.full_like(y_grid, 2.0))
+    x_grid = torch.nan_to_num(x_grid, nan=2.0, posinf=2.0, neginf=-2.0).clamp(-2.0, 2.0)
+    y_grid = torch.nan_to_num(y_grid, nan=2.0, posinf=2.0, neginf=-2.0).clamp(-2.0, 2.0)
 
     grid = torch.stack((x_grid.squeeze(1), y_grid.squeeze(1)), dim=-1)  # (B,D,HW,2)
     grid = grid.view(B, D * H, W, 2)
@@ -156,7 +185,8 @@ class EventMVSObjectDataset(Dataset):
 
     Returned dict:
         imgs         (V,C+1,H,W): event voxel bins + table-plane/pose-depth channel
-        proj_mats    (V,3,4)
+        cam_mats     (V,4,4), T_cam_from_world
+        K            (3,3), intrinsics scaled to the training resolution
         depth_values (D,)
         depth        (H,W), metric metres
         mask         (H,W)
@@ -199,14 +229,27 @@ class EventMVSObjectDataset(Dataset):
         self.pose_voxel_dir = self.sequence_dir / "events" / "voxels_pose_cam0"
 
         with h5py.File(self.depth_path, "r") as f:
-            self.n_frames = int(f["depth"].shape[0])
+            n_depth = int(f["depth"].shape[0])
             self.orig_hw = (int(f["depth"].shape[1]), int(f["depth"].shape[2]))
+        with h5py.File(self.vox_path, "r") as f:
+            n_vox = int(f["voxels"].shape[0])
+        with h5py.File(self.pose_path, "r") as f:
+            ee_T = f["ee_T"][:].astype(np.float32)
+        counts = [n_depth, n_vox, int(ee_T.shape[0])]
+        if self.table_h5_path.exists():
+            with h5py.File(self.table_h5_path, "r") as f:
+                table_keys = [k for k in ("table_plane", "depth", "table_depth") if k in f]
+                if not table_keys:
+                    raise KeyError(f"{self.table_h5_path} has none of table_plane/depth/table_depth")
+                counts.append(int(f[table_keys[0]].shape[0]))
+        self.n_frames = min(counts)
+        if len(set(counts)) > 1:
+            print(f"  [{self.sequence_dir.name}] frame-count mismatch {counts}; using {self.n_frames}")
 
         target_hw = resize_hw or self.orig_hw
         self.K = scale_K(calib["K"], calib["native_hw"], target_hw)
 
-        with h5py.File(self.pose_path, "r") as f:
-            ee_T = f["ee_T"][:].astype(np.float32)
+        ee_T = ee_T[:self.n_frames]
         T_ee_inv = np.linalg.inv(ee_T)
         self.T_cam_from_world = np.einsum(
             "ij,njk->nik", calib["T_event_from_ee"], T_ee_inv
@@ -224,6 +267,11 @@ class EventMVSObjectDataset(Dataset):
 
         margin = max(abs(o) for o in self.src_offsets) if self.src_offsets else 0
         valid = np.arange(margin, self.n_frames - margin, dtype=np.int64)
+        if len(valid) == 0:
+            raise RuntimeError(
+                f"{self.sequence_dir.name}: not enough frames ({self.n_frames}) for "
+                f"num_views={num_views}, view_interval={view_interval}"
+            )
 
         rng = np.random.default_rng(seed)
         block_size = max(20, 2 * margin + 1)
@@ -242,7 +290,10 @@ class EventMVSObjectDataset(Dataset):
             val_mask[s:e] = True
             count += e - s
 
-        self.indices = valid[val_mask] if split == "val" else valid[~val_mask]
+        if split == "all":
+            self.indices = valid
+        else:
+            self.indices = valid[val_mask] if split == "val" else valid[~val_mask]
         print(
             f"[{self.sequence_dir.name}] {split}: {len(self.indices)} MVS samples, "
             f"views={num_views}, interval={view_interval}, input_hw={target_hw}"
@@ -264,7 +315,10 @@ class EventMVSObjectDataset(Dataset):
             self._h5_msk = h5py.File(self.spatial_mask_path, "r")["mask"]
         if self._h5_tbl is None and self.table_h5_path.exists():
             f = h5py.File(self.table_h5_path, "r")
-            key = "table_plane" if "table_plane" in f else ("depth" if "depth" in f else "table_depth")
+            keys = [k for k in ("table_plane", "depth", "table_depth") if k in f]
+            if not keys:
+                raise KeyError(f"{self.table_h5_path} has none of table_plane/depth/table_depth")
+            key = keys[0]
             self._tbl_key = key
             self._h5_tbl = f[key]
 
@@ -344,6 +398,7 @@ class EventMVSObjectDataset(Dataset):
         d = self._h5_dep[idx].astype(np.float32)
         d = self._resize_hw(d, mode="nearest")
         mask = ((d > self.depth_min) & (d < self.depth_max)).astype(np.float32)
+        d = np.minimum(d, self.depth_max)
 
         if self._h5_msk is not None:
             sp = self._h5_msk[idx].astype(np.float32)
@@ -357,16 +412,17 @@ class EventMVSObjectDataset(Dataset):
         view_ids = [ref_idx] + [ref_idx + o for o in self.src_offsets]
 
         imgs = []
-        proj_mats = []
+        cam_mats = []
         for idx in view_ids:
             imgs.append(self._load_input(idx))
-            proj_mats.append(projection_matrix(self.K, self.T_cam_from_world[idx]))
+            cam_mats.append(self.T_cam_from_world[idx])
 
         depth, mask = self._load_depth_and_mask(ref_idx)
 
         return {
             "imgs": torch.from_numpy(np.stack(imgs)),             # (V,C,H,W)
-            "proj_mats": torch.from_numpy(np.stack(proj_mats)),   # (V,3,4)
+            "cam_mats": torch.from_numpy(np.stack(cam_mats)),     # (V,4,4)
+            "K": torch.from_numpy(self.K),                        # (3,3)
             "depth_values": torch.from_numpy(self.depth_values),  # (D,)
             "depth": torch.from_numpy(depth),                     # (H,W)
             "mask": torch.from_numpy(mask),                       # (H,W)
@@ -378,8 +434,9 @@ class EventMVSObjectDataset(Dataset):
 # ----------------------------
 
 class FeatureNet(nn.Module):
-    def __init__(self, in_channels: int, base_channels: int = 8):
+    def __init__(self, in_channels: int, base_channels: int = 16, feature_channels: Optional[int] = None):
         super().__init__()
+        feature_channels = feature_channels or base_channels * 4
         self.net = nn.Sequential(
             nn.Conv2d(in_channels, base_channels, 3, padding=1, bias=False),
             nn.BatchNorm2d(base_channels),
@@ -399,8 +456,8 @@ class FeatureNet(nn.Module):
             nn.BatchNorm2d(base_channels * 4),
             nn.ReLU(inplace=True),
 
-            nn.Conv2d(base_channels * 4, 32, 3, padding=1, bias=False),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(base_channels * 4, feature_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(feature_channels),
             nn.ReLU(inplace=True),
         )
 
@@ -409,7 +466,7 @@ class FeatureNet(nn.Module):
 
 
 class CostRegNet(nn.Module):
-    def __init__(self, in_channels: int = 32):
+    def __init__(self, in_channels: int, base_channels: int = 16):
         super().__init__()
 
         def conv3d(cin, cout, stride=1):
@@ -420,11 +477,11 @@ class CostRegNet(nn.Module):
             )
 
         self.net = nn.Sequential(
-            conv3d(in_channels, 8),
-            conv3d(8, 16),
-            conv3d(16, 16),
-            conv3d(16, 8),
-            nn.Conv3d(8, 1, 3, padding=1),
+            conv3d(in_channels, base_channels),
+            conv3d(base_channels, base_channels * 2),
+            conv3d(base_channels * 2, base_channels * 2),
+            conv3d(base_channels * 2, base_channels),
+            nn.Conv3d(base_channels, 1, 3, padding=1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -432,20 +489,29 @@ class CostRegNet(nn.Module):
 
 
 class EventMVSNet(nn.Module):
-    def __init__(self, in_channels: int, base_channels: int = 8):
+    def __init__(
+        self,
+        in_channels: int,
+        base_channels: int = 16,
+        feature_channels: Optional[int] = None,
+        cost_channels: int = 16,
+    ):
         super().__init__()
-        self.feature = FeatureNet(in_channels, base_channels)
-        self.cost_reg = CostRegNet(32)
+        feature_channels = feature_channels or base_channels * 4
+        self.feature = FeatureNet(in_channels, base_channels, feature_channels)
+        self.cost_reg = CostRegNet(feature_channels, cost_channels)
 
     def forward(
         self,
         imgs: torch.Tensor,
-        proj_mats: torch.Tensor,
+        cam_mats: torch.Tensor,
+        K: torch.Tensor,
         depth_values: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         imgs:         (B,V,C,H,W)
-        proj_mats:    (B,V,3,4)
+        cam_mats:     (B,V,4,4), T_cam_from_world
+        K:            (B,3,3), intrinsics scaled to input resolution
         depth_values: (B,D) or (D,)
 
         Returns:
@@ -460,26 +526,26 @@ class EventMVSNet(nn.Module):
         _, Fch, Hf, Wf = feats.shape
         feats = feats.view(B, V, Fch, Hf, Wf)
 
-        # Projection matrices must be scaled to feature resolution.
-        proj_feat = proj_mats.clone()
-        proj_feat[:, :, 0, :] *= Wf / W
-        proj_feat[:, :, 1, :] *= Hf / H
+        # Intrinsics must be scaled to feature resolution.
+        K_feat = K.clone()
+        K_feat[:, 0, :] *= Wf / W
+        K_feat[:, 1, :] *= Hf / H
 
         ref_feat = feats[:, 0]
-        ref_proj = proj_feat[:, 0]
+        ref_T = cam_mats[:, 0]
 
         volume_sum = ref_feat.unsqueeze(2).repeat(1, 1, D, 1, 1)
         volume_sq_sum = volume_sum ** 2
 
         for v in range(1, V):
-            warped = homo_warping(feats[:, v], proj_feat[:, v], ref_proj, depth_values)
+            warped = homo_warping(feats[:, v], cam_mats[:, v], ref_T, K_feat, depth_values)
             volume_sum = volume_sum + warped
             volume_sq_sum = volume_sq_sum + warped ** 2
 
         volume_variance = volume_sq_sum / V - (volume_sum / V) ** 2
 
         cost = self.cost_reg(volume_variance)
-        prob = F.softmax(-cost, dim=1)
+        prob = F.softmax(-cost.float(), dim=1).to(cost.dtype)
 
         if depth_values.dim() == 1:
             dv = depth_values[None, :, None, None]
@@ -488,17 +554,6 @@ class EventMVSNet(nn.Module):
         depth_low = torch.sum(prob * dv, dim=1)
         depth = F.interpolate(depth_low[:, None], size=(H, W), mode="bilinear", align_corners=False)[:, 0]
         return depth, prob
-
-
-# ----------------------------
-# Training
-# ----------------------------
-
-def masked_l1(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    valid = mask > 0.5
-    if valid.sum() == 0:
-        return pred.sum() * 0.0
-    return (pred[valid] - target[valid]).abs().mean()
 
 
 @torch.no_grad()
@@ -514,12 +569,16 @@ def validate(model, loader, device, viz: VizLogger | None = None,
 
     for batch in loader:
         imgs = batch["imgs"].to(device, non_blocking=True)
-        proj_mats = batch["proj_mats"].to(device, non_blocking=True)
+        cam_mats = batch["cam_mats"].to(device, non_blocking=True)
+        K = batch["K"].to(device, non_blocking=True)
         depth_values = batch["depth_values"].to(device, non_blocking=True)
         gt = batch["depth"].to(device, non_blocking=True)
         mask = batch["mask"].to(device, non_blocking=True)
 
-        pred, _ = model(imgs, proj_mats, depth_values)
+        pred, _ = model(imgs, cam_mats, K, depth_values)
+        if not torch.isfinite(pred).all():
+            print("  [val] skipping non-finite prediction batch", flush=True)
+            continue
         valid = mask > 0.5
         if valid.sum() == 0:
             continue
@@ -595,25 +654,52 @@ def build_datasets(args):
         resize_hw = (args.resize_h, args.resize_w)
 
     use_spatial_mask = not args.no_mask
+    if len(seqs) > 1 and not args.frame_block_split:
+        rng = np.random.default_rng(args.seed)
+        order = np.arange(len(seqs))
+        rng.shuffle(order)
+        n_val = max(1, round(len(seqs) * args.val_ratio))
+        n_val = min(n_val, len(seqs) - 1)
+        val_seq_ids = set(order[:n_val].tolist())
+        train_seqs = [s for i, s in enumerate(seqs) if i not in val_seq_ids]
+        val_seqs = [s for i, s in enumerate(seqs) if i in val_seq_ids]
+        print(f"Object split: train={ [s.name for s in train_seqs] }")
+        print(f"Object split: val={ [s.name for s in val_seqs] }")
+    else:
+        train_seqs = seqs
+        val_seqs = seqs
+
     train_sets, val_sets = [], []
-    for seq in seqs:
+    for seq in train_seqs:
         try:
             train_sets.append(EventMVSObjectDataset(
                 seq, calib, args.num_views, args.view_interval, args.num_depth,
-                args.depth_min, args.depth_max, resize_hw, args.val_ratio, "train",
-                use_spatial_mask=use_spatial_mask,
-            ))
-            val_sets.append(EventMVSObjectDataset(
-                seq, calib, args.num_views, args.view_interval, args.num_depth,
-                args.depth_min, args.depth_max, resize_hw, args.val_ratio, "val",
+                args.depth_min, args.depth_max, resize_hw, args.val_ratio,
+                "all" if len(seqs) > 1 and not args.frame_block_split else "train",
+                seed=args.seed,
                 use_spatial_mask=use_spatial_mask,
             ))
         except Exception as e:
-            print(f"ERROR loading {seq}: {e}")
+            print(f"ERROR loading train sequence {seq}: {e}")
+            _tb.print_exc()
+
+    for seq in val_seqs:
+        try:
+            val_sets.append(EventMVSObjectDataset(
+                seq, calib, args.num_views, args.view_interval, args.num_depth,
+                args.depth_min, args.depth_max, resize_hw, args.val_ratio,
+                "all" if len(seqs) > 1 and not args.frame_block_split else "val",
+                seed=args.seed,
+                use_spatial_mask=use_spatial_mask,
+            ))
+        except Exception as e:
+            print(f"ERROR loading val sequence {seq}: {e}")
             _tb.print_exc()
 
     if not train_sets:
         raise RuntimeError("No usable sequences after filtering.")
+    if not val_sets:
+        raise RuntimeError("No usable validation sequences after filtering.")
 
     train = ConcatDataset(train_sets) if len(train_sets) > 1 else train_sets[0]
     val = ConcatDataset(val_sets) if len(val_sets) > 1 else val_sets[0]
@@ -630,12 +716,12 @@ def main():
     ap.add_argument("--out", type=str,
                     default=str(_SCRIPT_DIR / "checkpoints" / "event_mvsnet.pt"))
 
-    ap.add_argument("--num_bins", type=int, default=5)
+    ap.add_argument("--num_bins", type=int, default=NUM_BINS)
     ap.add_argument("--num_views", type=int, default=5)
     ap.add_argument("--view_interval", type=int, default=5)
-    ap.add_argument("--num_depth", type=int, default=96)
-    ap.add_argument("--depth_min", type=float, default=0.05)
-    ap.add_argument("--depth_max", type=float, default=2.0)
+    ap.add_argument("--num_depth", type=int, default=128)
+    ap.add_argument("--depth_min", type=float, default=DEPTH_MIN)
+    ap.add_argument("--depth_max", type=float, default=D_MAX)
 
     ap.add_argument("--resize_h", type=int, default=256)
     ap.add_argument("--resize_w", type=int, default=320)
@@ -643,12 +729,21 @@ def main():
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--val_ratio", type=float, default=0.1)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--frame_block_split", action="store_true",
+                    help="Use the old per-sequence frame-block split instead of object-level split")
     ap.add_argument("--num_workers", type=int, default=4)
-    ap.add_argument("--base_channels", type=int, default=8)
+    ap.add_argument("--base_channels", type=int, default=16)
+    ap.add_argument("--feature_channels", type=int, default=0,
+                    help="Feature channels at H/4; 0 means base_channels*4")
+    ap.add_argument("--cost_channels", type=int, default=16,
+                    help="Base channel width for the 3D cost regularizer")
     ap.add_argument("--no_mask", action="store_true",
                     help="Ignore spatial_mask.h5; only pixels with valid depth (>depth_min) are used")
     ap.add_argument("--name", type=str, default=None,
                     help="Run name for checkpoint filename and TensorBoard logs")
+    ap.add_argument("--tb_root", type=Path, default=DEFAULT_TB_ROOT,
+                    help="Shared TensorBoard root. Runs are logged under <tb_root>/mvs/<name>.")
     args = ap.parse_args()
 
     if args.name is None:
@@ -658,18 +753,19 @@ def main():
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-
     train_ds, val_ds = build_datasets(args)
 
     out_dir = Path(args.out).parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    writer    = SummaryWriter(log_dir=str(out_dir / "tb" / args.name))
+    tb_log_dir = tensorboard_run_dir("mvs", args.name, args.tb_root)
+    writer    = SummaryWriter(log_dir=str(tb_log_dir))
+    print(f"TensorBoard: {tb_log_dir}")
     viz_train = VizLogger(writer, n_samples=4, tag="viz/train", show_mask=not args.no_mask)
     viz_val   = VizLogger(writer, n_samples=4, tag="viz/val",   show_mask=not args.no_mask)
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True, drop_last=True,
+        num_workers=args.num_workers, pin_memory=True, drop_last=False,
         persistent_workers=args.num_workers > 0,
     )
     val_loader = DataLoader(
@@ -680,7 +776,20 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     in_channels = args.num_bins + 1  # voxel bins + table-plane/pose-depth channel
-    model = EventMVSNet(in_channels=in_channels, base_channels=args.base_channels).to(device)
+    model = EventMVSNet(
+        in_channels=in_channels,
+        base_channels=args.base_channels,
+        feature_channels=(None if args.feature_channels <= 0 else args.feature_channels),
+        cost_channels=args.cost_channels,
+    ).to(device)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(
+        f"EventMVSNet in_ch={in_channels} base={args.base_channels} "
+        f"feature={args.feature_channels or args.base_channels * 4} "
+        f"cost={args.cost_channels} num_depth={args.num_depth} "
+        f"params={n_params:,}",
+        flush=True,
+    )
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
@@ -693,12 +802,15 @@ def main():
     for epoch in range(1, args.epochs + 1):
         model.train()
         running = 0.0
+        running_l1 = 0.0
         count = 0
+        skipped_nonfinite = 0
         _t_last = time.time()
 
         for batch in train_loader:
             imgs = batch["imgs"].to(device, non_blocking=True)
-            proj_mats = batch["proj_mats"].to(device, non_blocking=True)
+            cam_mats = batch["cam_mats"].to(device, non_blocking=True)
+            K = batch["K"].to(device, non_blocking=True)
             depth_values = batch["depth_values"].to(device, non_blocking=True)
             gt = batch["depth"].to(device, non_blocking=True)
             mask = batch["mask"].to(device, non_blocking=True)
@@ -706,16 +818,54 @@ def main():
             opt.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                pred, _ = model(imgs, proj_mats, depth_values)
-                loss = masked_l1(pred, gt, mask)
+                pred, _ = model(imgs, cam_mats, K, depth_values)
+                pred_norm = normalize_depth(pred[:, None], args.depth_min, args.depth_max)
+                gt_norm = normalize_depth(gt[:, None], args.depth_min, args.depth_max)
+                mask_1ch = mask[:, None]
+                loss, _ = compute_loss(
+                    pred_norm,
+                    gt_norm,
+                    mask_1ch,
+                    imgs[:, 0, :args.num_bins],
+                    K=None,
+                )
+
+            if not torch.isfinite(loss):
+                skipped_nonfinite += 1
+                print(
+                    f"  [train  epoch {epoch}] skipping non-finite loss batch "
+                    f"(skipped={skipped_nonfinite}, "
+                    f"pred finite={torch.isfinite(pred).all().item()}, "
+                    f"gt finite={torch.isfinite(gt).all().item()}, "
+                    f"mask valid={int((mask > 0.5).sum().item())})",
+                    flush=True,
+                )
+                continue
 
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if not torch.isfinite(grad_norm):
+                skipped_nonfinite += 1
+                opt.zero_grad(set_to_none=True)
+                print(
+                    f"  [train  epoch {epoch}] skipping non-finite gradients "
+                    f"(skipped={skipped_nonfinite})",
+                    flush=True,
+                )
+                continue
             scaler.step(opt)
             scaler.update()
 
             running += float(loss.detach())
+            with torch.no_grad():
+                running_l1 += float(l1_metres_from_norm(
+                    pred_norm.detach(),
+                    gt[:, None],
+                    mask[:, None],
+                    args.depth_min,
+                    args.depth_max,
+                ))
             count += 1
 
             _now = time.time()
@@ -723,7 +873,9 @@ def main():
                 vram_a = torch.cuda.memory_allocated() / 1024**2 if torch.cuda.is_available() else 0.0
                 print(
                     f"  [train  epoch {epoch}  {count:4d}/{n_train_batches} batches]  "
-                    f"loss {running / count:.4f} m  "
+                    f"loss {running / count:.4f}  "
+                    f"L1 {running_l1 / count:.4f} m  "
+                    f"skipped {skipped_nonfinite}  "
                     f"VRAM {vram_a:.0f} MB",
                     flush=True,
                 )
@@ -742,12 +894,14 @@ def main():
 
         metrics = validate(model, val_loader, device,
                            viz=viz_val, num_bins=args.num_bins)
-        train_l1 = running / max(count, 1)
+        train_loss = running / max(count, 1)
+        train_l1 = running_l1 / max(count, 1)
 
         viz_train.flush(step=epoch)
         viz_val.flush(step=epoch)
 
-        writer.add_scalar("loss/train",   train_l1,          epoch)
+        writer.add_scalar("loss/train",   train_loss,        epoch)
+        writer.add_scalar("l1/train",     train_l1,          epoch)
         writer.add_scalar("l1/val",        metrics["l1"],     epoch)
         writer.add_scalar("abs_rel/val",   metrics["abs_rel"], epoch)
 
@@ -755,7 +909,7 @@ def main():
         vram_r = torch.cuda.memory_reserved()  / 1024**2 if torch.cuda.is_available() else 0.0
 
         print(
-            f"epoch {epoch:03d} | train_l1={train_l1:.4f} m | "
+            f"epoch {epoch:03d} | train_loss={train_loss:.4f} | train_l1={train_l1:.4f} m | "
             f"val_l1={metrics['l1']:.4f} m | val_abs_rel={metrics['abs_rel']:.4f} | "
             f"VRAM: {vram_a:.0f}/{vram_r:.0f} MB",
             flush=True,
