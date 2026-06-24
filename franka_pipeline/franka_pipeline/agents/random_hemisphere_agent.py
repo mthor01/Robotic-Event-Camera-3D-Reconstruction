@@ -44,6 +44,7 @@ class RandomHemisphereAgent(Agent):
         base_exclusion_radius: float = 0.35,
         base_max_radius: float = 0.65,
         min_z_height: float = 0.1,
+        hemisphere_top_cutoff: float = None,
         lock_rotation_horizontal: bool = True,
         center_z_offset: float = 0.0,
         calibration_dir: str = None,
@@ -62,6 +63,8 @@ class RandomHemisphereAgent(Agent):
             base_exclusion_radius: Exclude poses within this x,y radius of robot base (0,0). Default: 0.35
             base_max_radius: Exclude poses beyond this x,y radius of robot base (0,0). Default: 0.65
             min_z_height: Minimum z-height for poses (table level). Default: 0.1
+            hemisphere_top_cutoff: Maximum pose height above the hemisphere center. Values below
+                radius remove the top cap. Default: radius (no cutoff).
             lock_rotation_horizontal: If True, keep depth camera image upright. If False, allow random roll. Default: True
             center_z_offset: Additional Z offset applied to the hemisphere center only. The target_point
                 is NOT affected. Useful for raising/lowering the sampling hemisphere. Default: 0.0
@@ -88,6 +91,11 @@ class RandomHemisphereAgent(Agent):
         self.base_exclusion_radius = base_exclusion_radius
         self.base_max_radius = base_max_radius
         self.min_z_height = min_z_height
+        self.hemisphere_top_cutoff = (
+            radius if hemisphere_top_cutoff is None else hemisphere_top_cutoff
+        )
+        if self.hemisphere_top_cutoff < 0:
+            raise ValueError("hemisphere_top_cutoff must be non-negative")
         self.lock_rotation_horizontal = lock_rotation_horizontal
         
         # Load calibration data: compute T_depth_from_ee
@@ -130,6 +138,9 @@ class RandomHemisphereAgent(Agent):
         logger.info(f"  Base exclusion radius: {self.base_exclusion_radius}")
         logger.info(f"  Base max radius: {self.base_max_radius}")
         logger.info(f"  Min z-height: {self.min_z_height}")
+        logger.info(
+            f"  Hemisphere top cutoff (above center): {self.hemisphere_top_cutoff}"
+        )
         logger.info(f"  Center Z offset: {center_z_offset}")
         logger.info(f"  Lock rotation horizontal: {self.lock_rotation_horizontal}")
 
@@ -175,6 +186,11 @@ class RandomHemisphereAgent(Agent):
             x = r * np.sin(phi) * np.cos(theta)
             y = r * np.sin(phi) * np.sin(theta)
             z = r * np.cos(phi)  # Always positive for hemisphere
+
+            # Remove poses from the top cap using height relative to the
+            # hemisphere center, rather than an absolute world-frame Z value.
+            if z > self.hemisphere_top_cutoff:
+                continue
             
             # Translate to center
             position = self.center + np.array([x, y, z])
@@ -399,7 +415,7 @@ class RandomHemisphereAgent(Agent):
             target_pose=command,
             threshold_reach=0.02,      # 2cm position tolerance
             threshold_rotation=3.15,   # ~180 degrees - essentially ignore rotation
-            max_steps=100,             # Give up after 100 steps to avoid getting stuck
+            max_steps=30,              # Give up after 30 steps to avoid getting stuck
         )
     
     def _setup_transition_to_pose(self, current_pos: np.ndarray, target_pose_idx: int) -> None:

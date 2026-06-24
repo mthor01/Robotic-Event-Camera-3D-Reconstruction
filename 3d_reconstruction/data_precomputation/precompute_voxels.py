@@ -21,9 +21,13 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 import multiprocessing
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parent))
 
-from config import NUM_BINS, TRAIN_RESIZE_HW, TRAIN_CROP_HW
+from config import DATA_ROOT as _DATA_ROOT, NUM_BINS, TRAIN_RESIZE_HW, TRAIN_CROP_HW
+
+
+DATA_ROOT = _HERE.parent / _DATA_ROOT
 
 
 def events_to_voxel_grid(
@@ -406,6 +410,8 @@ def process_sequence(
 def find_sequence_dirs(data_root: Path) -> List[Path]:
     """Find valid sequence directories that contain the new data structure."""
     sequence_dirs = []
+    if not data_root.exists():
+        return sequence_dirs
     for d in data_root.iterdir():
         if d.is_dir():
             realsense_h5 = d / "hdf5" / "realsense.h5"
@@ -423,7 +429,7 @@ def main():
     )
     parser.add_argument("--data_dir", nargs="+", type=str, default=None,
                        help="Sequence directory(ies) to process")
-    parser.add_argument("--data_root", type=str, default="data/real",
+    parser.add_argument("--data_root", type=str, default=str(DATA_ROOT),
                        help="Root data directory (will process all subdirs)")
     parser.add_argument("--num_bins", type=int, default=5,
                        help="Number of temporal bins for voxel grid")
@@ -462,6 +468,12 @@ def main():
 
     args = parser.parse_args()
 
+    def _resolve_data_path(path_str: str) -> Path:
+        path = Path(path_str)
+        if path.is_absolute():
+            return path
+        return (_HERE.parent / path).resolve()
+
     # Build output_hw (resize target) and crop_hw (final stored size)
     output_hw: Optional[Tuple[int, int]] = None
     if args.output_h and args.output_w:
@@ -481,12 +493,17 @@ def main():
 
     # Find sequences
     if args.data_dir:
-        sequence_dirs = [Path(d) for d in args.data_dir]
+        sequence_dirs = [_resolve_data_path(d) for d in args.data_dir]
     else:
-        sequence_dirs = find_sequence_dirs(Path(args.data_root))
+        data_root = _resolve_data_path(args.data_root)
+        print(f"Data root: {data_root}")
+        sequence_dirs = find_sequence_dirs(data_root)
 
     if not sequence_dirs:
-        print(f"No valid sequences found!")
+        if args.data_dir:
+            print("No valid sequences found in the provided --data_dir paths.")
+        else:
+            print(f"No valid sequences found under {data_root}.")
         return
 
     print(f"Found {len(sequence_dirs)} sequences to process")

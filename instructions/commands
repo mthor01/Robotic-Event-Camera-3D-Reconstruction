@@ -41,9 +41,11 @@ xhost +local:root
 
   
 ##########Record Data############
-python3 my_main.py --real-robot
+python3 main.py --real-robot
 
-python3 synchronised_recording.py
+python3 rec_data.py --hw-sync
+
+bash precompute_all.sh --data_root data/real/new_data --voxel --float16
 
 python3 project_realsense_to_event.py --data_root data/real                     #--save-videos
 
@@ -76,7 +78,3 @@ python3 project_realsense_to_event.py --data_dir data/real/1
 python3 real_train.py 
 
 tensorboard --logdir=checkpoints_e2depth
-
-
-##########TCML###################
-singularity shell --nv docker_installation/working_meta_462/meta_and_pytorch.sif

@@ -95,6 +95,15 @@ def main():
         help=f"Minimum z-height (default: {cfg.MIN_Z_HEIGHT})",
     )
     parser.add_argument(
+        "--hemisphere-top-cutoff",
+        type=float,
+        default=cfg.HEMISPHERE_TOP_CUTOFF,
+        help=(
+            "Maximum height above the hemisphere center "
+            f"(default: {cfg.HEMISPHERE_TOP_CUTOFF})"
+        ),
+    )
+    parser.add_argument(
         "--center-z-offset",
         type=float,
         default=cfg.CENTER_Z_OFFSET,
@@ -123,6 +132,7 @@ def main():
         base_exclusion_radius=args.base_exclusion_radius,
         base_max_radius=args.base_max_radius,
         min_z_height=args.min_z,
+        hemisphere_top_cutoff=args.hemisphere_top_cutoff,
         lock_rotation_horizontal=args.lock_rotation,
         center_z_offset=args.center_z_offset,
     )

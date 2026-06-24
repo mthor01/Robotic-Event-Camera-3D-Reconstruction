@@ -75,10 +75,10 @@ TARGET_Y = 0.0
 TARGET_Z = 0.12
 
 # Sphere/Hemisphere radius
-SPHERE_RADIUS = 0.37
+SPHERE_RADIUS = 0.33
 
 # Inner radius for hollow hemisphere (RandomHemisphereAgent only)
-INNER_RADIUS = 0.2
+INNER_RADIUS = 0.22
 
 # Number of random poses to generate
 NUM_POSES = 30 #30
@@ -99,13 +99,19 @@ RANDOM_SEED = None
 # SAFETY ZONE PARAMETERS (for RandomHemisphereAgent)
 # =============================================================================
 # Exclude poses within this x,y radius of robot base (0,0)
-BASE_EXCLUSION_RADIUS = 0.4
+BASE_EXCLUSION_RADIUS = 0.38
 
 # Exclude poses beyond this x,y radius of robot base (0,0)
-BASE_MAX_RADIUS = 0.55
+BASE_MAX_RADIUS = 0.52
 
 # Minimum z-height for poses (table level)
-MIN_Z_HEIGHT = 0.15
+MIN_Z_HEIGHT = 0.23
+
+# Maximum pose height above the hemisphere center.
+# Set this equal to SPHERE_RADIUS to keep the full hemisphere, or lower it to
+# cut poses from the top cap. This is relative to the hemisphere center, not an
+# absolute robot-world Z coordinate.
+HEMISPHERE_TOP_CUTOFF = SPHERE_RADIUS - 0.1
 
 # Z offset applied to the hemisphere center only (does NOT move the target point).
 # Use this to raise/lower the sampling hemisphere without changing where the camera looks.

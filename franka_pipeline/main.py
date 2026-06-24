@@ -382,6 +382,7 @@ def _run_single_object_recording(
                 base_exclusion_radius=cfg.BASE_EXCLUSION_RADIUS,
                 base_max_radius=cfg.BASE_MAX_RADIUS,
                 min_z_height=cfg.MIN_Z_HEIGHT,
+                hemisphere_top_cutoff=cfg.HEMISPHERE_TOP_CUTOFF,
                 lock_rotation_horizontal=cfg.LOCK_ROTATION_HORIZONTAL,
                 center_z_offset=center_z_offset,
             )
@@ -791,6 +792,7 @@ def main(
             logger.info(f"  Inner radius: {cfg.INNER_RADIUS}")
             logger.info(f"  Base exclusion radius: {cfg.BASE_EXCLUSION_RADIUS}")
             logger.info(f"  Min z-height: {cfg.MIN_Z_HEIGHT}")
+            logger.info(f"  Hemisphere top cutoff: {cfg.HEMISPHERE_TOP_CUTOFF}")
             # For random_hemisphere, center equals target point
             return EpisodeControlWrapperAgent(
                 RandomHemisphereAgent(
@@ -804,6 +806,7 @@ def main(
                     base_exclusion_radius=cfg.BASE_EXCLUSION_RADIUS,
                     base_max_radius=cfg.BASE_MAX_RADIUS,
                     min_z_height=cfg.MIN_Z_HEIGHT,
+                    hemisphere_top_cutoff=cfg.HEMISPHERE_TOP_CUTOFF,
                     lock_rotation_horizontal=cfg.LOCK_ROTATION_HORIZONTAL,
                     center_z_offset=center_z_offset,
                 )
