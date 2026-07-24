@@ -60,6 +60,7 @@ RUN python3 -m pip install --upgrade pip \
     tensorboard \
     tqdm \
     matplotlib \
+    seaborn \
     scipy\
     open3d
 

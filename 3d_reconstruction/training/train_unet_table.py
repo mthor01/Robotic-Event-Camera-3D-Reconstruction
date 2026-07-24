@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-train_unet_table.py - Single-frame UNet with table-plane prior channel.
+train_unet_table.py - Early-fusion UNet with table-plane prior channels.
 
-Feeds the U-Net the target event voxels together with one additional channel
-that encodes the table plane directly in the image plane:
+Feeds the U-Net one or more temporal indices. Each index contributes its event
+voxels and one channel encoding the table plane directly in the image plane:
 
-    [x_t | table_plane_channel]
+    [x_t | table_t | x_t-k | table_t-k | x_t+k | table_t+k | ...]
 
     x_t                 : target event voxel grid    (NUM_BINS channels)
     table_plane_channel : per-pixel z-depth [m] to the table plane,
@@ -14,16 +14,18 @@ that encodes the table plane directly in the image plane:
                           the horizontal plane  z = table_z  in the robot
                           base frame, using the frame's end-effector pose.
 
-Default input channels: NUM_BINS + 1
+Input channels: num_views * (NUM_BINS + 1). The default remains one view.
 
 Usage:
     python3 training/train_unet_table.py
     python3 training/train_unet_table.py --data_dir data/lego/lego_1
     python3 training/train_unet_table.py --table_z 0.02
     python3 training/train_unet_table.py --model_scale 2.0
+    python3 training/train_unet_table.py --num_views 5 --view_interval 5
 """
 
 import argparse
+import copy
 import sys
 import time
 from pathlib import Path
@@ -39,10 +41,11 @@ from train_unet import (
     DEPTH_MIN, D_MAX, NUM_BINS, _SCRIPT_DIR, DATA_ROOT,
     UNet, compute_loss, _l1_metres, _worst_percent_l1_metres,
 )
-from tensorboard_runs import DEFAULT_TB_ROOT, tensorboard_run_dir
-from viz import (
+from tensorboard_helper import (
+    DEFAULT_TB_ROOT,
     ErrorDistributionSpatialLogger,
     EventActivityAccuracyLogger,
+    tensorboard_run_dir,
     UncertaintyErrorLogger,
     VizLogger,
 )
@@ -131,22 +134,34 @@ def _compute_table_plane_channel(
 
 class TablePriorDataset(Dataset):
     """
-    Single-frame dataset: event voxels + precomputed table-plane channel → GT depth.
+    Early-fusion dataset: target/source event voxels and table priors → target GT depth.
 
     Requires hdf5/table_plane.h5 produced by
     data_precomputation/precompute_table_plane.py.
 
     Returns (all torch.Tensor on CPU):
-        inp    : (NUM_BINS + 1, H, W)  voxels concatenated with table-plane channel
+        inp    : (num_views * (NUM_BINS + 1), H, W), target view first
         dep_t  : (1, H, W)             GT depth [m]
         mask_t : (1, H, W)             valid depth mask
     """
 
-    def __init__(self, seq_dir: Path, use_mask: bool = True,
-                 fill_invalid: bool = False):
+    def __init__(
+        self,
+        seq_dir: Path,
+        use_mask: bool = True,
+        fill_invalid: bool = False,
+        num_views: int = 1,
+        view_interval: int = 5,
+    ):
         super().__init__()
+        if num_views < 1:
+            raise ValueError("num_views must be at least 1")
+        if view_interval < 1:
+            raise ValueError("view_interval must be at least 1")
         self.seq_dir         = seq_dir
         self.fill_invalid    = fill_invalid
+        self.num_views       = int(num_views)
+        self.view_interval   = int(view_interval)
         self.voxels_path     = seq_dir / "events" / "voxels_cam0.h5"
         self.depth_path      = seq_dir / "hdf5"   / "depth_in_event_frame.h5"
         self.mask_path       = seq_dir / "hdf5"   / "spatial_mask.h5"
@@ -166,7 +181,14 @@ class TablePriorDataset(Dataset):
         n_frames      = min(n_d, n_v, n_t)
         self.has_mask = use_mask and self.mask_path.exists()
 
-        self.valid_indices = np.arange(n_frames)
+        self.src_offsets = self._make_source_offsets(num_views, view_interval)
+        margin = max((abs(offset) for offset in self.src_offsets), default=0)
+        self.valid_indices = np.arange(margin, n_frames - margin, dtype=np.int64)
+        if len(self.valid_indices) == 0:
+            raise RuntimeError(
+                f"{self.seq_dir.name}: not enough frames ({n_frames}) for "
+                f"num_views={num_views}, view_interval={view_interval}"
+            )
         self._vox = None   # lazy HDF5 handles, opened per DataLoader worker
         self._dep = None
         self._msk = None
@@ -186,16 +208,41 @@ class TablePriorDataset(Dataset):
     def __len__(self) -> int:
         return len(self.valid_indices)
 
+    @staticmethod
+    def _make_source_offsets(num_views: int, view_interval: int) -> list[int]:
+        """Match MultiViewTableDataset's target, past, future ordering."""
+        offsets: list[int] = []
+        distance = 1
+        while len(offsets) < num_views - 1:
+            offsets.append(-distance * view_interval)
+            if len(offsets) < num_views - 1:
+                offsets.append(distance * view_interval)
+            distance += 1
+        return offsets
+
+    def _load_input(self, idx: int) -> torch.Tensor:
+        vox = self._vox[idx].astype(np.float32)
+        vox_t = torch.from_numpy(vox)
+        _, height, width = vox_t.shape
+        tbl_t = torch.from_numpy(self._tbl[idx].astype(np.float32)).unsqueeze(0)
+        if tbl_t.shape[-2:] != (height, width):
+            tbl_t = F.interpolate(
+                tbl_t.unsqueeze(0),
+                (height, width),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+        return torch.cat([vox_t, tbl_t], dim=0)
+
     def __getitem__(self, item: int):
         self._open()
         idx = int(self.valid_indices[item])
+        view_ids = [idx] + [idx + offset for offset in self.src_offsets]
 
-        # Voxels
-        vox = self._vox[idx]
-        if vox.dtype == np.float16:
-            vox = vox.astype(np.float32)
-        vox_t = torch.from_numpy(vox)   # (C, H, W)
-        _, Hv, Wv = vox_t.shape
+        # Concatenate complete per-view inputs along the channel dimension.
+        # The target is first, followed by -interval, +interval, ... sources.
+        view_inputs = [self._load_input(view_idx) for view_idx in view_ids]
+        _, Hv, Wv = view_inputs[0].shape
 
         # Depth + mask
         dep   = self._dep[idx].astype(np.float32)
@@ -209,22 +256,14 @@ class TablePriorDataset(Dataset):
             dep_t = F.interpolate(dep_t.unsqueeze(0), (Hv, Wv), mode="nearest").squeeze(0)
             msk_t = F.interpolate(msk_t.unsqueeze(0), (Hv, Wv), mode="nearest").squeeze(0)
 
-        # Table-plane channel (precomputed)
-        tbl_np = self._tbl[idx].astype(np.float32)             # (H_stored, W_stored)
-        tbl_t  = torch.from_numpy(tbl_np).unsqueeze(0)         # (1, H_stored, W_stored)
-        if tbl_t.shape[-2] != Hv or tbl_t.shape[-1] != Wv:
-            tbl_t = F.interpolate(
-                tbl_t.unsqueeze(0), (Hv, Wv),
-                mode="bilinear", align_corners=False,
-            ).squeeze(0)
-
         # Optionally fill invalid depth pixels with the table-plane prior [m]
         if self.fill_invalid:
-            tbl_m = tbl_t * (D_MAX - DEPTH_MIN) + DEPTH_MIN  # (1, H, W) metres
+            target_tbl = view_inputs[0][NUM_BINS:NUM_BINS + 1]
+            tbl_m = target_tbl * (D_MAX - DEPTH_MIN) + DEPTH_MIN
             dep_t = torch.where(msk_t > 0.5, dep_t, tbl_m)
             msk_t = torch.ones_like(msk_t)  # all pixels now have a valid target
 
-        inp = torch.cat([vox_t, tbl_t], dim=0)   # (C+1, H, W)
+        inp = torch.cat(view_inputs, dim=0)
         return inp, dep_t, msk_t
 
 
@@ -254,6 +293,29 @@ class UncertaintyUNet(UNet):
         pred = torch.sigmoid(out[:, :1])
         log_var = out[:, 1:2].clamp(min=-6.0, max=3.0)
         return pred, log_var
+
+
+class ModelEMA:
+    """Exponential moving average of parameters and floating-point buffers."""
+
+    def __init__(self, model: nn.Module, decay: float):
+        self.decay = float(decay)
+        self.model = copy.deepcopy(model).eval()
+        for parameter in self.model.parameters():
+            parameter.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        source = model.state_dict()
+        for name, averaged in self.model.state_dict().items():
+            current = source[name].detach()
+            if averaged.is_floating_point():
+                averaged.mul_(self.decay).add_(
+                    current.to(dtype=averaged.dtype),
+                    alpha=1.0 - self.decay,
+                )
+            else:
+                averaged.copy_(current)
 
 
 def uncertainty_nll_loss(
@@ -287,13 +349,14 @@ def run_epoch(
     uncertainty_diag=None,
     uncertainty_weight: float = 1.0,
     depth_aux_weight: float = 0.0,
+    ema_model: ModelEMA | None = None,
 ) -> tuple:
-    """One epoch. Returns (mean_total_loss, mean_l1_metres, mean_worst10_l1_metres)."""
+    """Return mean loss, L1, p95 absolute error, and worst-10% L1."""
     is_train = optimizer is not None
     model.train(is_train)
     ctx = torch.enable_grad() if is_train else torch.no_grad()
 
-    total_loss = total_l1 = total_worst10_l1 = 0.0
+    total_loss = total_l1 = total_p95 = total_worst10_l1 = 0.0
     _phase     = "train" if is_train else "val"
     _n_total   = len(loader)
     _n_batches = 0
@@ -326,10 +389,16 @@ def run_epoch(
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                if ema_model is not None:
+                    ema_model.update(model)
 
             total_loss += loss.item()
             with torch.no_grad():
                 total_l1 += _l1_metres(pred, dep_t, mask_t).item()
+                pred_m = pred * (D_MAX - DEPTH_MIN) + DEPTH_MIN
+                valid_errors = torch.abs(pred_m - dep_t)[mask_t > 0.5]
+                if valid_errors.numel() > 0:
+                    total_p95 += float(torch.quantile(valid_errors.float(), 0.95))
                 total_worst10_l1 += _worst_percent_l1_metres(pred, dep_t, mask_t).item()
 
             _n_batches += 1
@@ -338,6 +407,7 @@ def run_epoch(
                 print(f"  [{_phase}  {_n_batches:4d}/{_n_total} batches]  "
                       f"loss {total_loss / _n_batches:.4f}  "
                       f"L1 {total_l1 / _n_batches:.4f} m  "
+                      f"p95 {total_p95 / _n_batches:.4f} m  "
                       f"worst10 {total_worst10_l1 / _n_batches:.4f} m")
                 _t_last = _now
 
@@ -361,7 +431,7 @@ def run_epoch(
                 )
 
     n = max(len(loader), 1)
-    return total_loss / n, total_l1 / n, total_worst10_l1 / n
+    return total_loss / n, total_l1 / n, total_p95 / n, total_worst10_l1 / n
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +440,7 @@ def run_epoch(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Single-frame UNet with table-plane prior channel"
+        description="Early-fusion UNet with per-view table-plane prior channels"
     )
     parser.add_argument("--data_dir",      type=Path, default=DATA_ROOT,
                         help="Single sequence dir or parent of multiple sequences")
@@ -381,6 +451,10 @@ def main() -> None:
     parser.add_argument("--base_channels", type=int,  default=32)
     parser.add_argument("--model_scale",   type=float, default=1.0,
                         help="Width multiplier for base_channels")
+    parser.add_argument("--num_views",     type=int, default=1,
+                        help="Number of target/source indices concatenated as U-Net input")
+    parser.add_argument("--view_interval", type=int, default=5,
+                        help="Frame interval between target and successive source indices")
     parser.add_argument("--out_dir",       type=Path,
                         default=_SCRIPT_DIR / "checkpoints" / "unet_table")
     parser.add_argument("--seed",          type=int,  default=42)
@@ -397,6 +471,8 @@ def main() -> None:
                         help="Weight for the primary uncertainty negative-log-likelihood term.")
     parser.add_argument("--depth_aux_weight", type=float, default=0.0,
                         help="Optional auxiliary weight for the original depth loss when uncertainty is enabled.")
+    parser.add_argument("--ema_decay", type=float, default=0.0,
+                        help="EMA decay used for validation/checkpoints; 0 disables EMA")
     parser.add_argument("--name",          type=str, default=None,
                         help="Run name used in checkpoint filenames. Prompted if not provided.")
     parser.add_argument("--tb_root",       type=Path, default=DEFAULT_TB_ROOT,
@@ -405,6 +481,12 @@ def main() -> None:
 
     if args.model_scale <= 0:
         parser.error("--model_scale must be > 0")
+    if args.num_views < 1:
+        parser.error("--num_views must be at least 1")
+    if args.view_interval < 1:
+        parser.error("--view_interval must be at least 1")
+    if args.ema_decay < 0 or args.ema_decay >= 1:
+        parser.error("--ema_decay must be in [0, 1)")
 
     if args.name is None:
         args.name = input("Enter a run name for the checkpoints: ").strip()
@@ -426,7 +508,23 @@ def main() -> None:
             and (p / "hdf5" / "table_plane.h5").exists()
         )
 
-    if _is_sequence(args.data_dir):
+    train_root = args.data_dir / "train"
+    eval_root = args.data_dir / "eval"
+    explicit_train_seqs = (
+        sorted(d for d in train_root.iterdir() if d.is_dir() and _is_sequence(d))
+        if train_root.is_dir() else []
+    )
+    explicit_eval_seqs = (
+        sorted(d for d in eval_root.iterdir() if d.is_dir() and _is_sequence(d))
+        if eval_root.is_dir() else []
+    )
+
+    if explicit_train_seqs and explicit_eval_seqs:
+        train_seqs = explicit_train_seqs
+        val_seqs = explicit_eval_seqs
+        seq_dirs = train_seqs + val_seqs
+        single_object = False
+    elif _is_sequence(args.data_dir):
         seq_dirs      = [args.data_dir]
         single_object = True
     else:
@@ -442,7 +540,11 @@ def main() -> None:
         )
 
     # ── Object-level split ────────────────────────────────────────────────
-    if single_object:
+    if explicit_train_seqs and explicit_eval_seqs:
+        print(f"Using explicit train/eval split from {args.data_dir}")
+        print(f"  Train ({len(train_seqs)}): {[d.name for d in train_seqs]}")
+        print(f"  Eval  ({len(val_seqs)}): {[d.name for d in val_seqs]}")
+    elif single_object:
         train_seqs = val_seqs = seq_dirs
         print(f"Found {len(seq_dirs)} sequence(s) [single-object mode]")
         print(f"  Sequences: {[d.name for d in seq_dirs]}")
@@ -469,6 +571,8 @@ def main() -> None:
     ds_kw = dict(
         use_mask=not args.no_mask,
         fill_invalid=args.fill_invalid,
+        num_views=args.num_views,
+        view_interval=args.view_interval,
     )
     train_ds = ConcatDataset([TablePriorDataset(d, **ds_kw) for d in train_seqs])
     val_ds   = ConcatDataset([TablePriorDataset(d, **ds_kw) for d in val_seqs])
@@ -486,7 +590,8 @@ def main() -> None:
                               shuffle=False, **loader_kw)
 
     # ── Model ──────────────────────────────────────────────────────────────
-    in_ch  = NUM_BINS + 1
+    per_view_channels = NUM_BINS + 1
+    in_ch = args.num_views * per_view_channels
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     base_channels = max(1, int(round(args.base_channels * args.model_scale)))
     if args.predict_uncertainty:
@@ -506,7 +611,10 @@ def main() -> None:
         f"{model_name}  in_ch={in_ch}  model_scale={args.model_scale:g}  "
         f"base={base_channels}  parameters: {n_params:,}"
     )
-    print(f"  {NUM_BINS} (voxels) + 1 (table-plane channel) = {in_ch} channels")
+    print(
+        f"  {args.num_views} views x ({NUM_BINS} voxel + 1 table-plane) "
+        f"= {in_ch} channels; view_interval={args.view_interval}"
+    )
     if args.predict_uncertainty:
         print(f"  Uncertainty head enabled; primary NLL weight = {args.uncertainty_weight:g}")
         print(f"  Auxiliary depth-loss weight = {args.depth_aux_weight:g}")
@@ -516,6 +624,12 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=args.lr * 1e-2
     )
+    ema = ModelEMA(model, args.ema_decay) if args.ema_decay > 0 else None
+    if ema is not None:
+        print(
+            f"EMA: enabled (decay={args.ema_decay:g}); "
+            "validation/checkpoints use EMA weights"
+        )
 
     # ── Logging ───────────────────────────────────────────────────────────
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -526,30 +640,42 @@ def main() -> None:
     viz_val   = VizLogger(writer, n_samples=4, tag="viz/val",   show_mask=not args.no_mask)
     activity_train = EventActivityAccuracyLogger(writer, tag="event_activity_accuracy/train")
     activity_val   = EventActivityAccuracyLogger(writer, tag="event_activity_accuracy/val")
-    error_train = ErrorDistributionSpatialLogger(writer, tag="error/train")
-    error_val   = ErrorDistributionSpatialLogger(writer, tag="error/val")
+    error_train = ErrorDistributionSpatialLogger(
+        writer, tag="error/train", images_only=False
+    )
+    error_val = ErrorDistributionSpatialLogger(
+        writer, tag="error/val", images_only=False
+    )
     uncertainty_train = (
-        UncertaintyErrorLogger(writer, tag="uncertainty_error/train")
+        UncertaintyErrorLogger(
+            writer, tag="uncertainty/train", images_only=True
+        )
         if args.predict_uncertainty else None
     )
     uncertainty_val = (
-        UncertaintyErrorLogger(writer, tag="uncertainty_error/val")
+        UncertaintyErrorLogger(
+            writer, tag="uncertainty/val", images_only=True
+        )
         if args.predict_uncertainty else None
     )
 
     # ── Training loop ─────────────────────────────────────────────────────
     best_val_l1 = float("inf")
+    best_val_p95 = float("inf")
+    best_val_worst10 = float("inf")
     ckpt: dict = {}
 
     for epoch in range(1, args.epochs + 1):
-        tr_loss, tr_l1, tr_worst10 = run_epoch(model, train_loader, optimizer, device,
+        tr_loss, tr_l1, tr_p95, tr_worst10 = run_epoch(model, train_loader, optimizer, device,
                                     K_tensor, viz=viz_train,
                                     activity_diag=activity_train,
                                     error_diag=error_train,
                                     uncertainty_diag=uncertainty_train,
                                     uncertainty_weight=args.uncertainty_weight,
-                                    depth_aux_weight=args.depth_aux_weight)
-        va_loss, va_l1, va_worst10 = run_epoch(model, val_loader,   None,      device,
+                                    depth_aux_weight=args.depth_aux_weight,
+                                    ema_model=ema)
+        validation_model = ema.model if ema is not None else model
+        va_loss, va_l1, va_p95, va_worst10 = run_epoch(validation_model, val_loader, None, device,
                                     K_tensor, viz=viz_val,
                                     activity_diag=activity_val,
                                     error_diag=error_val,
@@ -576,6 +702,7 @@ def main() -> None:
             f"Epoch {epoch:03d}/{args.epochs}  "
             f"loss: {tr_loss:.4f}/{va_loss:.4f}  "
             f"L1: {tr_l1:.4f}/{va_l1:.4f} m  "
+            f"p95: {tr_p95:.4f}/{va_p95:.4f} m  "
             f"worst10: {tr_worst10:.4f}/{va_worst10:.4f} m  "
             f"VRAM: {vram_a:.0f}/{vram_r:.0f} MB"
         )
@@ -584,31 +711,55 @@ def main() -> None:
         writer.add_scalar("loss/val",   va_loss, epoch)
         writer.add_scalar("l1/train",   tr_l1,   epoch)
         writer.add_scalar("l1/val",     va_l1,   epoch)
+        writer.add_scalar("p95/train", tr_p95, epoch)
+        writer.add_scalar("p95/val", va_p95, epoch)
         writer.add_scalar("l1_worst10/train", tr_worst10, epoch)
         writer.add_scalar("l1_worst10/val",   va_worst10, epoch)
         writer.add_scalar("lr",         scheduler.get_last_lr()[0], epoch)
 
         ckpt = {
             "epoch":   epoch,
-            "model":   model.state_dict(),
+            "model":   validation_model.state_dict(),
+            "model_arch": model_name,
             "val_l1":  va_l1,
+            "val_p95": va_p95,
+            "val_l1_worst10": va_worst10,
             "base":    base_channels,
             "base_channels_arg": args.base_channels,
             "model_scale": args.model_scale,
             "in_ch":   in_ch,
+            "num_views": args.num_views,
+            "view_interval": args.view_interval,
+            "early_fusion_views": True,
             "table_z": table_z_ckpt,
             "predict_uncertainty": args.predict_uncertainty,
             "uncertainty_weight": args.uncertainty_weight,
             "depth_aux_weight": args.depth_aux_weight,
+            "ema_decay": args.ema_decay,
         }
         if va_l1 < best_val_l1:
             best_val_l1 = va_l1
-            torch.save(ckpt, args.out_dir / f"best_{args.name}.pth")
-            print(f"  → new best checkpoint  (val L1 = {va_l1:.4f} m)")
+            torch.save(ckpt, args.out_dir / f"best_l1_{args.name}.pth")
+            print(f"  → new best L1 checkpoint  (val L1 = {va_l1:.4f} m)")
+        if va_p95 < best_val_p95:
+            best_val_p95 = va_p95
+            torch.save(ckpt, args.out_dir / f"best_p95_{args.name}.pth")
+            print(f"  → new best p95 checkpoint  (val p95 = {va_p95:.4f} m)")
+        if va_worst10 < best_val_worst10:
+            best_val_worst10 = va_worst10
+            torch.save(ckpt, args.out_dir / f"best_l1_worst10_{args.name}.pth")
+            print(
+                "  → new best worst10 checkpoint  "
+                f"(val worst10 L1 = {va_worst10:.4f} m)"
+            )
 
     torch.save(ckpt, args.out_dir / f"last_{args.name}.pth")
     writer.close()
-    print(f"\nDone. Best val L1: {best_val_l1:.4f} m")
+    print(
+        f"\nDone. Best val L1: {best_val_l1:.4f} m, "
+        f"p95: {best_val_p95:.4f} m, "
+        f"worst10 L1: {best_val_worst10:.4f} m"
+    )
 
 
 if __name__ == "__main__":
