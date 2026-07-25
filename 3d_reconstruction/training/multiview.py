@@ -110,11 +110,48 @@ def _scale_K(K: np.ndarray, native_hw: tuple[int, int], target_hw: tuple[int, in
     return K_scaled.astype(np.float32)
 
 
+def _scale_K_resize_crop(
+    K: np.ndarray,
+    native_hw: tuple[int, int],
+    resize_hw: tuple[int, int],
+    crop_hw: tuple[int, int],
+) -> np.ndarray:
+    """Scale event intrinsics through resize + centred crop.
+
+    This matches the preprocessing used by project_realsense_to_event.py and
+    precompute_voxels.py. The historical direct native->tensor scaling remains
+    unchanged unless --fix_transform is enabled.
+    """
+    native_h, native_w = native_hw
+    resize_h, resize_w = resize_hw
+    crop_h, crop_w = crop_hw
+    K_scaled = K.copy()
+    K_scaled[0, :] *= resize_w / native_w
+    K_scaled[1, :] *= resize_h / native_h
+    K_scaled[0, 2] -= (resize_w - crop_w) / 2.0
+    K_scaled[1, 2] -= (resize_h - crop_h) / 2.0
+    return K_scaled.astype(np.float32)
+
+
 def _inverse_depth_candidates(num_depths: int, depth_min: float, depth_max: float) -> np.ndarray:
     if num_depths < 2:
         raise ValueError(f"--num_depths must be >= 2, got {num_depths}")
     inv = np.linspace(1.0 / depth_min, 1.0 / depth_max, num_depths, dtype=np.float32)
     return (1.0 / inv).astype(np.float32)
+
+
+def _table_plane_filename(fix_transform: bool) -> str:
+    return "fixed_table_plane.h5" if fix_transform else "table_plane.h5"
+
+
+def _pose_channels_from_base_event(T_base_from_event: np.ndarray) -> np.ndarray:
+    """Return six pose values: event-camera position and optical axis in base frame."""
+    position = T_base_from_event[:3, 3].astype(np.float32)
+    optical_axis = T_base_from_event[:3, 2].astype(np.float32)
+    norm = float(np.linalg.norm(optical_axis))
+    if norm > 1e-6:
+        optical_axis = optical_axis / norm
+    return np.concatenate([position, optical_axis]).astype(np.float32)
 
 
 def homo_warp_features(
@@ -243,6 +280,10 @@ class MultiViewTableDataset(Dataset):
         num_depths: int = 32,
         use_mask: bool = True,
         fill_invalid: bool = False,
+        fix_transform: bool = False,
+        pose_channels: bool = False,
+        recurrent: bool = False,
+        recurrent_enrollment_range: int = 0,
         split_indices: np.ndarray | None = None,
         aug: MultiViewAugConfig | None = None,
     ):
@@ -256,6 +297,12 @@ class MultiViewTableDataset(Dataset):
             )
         if pose_move_threshold <= 0:
             raise ValueError(f"--pose_move_threshold must be > 0, got {pose_move_threshold}")
+        if recurrent and num_views != 1:
+            raise ValueError("--recurrent only supports single-view input; set --num_views 1")
+        if recurrent and pose_view_selection:
+            raise ValueError("--recurrent cannot be combined with --pose_view_selection")
+        if recurrent_enrollment_range < 0:
+            raise ValueError("--recurrent_enrollment_range must be >= 0")
 
         self.seq_dir = Path(seq_dir)
         self.num_views = num_views
@@ -263,13 +310,16 @@ class MultiViewTableDataset(Dataset):
         self.pose_view_selection = pose_view_selection
         self.pose_move_threshold = float(pose_move_threshold)
         self.fill_invalid = fill_invalid
+        self.pose_channels = bool(pose_channels)
+        self.recurrent = bool(recurrent)
+        self.recurrent_enrollment_range = int(recurrent_enrollment_range)
         self.aug = aug or MultiViewAugConfig(enabled=False)
 
         self.voxels_path = self.seq_dir / "events" / "voxels_cam0.h5"
         self.depth_path = self.seq_dir / "hdf5" / "depth_in_event_frame.h5"
         self.mask_path = self.seq_dir / "hdf5" / "spatial_mask.h5"
         self.poses_path = self.seq_dir / "hdf5" / "poses.h5"
-        self.table_plane_path = self.seq_dir / "hdf5" / "table_plane.h5"
+        self.table_plane_path = self.seq_dir / "hdf5" / _table_plane_filename(fix_transform)
 
         for p in (self.voxels_path, self.depth_path, self.poses_path, self.table_plane_path):
             if not p.exists():
@@ -281,14 +331,36 @@ class MultiViewTableDataset(Dataset):
         with h5py.File(self.voxels_path, "r") as f:
             n_v = f["voxels"].shape[0]
             _, vox_h, vox_w = f["voxels"].shape[1:]
+            vox_attrs = dict(f["voxels"].attrs)
         with h5py.File(self.table_plane_path, "r") as f:
             n_t = f["table_plane"].shape[0]
+            table_fix_transform = bool(f.attrs.get("fix_transform", False))
         with h5py.File(self.poses_path, "r") as f:
             ee_T = f["ee_T"][:].astype(np.float32)
 
         self.n_frames = min(n_d, n_v, n_t, len(ee_T))
         self.has_mask = use_mask and self.mask_path.exists()
-        self.K = _scale_K(calib["K_native"], calib["native_hw"], (vox_h, vox_w))
+        if fix_transform and not table_fix_transform:
+            print(
+                f"  [{self.seq_dir.name}] WARNING: -fix_transform is active for MVS K, "
+                f"but hdf5/{self.table_plane_path.name} was not marked as fixed. Re-run "
+                "data_precomputation/precompute_table_plane.py -fix_transform for a "
+                "fully consistent table prior."
+            )
+        if fix_transform:
+            native_h, native_w = calib["native_hw"]
+            resize_h = int(vox_attrs.get("resize_h", vox_h))
+            resize_w = int(vox_attrs.get("resize_w", vox_w))
+            crop_h = int(vox_attrs.get("crop_h", vox_h))
+            crop_w = int(vox_attrs.get("crop_w", vox_w))
+            self.K = _scale_K_resize_crop(
+                calib["K_native"],
+                (native_h, native_w),
+                (resize_h, resize_w),
+                (crop_h, crop_w),
+            )
+        else:
+            self.K = _scale_K(calib["K_native"], calib["native_hw"], (vox_h, vox_w))
         self.depth_values = _inverse_depth_candidates(num_depths, DEPTH_MIN, D_MAX)
 
         ee_T = ee_T[:self.n_frames]
@@ -297,11 +369,22 @@ class MultiViewTableDataset(Dataset):
             "ij,njk->nik", calib["T_event_from_ee"], T_ee_inv
         ).astype(np.float32)
         self.cam_centers_world = self._camera_centers_world(self.T_cam_from_world)
+        if self.pose_channels:
+            T_base_from_event = np.linalg.inv(self.T_cam_from_world).astype(np.float32)
+            self.pose_values = np.stack(
+                [_pose_channels_from_base_event(T) for T in T_base_from_event],
+                axis=0,
+            ).astype(np.float32)
+        else:
+            self.pose_values = None
 
         self.pose_view_ids: dict[int, list[int]] = {}
         if num_views == 1:
             self.src_offsets = []
-            valid = np.arange(self.n_frames, dtype=np.int64)
+            if self.recurrent:
+                valid = np.arange(self.recurrent_enrollment_range, self.n_frames, dtype=np.int64)
+            else:
+                valid = np.arange(self.n_frames, dtype=np.int64)
         elif self.pose_view_selection:
             valid = self._make_pose_view_ids(num_views, self.pose_move_threshold)
         else:
@@ -416,7 +499,12 @@ class MultiViewTableDataset(Dataset):
             tbl_t = F.interpolate(
                 tbl_t.unsqueeze(0), (h, w), mode="bilinear", align_corners=False
             ).squeeze(0)
-        return torch.cat([vox_t, tbl_t], dim=0)
+        channels = [vox_t, tbl_t]
+        if self.pose_channels:
+            pose_values = self.pose_values[idx]
+            pose_t = torch.from_numpy(pose_values).view(6, 1, 1).expand(-1, h, w)
+            channels.append(pose_t)
+        return torch.cat(channels, dim=0)
 
     @staticmethod
     def _axis_angle_to_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
@@ -509,6 +597,8 @@ class MultiViewTableDataset(Dataset):
         idx = int(self.valid_indices[item])
         if self.pose_view_selection:
             view_ids = self.pose_view_ids[idx]
+        elif self.recurrent:
+            view_ids = list(range(idx - self.recurrent_enrollment_range, idx + 1))
         else:
             view_ids = [idx] + [idx + o for o in self.src_offsets]
 
@@ -528,7 +618,8 @@ class MultiViewTableDataset(Dataset):
             msk_t = F.interpolate(msk_t.unsqueeze(0), (h, w), mode="nearest").squeeze(0)
 
         if self.fill_invalid:
-            tbl_m = imgs[0, NUM_BINS:NUM_BINS + 1] * (D_MAX - DEPTH_MIN) + DEPTH_MIN
+            target_view = -1 if self.recurrent else 0
+            tbl_m = imgs[target_view, NUM_BINS:NUM_BINS + 1] * (D_MAX - DEPTH_MIN) + DEPTH_MIN
             dep_t = torch.where(msk_t > 0.5, dep_t, tbl_m)
             msk_t = torch.ones_like(msk_t)
 
@@ -1589,22 +1680,25 @@ def debug_multiview_samples(
 # Main
 # ---------------------------------------------------------------------------
 
-def _is_sequence(p: Path) -> bool:
+def _is_sequence(p: Path, fix_transform: bool = False) -> bool:
     return (
         (p / "events" / "voxels_cam0.h5").exists()
         and (p / "hdf5" / "depth_in_event_frame.h5").exists()
         and (p / "hdf5" / "poses.h5").exists()
-        and (p / "hdf5" / "table_plane.h5").exists()
+        and (p / "hdf5" / _table_plane_filename(fix_transform)).exists()
     )
 
 
-def _find_sequences(root: Path) -> list[Path]:
+def _find_sequences(root: Path, fix_transform: bool = False) -> list[Path]:
     """Return a sequence at root, or all valid immediate child sequences."""
-    if _is_sequence(root):
+    if _is_sequence(root, fix_transform=fix_transform):
         return [root]
     if not root.is_dir():
         return []
-    return sorted(d for d in root.iterdir() if d.is_dir() and _is_sequence(d))
+    return sorted(
+        d for d in root.iterdir()
+        if d.is_dir() and _is_sequence(d, fix_transform=fix_transform)
+    )
 
 
 def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
@@ -1877,6 +1971,10 @@ def main() -> None:
                         help="Ignore spatial mask; dep>0 validity is always applied")
     parser.add_argument("--fill_invalid", action="store_true",
                         help="Fill pixels with no depth measurement using the table-plane prior")
+    parser.add_argument("-fix_transform", "--fix_transform", action="store_true",
+                        help="Opt-in geometry fix: scale event intrinsics through the stored "
+                             "resize + centred crop transform instead of the historical direct "
+                             "native-resolution -> tensor-resolution scaling")
     parser.add_argument("--no_augmentations", action="store_true",
                         help="Disable all training-time multi-view data augmentations")
     parser.add_argument("--no_source_view_dropout", action="store_true",
@@ -1986,8 +2084,8 @@ def main() -> None:
 
     train_root = args.data_dir / "train"
     eval_root = args.data_dir / "eval"
-    train_seqs = _find_sequences(train_root)
-    val_seqs = _find_sequences(eval_root)
+    train_seqs = _find_sequences(train_root, fix_transform=args.fix_transform)
+    val_seqs = _find_sequences(eval_root, fix_transform=args.fix_transform)
 
     if not train_seqs or not val_seqs:
         missing = []
@@ -1998,7 +2096,7 @@ def main() -> None:
         sys.exit(
             f"[ERROR] No valid sequences found in: {', '.join(missing)}\n"
             "        --data_dir must contain train/ and eval/, each holding one or more\n"
-            "        valid sequences with voxels, depth, poses.h5, and table_plane.h5.\n"
+            f"        valid sequences with voxels, depth, poses.h5, and {_table_plane_filename(args.fix_transform)}.\n"
             "        Run: python3 data_precomputation/precompute_table_plane.py"
         )
 
@@ -2034,6 +2132,8 @@ def main() -> None:
         num_depths=args.num_depths,
         use_mask=not args.no_mask,
         fill_invalid=args.fill_invalid,
+        fix_transform=args.fix_transform,
+        pose_channels=False,
     )
     train_aug = MultiViewAugConfig(
         enabled=not args.no_augmentations,

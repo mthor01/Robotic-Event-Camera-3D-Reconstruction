@@ -1,0 +1,73 @@
+RandomHemisphereAgent sampler-area check
+Config source: /home/mthormann/robot_and_record/franka_pipeline/config_defaults.py
+Pose source: 52490 recorded poses (new)
+
+Target XYZ [m]: [0.35, 0.0, 0.12]
+Hemisphere center XYZ [m]: [0.35, 0.0, 0.12]
+Inner/outer radius [m]: 0.2 / 0.37
+Allowed base XY radius [m]: 0.4 / 0.55
+Minimum Z [m]: 0.15
+Configured poses per run: 30
+Displayed position type: event-camera
+
+Loaded/generated positions: 52490
+Positions inside sampler region: 50088
+Fraction inside sampler region: 95.424%
+Valid EE XYZ minimum [m]: [0.2672194678913815, -0.3355228161721129, 0.21022261759139174]
+Valid EE XYZ maximum [m]: [0.549883349737503, 0.328999682567278, 0.37704960290113715]
+Displayed XYZ minimum [m]: [0.2430399242853243, -0.40917840489965007, 0.14187508214984246]
+Displayed XYZ maximum [m]: [0.6444664956738274, 0.39998547930152495, 0.3828211869252553]
+
+Scope: sampler position constraints only; IK/collision feasibility is not tested.
+
+Recorded sequences: 50
+  eval/20: 1257 poses
+  eval/30: 1590 poses
+  eval/40: 989 poses
+  eval/50: 922 poses
+  eval/60: 999 poses
+  eval/70: 938 poses
+  train/21: 1143 poses
+  train/22: 1375 poses
+  train/23: 1323 poses
+  train/24: 1571 poses
+  train/25: 1325 poses
+  train/26: 1278 poses
+  train/27: 1279 poses
+  train/28: 1302 poses
+  train/29: 1455 poses
+  train/31: 1207 poses
+  train/32: 1194 poses
+  train/33: 1285 poses
+  train/34: 992 poses
+  train/35: 951 poses
+  train/36: 915 poses
+  train/37: 824 poses
+  train/38: 987 poses
+  train/39: 913 poses
+  train/41: 961 poses
+  train/42: 1007 poses
+  train/43: 848 poses
+  train/44: 1044 poses
+  train/46: 835 poses
+  train/47: 802 poses
+  train/48: 798 poses
+  train/49: 922 poses
+  train/51: 945 poses
+  train/52: 882 poses
+  train/53: 945 poses
+  train/54: 910 poses
+  train/55: 1094 poses
+  train/56: 891 poses
+  train/57: 888 poses
+  train/58: 945 poses
+  train/59: 903 poses
+  train/61: 991 poses
+  train/62: 903 poses
+  train/63: 930 poses
+  train/64: 988 poses
+  train/65: 927 poses
+  train/66: 909 poses
+  train/67: 865 poses
+  train/68: 1312 poses
+  train/69: 1031 poses

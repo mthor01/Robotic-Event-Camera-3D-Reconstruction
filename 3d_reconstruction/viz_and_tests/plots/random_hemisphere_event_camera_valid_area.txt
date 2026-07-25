@@ -1,0 +1,21 @@
+RandomHemisphereAgent sampler-area check
+Config source: /home/mthormann/robot_and_record/franka_pipeline/config_defaults.py
+Pose source: 120000 Monte Carlo candidates
+
+Target XYZ [m]: [0.35, 0.0, 0.12]
+Hemisphere center XYZ [m]: [0.35, 0.0, 0.12]
+Inner/outer radius [m]: 0.2 / 0.37
+Allowed base XY radius [m]: 0.4 / 0.55
+Minimum Z [m]: 0.15
+Configured poses per run: 30
+Displayed position type: event-camera
+
+Loaded/generated positions: 120000
+Positions inside sampler region: 33955
+Fraction inside sampler region: 28.296%
+Valid EE XYZ minimum [m]: [0.21639660600904803, -0.3677711072008856, 0.15001477033886612]
+Valid EE XYZ maximum [m]: [0.5498588955598867, 0.3661008410792874, 0.4842318811065538]
+Displayed XYZ minimum [m]: [0.19750235454988288, -0.4219645839137106, 0.06659501955527697]
+Displayed XYZ maximum [m]: [0.64580328414891, 0.4219892256196093, 0.5129937936536936]
+
+Scope: sampler position constraints only; IK/collision feasibility is not tested.

@@ -9,8 +9,9 @@ resulting camera-space depth, normalised to [0, 1] using the training range
 an extra input channel during training (train_unet_table.py).
 
 Output (per recording):
-    hdf5/table_plane.h5   — dataset "table_plane"  (N, H, W) float32 in [0, 1]
-                          — attrs: table_z_m, depth_min, depth_max, description
+    hdf5/table_plane.h5         — dataset "table_plane"  (N, H, W) float32 in [0, 1]
+    hdf5/fixed_table_plane.h5   — same, when -fix_transform/--fix_transform is enabled
+                                — attrs: table_z_m, depth_min, depth_max, description
 
 Optional debug image:
     debug/table_plane_debug.png  — GT depth | table-plane depth side-by-side
@@ -126,6 +127,24 @@ def _compute_channel(
     return channel.reshape(out_H, out_W).astype(np.float32)
 
 
+def _scale_K_resize_crop(
+    K_native: np.ndarray,
+    native_H: int,
+    native_W: int,
+    resize_H: int,
+    resize_W: int,
+    crop_H: int,
+    crop_W: int,
+) -> np.ndarray:
+    """Scale event intrinsics through resize + centred crop."""
+    K = K_native.copy().astype(np.float64)
+    K[0, :] *= resize_W / native_W
+    K[1, :] *= resize_H / native_H
+    K[0, 2] -= (resize_W - crop_W) / 2.0
+    K[1, 2] -= (resize_H - crop_H) / 2.0
+    return K
+
+
 # ---------------------------------------------------------------------------
 # Debug image
 # ---------------------------------------------------------------------------
@@ -187,8 +206,9 @@ def process_sequence(
     table_z:   float,
     overwrite: bool = False,
     debug:     bool = False,
+    fix_transform: bool = False,
 ) -> dict:
-    """Compute and save table_plane.h5 for one recording directory."""
+    """Compute and save table_plane.h5, or fixed_table_plane.h5 with -fix_transform."""
     result = {"name": seq_dir.name, "success": False, "n_frames": 0, "error": None}
 
     depth_h5_path = seq_dir / "hdf5" / "depth_in_event_frame.h5"
@@ -201,12 +221,19 @@ def process_sequence(
         result["error"] = "poses.h5 not found"
         return result
 
-    out_path = seq_dir / "hdf5" / "table_plane.h5"
+    table_plane_filename = "fixed_table_plane.h5" if fix_transform else "table_plane.h5"
+    out_path = seq_dir / "hdf5" / table_plane_filename
 
     with h5py.File(depth_h5_path, "r") as df:
         n_depth = df["depth"].shape[0]
         H       = df["depth"].shape[1]
         W       = df["depth"].shape[2]
+        native_H = int(df.attrs.get("native_ev_h", calib["native_H"]))
+        native_W = int(df.attrs.get("native_ev_w", calib["native_W"]))
+        resize_H = int(df.attrs.get("resize_h", native_H))
+        resize_W = int(df.attrs.get("resize_w", native_W))
+        crop_H = int(df.attrs.get("crop_h", H))
+        crop_W = int(df.attrs.get("crop_w", W))
 
     with h5py.File(poses_path, "r") as pf:
         ee_T_all = pf["ee_T"][:]
@@ -219,9 +246,15 @@ def process_sequence(
     if not overwrite and out_path.exists():
         with h5py.File(out_path, "r") as ef:
             if ef["table_plane"].shape[0] >= n_frames:
-                result.update(success=True, n_frames=n_frames,
-                               error="Already computed (use --overwrite)")
-                return result
+                existing_fix_transform = bool(ef.attrs.get("fix_transform", False))
+                if not fix_transform or existing_fix_transform:
+                    result.update(success=True, n_frames=n_frames,
+                                  error="Already computed (use --overwrite)")
+                    return result
+                print(
+                    f"  [{seq_dir.name}] Existing {table_plane_filename} was computed without "
+                    "-fix_transform; recomputing fixed transform."
+                )
 
     # Build T_base_from_event for every frame
     T_ee_from_event        = calib["T_ee_from_event"]
@@ -244,15 +277,31 @@ def process_sequence(
         of.attrs["table_z_m"]  = float(table_z)
         of.attrs["depth_min"]  = float(DEPTH_MIN)
         of.attrs["depth_max"]  = float(D_MAX)
+        of.attrs["fix_transform"] = bool(fix_transform)
         of.attrs["description"] = (
             f"Per-pixel normalised depth [0,1] to table plane z={table_z:.4f} m "
             f"(robot base frame). Training depth range: [{DEPTH_MIN}, {D_MAX}] m."
         )
 
+        if fix_transform:
+            K_for_table = _scale_K_resize_crop(
+                calib["K_native"],
+                native_H,
+                native_W,
+                resize_H,
+                resize_W,
+                crop_H,
+                crop_W,
+            )
+            K_native_H, K_native_W = H, W
+        else:
+            K_for_table = calib["K_native"]
+            K_native_H, K_native_W = calib["native_H"], calib["native_W"]
+
         for fi in tqdm(range(n_frames), desc=seq_dir.name, leave=False):
             channel = _compute_channel(
                 T_base_from_event_all[fi],
-                calib["K_native"], calib["native_H"], calib["native_W"],
+                K_for_table, K_native_H, K_native_W,
                 H, W, table_z,
             )
             ds[fi] = channel
@@ -274,7 +323,7 @@ def process_sequence(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Precompute table-plane depth prior (hdf5/table_plane.h5).",
+        description="Precompute table-plane depth prior (hdf5/table_plane.h5, or hdf5/fixed_table_plane.h5 with -fix_transform).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -293,12 +342,18 @@ def main() -> None:
     )
     parser.add_argument(
         "--overwrite", action="store_true",
-        help="Re-compute even if table_plane.h5 already exists.",
+        help="Re-compute even if the selected table-plane file already exists.",
     )
     parser.add_argument(
         "--debug", action="store_true",
         help="Save debug/table_plane_debug.png (GT depth | table-plane depth) "
              "for each sequence.",
+    )
+    parser.add_argument(
+        "-fix_transform", "--fix_transform", action="store_true",
+        help="Opt-in geometry fix: scale event intrinsics through the stored "
+             "resize + centred crop transform instead of the historical direct "
+             "native-resolution -> final-resolution scaling.",
     )
     args = parser.parse_args()
 
@@ -325,27 +380,33 @@ def main() -> None:
             and (p / "hdf5" / "poses.h5").exists()
         )
 
+    def _collect_sequences(path: Path) -> list[Path]:
+        if _is_sequence(path):
+            return [path]
+        if not path.is_dir():
+            return []
+        return sorted(
+            d for d in path.rglob("*")
+            if d.is_dir() and _is_sequence(d)
+        )
+
+    searched_roots: list[Path]
     if args.data_dir:
         seq_dirs = []
+        searched_roots = []
         for data_dir in args.data_dir:
             path = _resolve_data_path(data_dir)
-            if _is_sequence(path):
-                seq_dirs.append(path)
-            else:
-                seq_dirs.extend(
-                    d for d in sorted(path.iterdir())
-                    if d.is_dir() and _is_sequence(d)
-                )
+            searched_roots.append(path)
+            seq_dirs.extend(_collect_sequences(path))
         seq_dirs = sorted(set(seq_dirs))
-    elif _is_sequence(data_root):
-        seq_dirs = [data_root]
     else:
-        seq_dirs = sorted(d for d in data_root.iterdir()
-                          if d.is_dir() and _is_sequence(d))
+        searched_roots = [data_root]
+        seq_dirs = _collect_sequences(data_root)
 
     if not seq_dirs:
+        searched = ", ".join(str(p) for p in searched_roots)
         sys.exit(
-            f"[ERROR] No valid sequences found at or under {data_root}\n"
+            f"[ERROR] No valid sequences found at or under {searched}\n"
             "        Make sure depth_in_event_frame.h5 and poses.h5 exist."
         )
 
@@ -357,6 +418,7 @@ def main() -> None:
             seq_dir, calib, args.table_z,
             overwrite=args.overwrite,
             debug=args.debug,
+            fix_transform=args.fix_transform,
         )
         results.append(r)
         status = "OK"   if r["success"] else "FAIL"
