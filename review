@@ -1,3 +1,0 @@
-review _compute_valid_indices in train
-
-change resize and crop to be done by precomputations only instead of doing it partly with train

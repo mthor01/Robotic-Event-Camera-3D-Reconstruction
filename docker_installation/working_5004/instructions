@@ -1,6 +1,0 @@
-docker build -t openeb-with-py --build-arg OPENEB_REF=5.2.0 .
-
-docker run -it --rm \
-  -v $(pwd):/work \
-  openeb-with-py
-

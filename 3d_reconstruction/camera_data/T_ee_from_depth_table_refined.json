@@ -1,0 +1,258 @@
+{
+  "data_root": "data/new",
+  "sequences": 50,
+  "observations": 2652,
+  "train_observations": 1326,
+  "validation_observations": 1326,
+  "optimizer_success": true,
+  "optimizer_message": "`ftol` termination condition is satisfied.",
+  "estimated_table_z_m": -0.016291177058902973,
+  "correction_rotation_deg": [
+    0.6360718185516777,
+    0.7241490068035425,
+    0.07625422902007178
+  ],
+  "correction_translation_mm": [
+    5.0653829370679615,
+    50.902584762442764,
+    14.038636533181641
+  ],
+  "train_before": {
+    "count": 1326,
+    "height_median_m": -0.0020525656669265254,
+    "height_std_mm": 2.7316595453584767,
+    "height_range_mm": 14.480789693535392,
+    "tilt_median_deg": 0.9820571264027134,
+    "tilt_std_deg": 0.4571304040878747,
+    "tilt_max_deg": 2.7955963968861375
+  },
+  "train_after": {
+    "count": 1326,
+    "height_median_m": -0.016344100647732965,
+    "height_std_mm": 2.397300603331347,
+    "height_range_mm": 11.171342510503335,
+    "tilt_median_deg": 0.7173217602596847,
+    "tilt_std_deg": 0.25890431570616335,
+    "tilt_max_deg": 1.996808319774452
+  },
+  "validation_before": {
+    "count": 1326,
+    "height_median_m": -0.0021506176378775603,
+    "height_std_mm": 2.722938161428077,
+    "height_range_mm": 12.538833879271811,
+    "tilt_median_deg": 0.9802685502527647,
+    "tilt_std_deg": 0.4564204618264102,
+    "tilt_max_deg": 2.1469804793838647
+  },
+  "validation_after": {
+    "count": 1326,
+    "height_median_m": -0.016323342873526978,
+    "height_std_mm": 2.396156522920259,
+    "height_range_mm": 11.492900614476547,
+    "tilt_median_deg": 0.7133455840460898,
+    "tilt_std_deg": 0.25686244671342773,
+    "tilt_max_deg": 1.4001269555488676
+  },
+  "per_sequence": {
+    "data/new/eval/20": {
+      "accepted": 63,
+      "attempted": 63
+    },
+    "data/new/eval/30": {
+      "accepted": 80,
+      "attempted": 80
+    },
+    "data/new/eval/40": {
+      "accepted": 50,
+      "attempted": 50
+    },
+    "data/new/eval/50": {
+      "accepted": 47,
+      "attempted": 47
+    },
+    "data/new/eval/60": {
+      "accepted": 50,
+      "attempted": 50
+    },
+    "data/new/eval/70": {
+      "accepted": 47,
+      "attempted": 47
+    },
+    "data/new/train/21": {
+      "accepted": 58,
+      "attempted": 58
+    },
+    "data/new/train/22": {
+      "accepted": 69,
+      "attempted": 69
+    },
+    "data/new/train/23": {
+      "accepted": 67,
+      "attempted": 67
+    },
+    "data/new/train/24": {
+      "accepted": 79,
+      "attempted": 79
+    },
+    "data/new/train/25": {
+      "accepted": 67,
+      "attempted": 67
+    },
+    "data/new/train/26": {
+      "accepted": 64,
+      "attempted": 64
+    },
+    "data/new/train/27": {
+      "accepted": 64,
+      "attempted": 64
+    },
+    "data/new/train/28": {
+      "accepted": 66,
+      "attempted": 66
+    },
+    "data/new/train/29": {
+      "accepted": 73,
+      "attempted": 73
+    },
+    "data/new/train/31": {
+      "accepted": 61,
+      "attempted": 61
+    },
+    "data/new/train/32": {
+      "accepted": 60,
+      "attempted": 60
+    },
+    "data/new/train/33": {
+      "accepted": 65,
+      "attempted": 65
+    },
+    "data/new/train/34": {
+      "accepted": 50,
+      "attempted": 50
+    },
+    "data/new/train/35": {
+      "accepted": 48,
+      "attempted": 48
+    },
+    "data/new/train/36": {
+      "accepted": 46,
+      "attempted": 46
+    },
+    "data/new/train/37": {
+      "accepted": 42,
+      "attempted": 42
+    },
+    "data/new/train/38": {
+      "accepted": 50,
+      "attempted": 50
+    },
+    "data/new/train/39": {
+      "accepted": 46,
+      "attempted": 46
+    },
+    "data/new/train/41": {
+      "accepted": 49,
+      "attempted": 49
+    },
+    "data/new/train/42": {
+      "accepted": 51,
+      "attempted": 51
+    },
+    "data/new/train/43": {
+      "accepted": 43,
+      "attempted": 43
+    },
+    "data/new/train/44": {
+      "accepted": 53,
+      "attempted": 53
+    },
+    "data/new/train/46": {
+      "accepted": 42,
+      "attempted": 42
+    },
+    "data/new/train/47": {
+      "accepted": 41,
+      "attempted": 41
+    },
+    "data/new/train/48": {
+      "accepted": 40,
+      "attempted": 40
+    },
+    "data/new/train/49": {
+      "accepted": 47,
+      "attempted": 47
+    },
+    "data/new/train/51": {
+      "accepted": 48,
+      "attempted": 48
+    },
+    "data/new/train/52": {
+      "accepted": 45,
+      "attempted": 45
+    },
+    "data/new/train/53": {
+      "accepted": 48,
+      "attempted": 48
+    },
+    "data/new/train/54": {
+      "accepted": 46,
+      "attempted": 46
+    },
+    "data/new/train/55": {
+      "accepted": 55,
+      "attempted": 55
+    },
+    "data/new/train/56": {
+      "accepted": 45,
+      "attempted": 45
+    },
+    "data/new/train/57": {
+      "accepted": 45,
+      "attempted": 45
+    },
+    "data/new/train/58": {
+      "accepted": 48,
+      "attempted": 48
+    },
+    "data/new/train/59": {
+      "accepted": 46,
+      "attempted": 46
+    },
+    "data/new/train/61": {
+      "accepted": 50,
+      "attempted": 50
+    },
+    "data/new/train/62": {
+      "accepted": 46,
+      "attempted": 46
+    },
+    "data/new/train/63": {
+      "accepted": 47,
+      "attempted": 47
+    },
+    "data/new/train/64": {
+      "accepted": 50,
+      "attempted": 50
+    },
+    "data/new/train/65": {
+      "accepted": 47,
+      "attempted": 47
+    },
+    "data/new/train/66": {
+      "accepted": 46,
+      "attempted": 46
+    },
+    "data/new/train/67": {
+      "accepted": 44,
+      "attempted": 44
+    },
+    "data/new/train/68": {
+      "accepted": 66,
+      "attempted": 66
+    },
+    "data/new/train/69": {
+      "accepted": 52,
+      "attempted": 52
+    }
+  }
+}

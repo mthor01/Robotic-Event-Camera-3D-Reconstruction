@@ -14,6 +14,7 @@ Usage:
 """
 
 import argparse
+import copy
 import sys
 from pathlib import Path
 
@@ -23,7 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
-from viz import VizLogger
+from tensorboard_helper import VizLogger
 
 # ---------------------------------------------------------------------------
 # Constants (from 3d_reconstruction/config.py)
@@ -239,6 +240,28 @@ class UNet(nn.Module):
         return self.head(feat)   # (B, 1, H, W) in [0, 1]
 
 
+class ModelEMA:
+    """Exponential moving average of parameters and floating-point buffers."""
+
+    def __init__(self, model: nn.Module, decay: float):
+        self.decay = float(decay)
+        self.model = copy.deepcopy(model).eval()
+        for parameter in self.model.parameters():
+            parameter.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        source = model.state_dict()
+        for name, averaged in self.model.state_dict().items():
+            current = source[name].detach()
+            if averaged.is_floating_point():
+                averaged.mul_(self.decay).add_(
+                    current.to(dtype=averaged.dtype), alpha=1.0 - self.decay
+                )
+            else:
+                averaged.copy_(current)
+
+
 # ---------------------------------------------------------------------------
 # Loss  (e2depth_loss: charbonnier + gradient + smoothness + mean-depth)
 # ---------------------------------------------------------------------------
@@ -410,6 +433,7 @@ def run_epoch(
     device:    torch.device,
     K:         torch.Tensor | None = None,
     viz:       VizLogger | None = None,
+    ema_model: ModelEMA | None = None,
 ) -> tuple:
     """
     Run one training or validation epoch.
@@ -437,6 +461,8 @@ def run_epoch(
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                if ema_model is not None:
+                    ema_model.update(model)
 
             total_loss += loss.item()
             with torch.no_grad():
@@ -472,7 +498,12 @@ def main() -> None:
                         default=_SCRIPT_DIR / "checkpoints" / "unet",
                         help="Directory for checkpoints and TensorBoard logs")
     parser.add_argument("--seed",           type=int,  default=42)
+    parser.add_argument("--ema_decay",      type=float, default=0.0,
+                        help="EMA decay used for validation/checkpoints; 0 disables EMA")
     args = parser.parse_args()
+
+    if args.ema_decay < 0 or args.ema_decay >= 1:
+        parser.error("--ema_decay must be in [0, 1)")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -568,6 +599,12 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=args.lr * 1e-2
     )
+    ema = ModelEMA(model, args.ema_decay) if args.ema_decay > 0 else None
+    if ema is not None:
+        print(
+            f"EMA: enabled (decay={args.ema_decay:g}); "
+            "validation/checkpoints use EMA weights"
+        )
 
     # ------------------------------------------------------------------
     # Logging
@@ -584,8 +621,14 @@ def main() -> None:
     best_val_l1 = float("inf")
 
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_l1 = run_epoch(model, train_loader, optimizer, device, K=K, viz=viz_train)
-        val_loss,   val_l1   = run_epoch(model, val_loader,   None,      device, K=K, viz=viz_val)
+        train_loss, train_l1 = run_epoch(
+            model, train_loader, optimizer, device, K=K, viz=viz_train,
+            ema_model=ema,
+        )
+        validation_model = ema.model if ema is not None else model
+        val_loss, val_l1 = run_epoch(
+            validation_model, val_loader, None, device, K=K, viz=viz_val
+        )
         scheduler.step()
 
         viz_train.flush(step=epoch)
@@ -610,18 +653,20 @@ def main() -> None:
             ckpt_path   = args.out_dir / "best.pth"
             torch.save({
                 "epoch":     epoch,
-                "model":     model.state_dict(),
+                "model":     validation_model.state_dict(),
                 "val_l1":    val_l1,
                 "base":      args.base_channels,
+                "ema_decay": args.ema_decay,
             }, ckpt_path)
             print(f"  → new best checkpoint saved (val L1 = {val_l1:.4f} m)")
 
     # Save final checkpoint
     torch.save({
         "epoch":  args.epochs,
-        "model":  model.state_dict(),
+        "model":  validation_model.state_dict(),
         "val_l1": val_l1,
         "base":   args.base_channels,
+        "ema_decay": args.ema_decay,
     }, args.out_dir / "last.pth")
 
     writer.close()

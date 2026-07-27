@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-unet_viz.py — TensorBoard image visualization helper for train_unet.py.
+TensorBoard path and image-visualization helpers.
 
 Each logged panel contains up to `n_samples` rows, one row per sample.
 Each row has six sub-images (left to right):
@@ -9,7 +9,7 @@ Each row has six sub-images (left to right):
 
 Usage in train_unet.py
 ----------------------
-    from unet_viz import UNetVizLogger
+    from tensorboard_helper import UNetVizLogger
 
     viz_train = UNetVizLogger(writer, n_samples=4, tag="viz/train")
     viz_val   = UNetVizLogger(writer, n_samples=4, tag="viz/val")
@@ -24,11 +24,25 @@ Usage in train_unet.py
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
+
+
+DEFAULT_TB_ROOT = Path(__file__).resolve().parent / "checkpoints" / "tensorboard"
+
+
+def tensorboard_run_dir(
+    model_name: str,
+    run_name: str,
+    tb_root: Path | str | None = None,
+) -> Path:
+    root = Path(tb_root) if tb_root is not None else DEFAULT_TB_ROOT
+    return root / model_name / run_name
+
 
 # ---------------------------------------------------------------------------
 # Colourmap helpers

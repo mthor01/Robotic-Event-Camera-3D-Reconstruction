@@ -31,6 +31,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import sys
 import time
 from dataclasses import dataclass
@@ -40,17 +41,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import ConcatDataset, DataLoader, Dataset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler
 from torch.utils.tensorboard import SummaryWriter
 
 from train_unet import (
     DEPTH_MIN, D_MAX, NUM_BINS, _SCRIPT_DIR, DATA_ROOT,
     compute_loss, _l1_metres, _worst_percent_l1_metres,
 )
-from tensorboard_runs import DEFAULT_TB_ROOT, tensorboard_run_dir
-from viz import (
+from tensorboard_helper import (
+    DEFAULT_TB_ROOT,
     ErrorDistributionSpatialLogger,
     EventActivityAccuracyLogger,
+    tensorboard_run_dir,
     UncertaintyErrorLogger,
     VizLogger,
 )
@@ -108,11 +110,48 @@ def _scale_K(K: np.ndarray, native_hw: tuple[int, int], target_hw: tuple[int, in
     return K_scaled.astype(np.float32)
 
 
+def _scale_K_resize_crop(
+    K: np.ndarray,
+    native_hw: tuple[int, int],
+    resize_hw: tuple[int, int],
+    crop_hw: tuple[int, int],
+) -> np.ndarray:
+    """Scale event intrinsics through resize + centred crop.
+
+    This matches the preprocessing used by project_realsense_to_event.py and
+    precompute_voxels.py. The historical direct native->tensor scaling remains
+    unchanged unless --fix_transform is enabled.
+    """
+    native_h, native_w = native_hw
+    resize_h, resize_w = resize_hw
+    crop_h, crop_w = crop_hw
+    K_scaled = K.copy()
+    K_scaled[0, :] *= resize_w / native_w
+    K_scaled[1, :] *= resize_h / native_h
+    K_scaled[0, 2] -= (resize_w - crop_w) / 2.0
+    K_scaled[1, 2] -= (resize_h - crop_h) / 2.0
+    return K_scaled.astype(np.float32)
+
+
 def _inverse_depth_candidates(num_depths: int, depth_min: float, depth_max: float) -> np.ndarray:
     if num_depths < 2:
         raise ValueError(f"--num_depths must be >= 2, got {num_depths}")
     inv = np.linspace(1.0 / depth_min, 1.0 / depth_max, num_depths, dtype=np.float32)
     return (1.0 / inv).astype(np.float32)
+
+
+def _table_plane_filename(fix_transform: bool) -> str:
+    return "fixed_table_plane.h5" if fix_transform else "table_plane.h5"
+
+
+def _pose_channels_from_base_event(T_base_from_event: np.ndarray) -> np.ndarray:
+    """Return six pose values: event-camera position and optical axis in base frame."""
+    position = T_base_from_event[:3, 3].astype(np.float32)
+    optical_axis = T_base_from_event[:3, 2].astype(np.float32)
+    norm = float(np.linalg.norm(optical_axis))
+    if norm > 1e-6:
+        optical_axis = optical_axis / norm
+    return np.concatenate([position, optical_axis]).astype(np.float32)
 
 
 def homo_warp_features(
@@ -241,12 +280,16 @@ class MultiViewTableDataset(Dataset):
         num_depths: int = 32,
         use_mask: bool = True,
         fill_invalid: bool = False,
+        fix_transform: bool = False,
+        pose_channels: bool = False,
+        recurrent: bool = False,
+        recurrent_enrollment_range: int = 0,
         split_indices: np.ndarray | None = None,
         aug: MultiViewAugConfig | None = None,
     ):
         super().__init__()
-        if num_views < 2:
-            raise ValueError("--num_views must be at least 2 for multi-view training")
+        if num_views < 1:
+            raise ValueError("--num_views must be at least 1")
         if pose_view_selection and num_views % 2 != 1:
             raise ValueError(
                 "--pose_view_selection requires odd --num_views so sources are balanced "
@@ -254,6 +297,12 @@ class MultiViewTableDataset(Dataset):
             )
         if pose_move_threshold <= 0:
             raise ValueError(f"--pose_move_threshold must be > 0, got {pose_move_threshold}")
+        if recurrent and num_views != 1:
+            raise ValueError("--recurrent only supports single-view input; set --num_views 1")
+        if recurrent and pose_view_selection:
+            raise ValueError("--recurrent cannot be combined with --pose_view_selection")
+        if recurrent_enrollment_range < 0:
+            raise ValueError("--recurrent_enrollment_range must be >= 0")
 
         self.seq_dir = Path(seq_dir)
         self.num_views = num_views
@@ -261,13 +310,16 @@ class MultiViewTableDataset(Dataset):
         self.pose_view_selection = pose_view_selection
         self.pose_move_threshold = float(pose_move_threshold)
         self.fill_invalid = fill_invalid
+        self.pose_channels = bool(pose_channels)
+        self.recurrent = bool(recurrent)
+        self.recurrent_enrollment_range = int(recurrent_enrollment_range)
         self.aug = aug or MultiViewAugConfig(enabled=False)
 
         self.voxels_path = self.seq_dir / "events" / "voxels_cam0.h5"
         self.depth_path = self.seq_dir / "hdf5" / "depth_in_event_frame.h5"
         self.mask_path = self.seq_dir / "hdf5" / "spatial_mask.h5"
         self.poses_path = self.seq_dir / "hdf5" / "poses.h5"
-        self.table_plane_path = self.seq_dir / "hdf5" / "table_plane.h5"
+        self.table_plane_path = self.seq_dir / "hdf5" / _table_plane_filename(fix_transform)
 
         for p in (self.voxels_path, self.depth_path, self.poses_path, self.table_plane_path):
             if not p.exists():
@@ -279,14 +331,36 @@ class MultiViewTableDataset(Dataset):
         with h5py.File(self.voxels_path, "r") as f:
             n_v = f["voxels"].shape[0]
             _, vox_h, vox_w = f["voxels"].shape[1:]
+            vox_attrs = dict(f["voxels"].attrs)
         with h5py.File(self.table_plane_path, "r") as f:
             n_t = f["table_plane"].shape[0]
+            table_fix_transform = bool(f.attrs.get("fix_transform", False))
         with h5py.File(self.poses_path, "r") as f:
             ee_T = f["ee_T"][:].astype(np.float32)
 
         self.n_frames = min(n_d, n_v, n_t, len(ee_T))
         self.has_mask = use_mask and self.mask_path.exists()
-        self.K = _scale_K(calib["K_native"], calib["native_hw"], (vox_h, vox_w))
+        if fix_transform and not table_fix_transform:
+            print(
+                f"  [{self.seq_dir.name}] WARNING: -fix_transform is active for MVS K, "
+                f"but hdf5/{self.table_plane_path.name} was not marked as fixed. Re-run "
+                "data_precomputation/precompute_table_plane.py -fix_transform for a "
+                "fully consistent table prior."
+            )
+        if fix_transform:
+            native_h, native_w = calib["native_hw"]
+            resize_h = int(vox_attrs.get("resize_h", vox_h))
+            resize_w = int(vox_attrs.get("resize_w", vox_w))
+            crop_h = int(vox_attrs.get("crop_h", vox_h))
+            crop_w = int(vox_attrs.get("crop_w", vox_w))
+            self.K = _scale_K_resize_crop(
+                calib["K_native"],
+                (native_h, native_w),
+                (resize_h, resize_w),
+                (crop_h, crop_w),
+            )
+        else:
+            self.K = _scale_K(calib["K_native"], calib["native_hw"], (vox_h, vox_w))
         self.depth_values = _inverse_depth_candidates(num_depths, DEPTH_MIN, D_MAX)
 
         ee_T = ee_T[:self.n_frames]
@@ -295,9 +369,23 @@ class MultiViewTableDataset(Dataset):
             "ij,njk->nik", calib["T_event_from_ee"], T_ee_inv
         ).astype(np.float32)
         self.cam_centers_world = self._camera_centers_world(self.T_cam_from_world)
+        if self.pose_channels:
+            T_base_from_event = np.linalg.inv(self.T_cam_from_world).astype(np.float32)
+            self.pose_values = np.stack(
+                [_pose_channels_from_base_event(T) for T in T_base_from_event],
+                axis=0,
+            ).astype(np.float32)
+        else:
+            self.pose_values = None
 
         self.pose_view_ids: dict[int, list[int]] = {}
-        if self.pose_view_selection:
+        if num_views == 1:
+            self.src_offsets = []
+            if self.recurrent:
+                valid = np.arange(self.recurrent_enrollment_range, self.n_frames, dtype=np.int64)
+            else:
+                valid = np.arange(self.n_frames, dtype=np.int64)
+        elif self.pose_view_selection:
             valid = self._make_pose_view_ids(num_views, self.pose_move_threshold)
         else:
             self.src_offsets = self._make_source_offsets(num_views, view_interval)
@@ -411,7 +499,12 @@ class MultiViewTableDataset(Dataset):
             tbl_t = F.interpolate(
                 tbl_t.unsqueeze(0), (h, w), mode="bilinear", align_corners=False
             ).squeeze(0)
-        return torch.cat([vox_t, tbl_t], dim=0)
+        channels = [vox_t, tbl_t]
+        if self.pose_channels:
+            pose_values = self.pose_values[idx]
+            pose_t = torch.from_numpy(pose_values).view(6, 1, 1).expand(-1, h, w)
+            channels.append(pose_t)
+        return torch.cat(channels, dim=0)
 
     @staticmethod
     def _axis_angle_to_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
@@ -504,6 +597,8 @@ class MultiViewTableDataset(Dataset):
         idx = int(self.valid_indices[item])
         if self.pose_view_selection:
             view_ids = self.pose_view_ids[idx]
+        elif self.recurrent:
+            view_ids = list(range(idx - self.recurrent_enrollment_range, idx + 1))
         else:
             view_ids = [idx] + [idx + o for o in self.src_offsets]
 
@@ -523,7 +618,8 @@ class MultiViewTableDataset(Dataset):
             msk_t = F.interpolate(msk_t.unsqueeze(0), (h, w), mode="nearest").squeeze(0)
 
         if self.fill_invalid:
-            tbl_m = imgs[0, NUM_BINS:NUM_BINS + 1] * (D_MAX - DEPTH_MIN) + DEPTH_MIN
+            target_view = -1 if self.recurrent else 0
+            tbl_m = imgs[target_view, NUM_BINS:NUM_BINS + 1] * (D_MAX - DEPTH_MIN) + DEPTH_MIN
             dep_t = torch.where(msk_t > 0.5, dep_t, tbl_m)
             msk_t = torch.ones_like(msk_t)
 
@@ -539,6 +635,40 @@ class MultiViewTableDataset(Dataset):
             "ref_idx": torch.tensor(idx, dtype=torch.long),
             "view_ids": torch.tensor(view_ids, dtype=torch.long),
         }
+
+
+class PerSequenceFractionSampler(Sampler[int]):
+    """Select a new deterministic random fraction from every sequence each epoch."""
+
+    def __init__(self, sequence_lengths: list[int], fraction: float, seed: int):
+        self.sequence_lengths = [int(n) for n in sequence_lengths]
+        self.fraction = float(fraction)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.offsets = np.cumsum([0, *self.sequence_lengths[:-1]]).tolist()
+        self.sample_counts = [
+            min(n, max(1, int(round(n * self.fraction))))
+            for n in self.sequence_lengths
+        ]
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return sum(self.sample_counts)
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        selected: list[torch.Tensor] = []
+        for offset, length, count in zip(
+            self.offsets, self.sequence_lengths, self.sample_counts
+        ):
+            local = torch.randperm(length, generator=generator)[:count]
+            selected.append(local + offset)
+        indices = torch.cat(selected)
+        order = torch.randperm(len(indices), generator=generator)
+        return iter(indices[order].tolist())
 
 
 # ---------------------------------------------------------------------------
@@ -839,6 +969,22 @@ class MultiViewDepthNet(nn.Module):
         fullres_geometry: bool = False,
         fullres_depths: int = 3,
         fullres_window: float = 0.01,
+        fpn_dropout: float = 0.0,
+        reference_dropout: float = 0.0,
+        hourglass_dropout: float = 0.0,
+        drop_path_rate: float = 0.0,
+        cost_volume_type: str = "correlation",
+        middle_depths: int = 8,
+        middle_window: float = 0.12,
+        middle_cost_channels: int = 0,
+        middle_hourglass_levels: int = 0,
+        middle_feature_channels: int = 0,
+        fine_feature_channels: int = 0,
+        middle_supervision: bool = False,
+        middle_loss_weight: float = 0.3,
+        fullres_fine_volume: bool = False,
+        h4_coarse_volume: bool = False,
+        decoder_type: str = "auto",
     ):
         super().__init__()
         del (
@@ -859,6 +1005,22 @@ class MultiViewDepthNet(nn.Module):
             fullres_geometry,
             fullres_depths,
             fullres_window,
+            fpn_dropout,
+            reference_dropout,
+            hourglass_dropout,
+            drop_path_rate,
+            cost_volume_type,
+            middle_depths,
+            middle_window,
+            middle_cost_channels,
+            middle_hourglass_levels,
+            middle_feature_channels,
+            fine_feature_channels,
+            middle_supervision,
+            middle_loss_weight,
+            fullres_fine_volume,
+            h4_coarse_volume,
+            decoder_type,
         )
         if fine_depths < 3:
             raise ValueError(f"fine_depths must be >= 3, got {fine_depths}")
@@ -1104,7 +1266,8 @@ class MultiViewDepthNet(nn.Module):
                 size=(H, W),
                 mode="bilinear",
                 align_corners=False,
-            ).clamp(0.0, 1.0)
+            )
+            confidence_m = confidence_m.clamp(0.0, 1.0)
 
         if not return_coarse:
             if return_uncertainty:
@@ -1144,12 +1307,22 @@ def run_epoch(
     confidence_rel_tolerance: float = 0.01,
     fine_supervision: bool = False,
     fine_loss_weight: float = 0.3,
-) -> tuple[float, float, float]:
+    middle_supervision: bool = False,
+    middle_loss_weight: float = 0.3,
+    lambda_worst_percent: float = 0.0,
+    worst_percent: float = 0.10,
+    ema_model=None,
+    freeze_batch_norm: bool = False,
+) -> tuple[float, float, float, float]:
     is_train = optimizer is not None
     model.train(is_train)
+    if is_train and freeze_batch_norm:
+        for module in model.modules():
+            if isinstance(module, nn.modules.batchnorm._BatchNorm):
+                module.eval()
     ctx = torch.enable_grad() if is_train else torch.no_grad()
 
-    total_loss = total_l1 = total_worst10_l1 = 0.0
+    total_loss = total_l1 = total_p95 = total_worst10_l1 = 0.0
     n_batches = 0
     phase = "train" if is_train else "val"
     t_phase_start = time.perf_counter()
@@ -1189,11 +1362,15 @@ def run_epoch(
                 else:
                     pred = model_out
 
+            pred_loss = pred
+            coarse_pred_loss = None
+            if coarse_supervision:
+                coarse_pred_loss = coarse_pred
             if l1_loss_only:
-                loss_final = _l1_metres(pred, dep_t, mask_t)
+                loss_final = _l1_metres(pred_loss, dep_t, mask_t)
             else:
                 loss_final, _ = compute_loss(
-                    pred,
+                    pred_loss,
                     dep_norm,
                     mask_t,
                     imgs[:, 0, :NUM_BINS],
@@ -1204,6 +1381,14 @@ def run_epoch(
                     lambda_normal=lambda_normal,
                 )
             loss = loss_final
+            if lambda_worst_percent > 0:
+                loss_worst = _worst_percent_l1_metres(
+                    pred_loss,
+                    dep_t,
+                    mask_t,
+                    percent=worst_percent,
+                )
+                loss = loss + lambda_worst_percent * loss_worst
             if fine_supervision:
                 fine_pred = getattr(model, "aux_fine_pred", None)
                 if fine_pred is None:
@@ -1215,12 +1400,26 @@ def run_epoch(
                 fine_mask = F.interpolate(mask_t, size=fine_hw, mode="nearest")
                 loss_fine = _l1_metres(fine_pred, fine_depth, fine_mask)
                 loss = loss + fine_loss_weight * loss_fine
+            if middle_supervision:
+                middle_pred = getattr(model, "aux_middle_pred", None)
+                if middle_pred is None:
+                    raise RuntimeError(
+                        "--middle_supervision requires a three-stage model "
+                        "exposing aux_middle_pred"
+                    )
+                middle_hw = middle_pred.shape[-2:]
+                middle_depth = F.interpolate(dep_t, size=middle_hw, mode="nearest")
+                middle_mask = F.interpolate(mask_t, size=middle_hw, mode="nearest")
+                loss_middle = _l1_metres(
+                    middle_pred, middle_depth, middle_mask
+                )
+                loss = loss + middle_loss_weight * loss_middle
             if coarse_supervision:
                 if l1_loss_only:
-                    loss_coarse = _l1_metres(coarse_pred, dep_t, mask_t)
+                    loss_coarse = _l1_metres(coarse_pred_loss, dep_t, mask_t)
                 else:
                     loss_coarse, _ = compute_loss(
-                        coarse_pred,
+                        coarse_pred_loss,
                         dep_norm,
                         mask_t,
                         imgs[:, 0, :NUM_BINS],
@@ -1232,7 +1431,7 @@ def run_epoch(
                     )
                 loss = loss + coarse_loss_weight * loss_coarse
             if uncertainty and pred_unc is not None and lambda_confidence > 0:
-                pred_m = pred * (D_MAX - DEPTH_MIN) + DEPTH_MIN
+                pred_m = pred_loss * (D_MAX - DEPTH_MIN) + DEPTH_MIN
                 with torch.no_grad():
                     error = torch.abs(pred_m.detach() - dep_t)
                     tolerance = confidence_abs_tolerance + confidence_rel_tolerance * dep_t
@@ -1260,11 +1459,17 @@ def run_epoch(
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 optimizer.step()
+                if ema_model is not None:
+                    ema_model.update(model)
 
             total_loss += float(loss.detach())
             with torch.no_grad():
-                total_l1 += float(_l1_metres(pred, dep_t, mask_t))
-                total_worst10_l1 += float(_worst_percent_l1_metres(pred, dep_t, mask_t))
+                total_l1 += float(_l1_metres(pred_loss, dep_t, mask_t))
+                pred_m = pred_loss * (D_MAX - DEPTH_MIN) + DEPTH_MIN
+                valid_errors = torch.abs(pred_m - dep_t)[mask_t > 0.5]
+                if valid_errors.numel() > 0:
+                    total_p95 += float(torch.quantile(valid_errors.float(), 0.95))
+                total_worst10_l1 += float(_worst_percent_l1_metres(pred_loss, dep_t, mask_t))
             n_batches += 1
 
             now = time.perf_counter()
@@ -1288,6 +1493,7 @@ def run_epoch(
                     f"{batches_per_s:.3f} batch/s ({seconds_per_batch:.2f} s/batch)  "
                     f"loss {total_loss / n_batches:.4f}  "
                     f"L1 {total_l1 / n_batches:.4f} m  "
+                    f"p95 {total_p95 / n_batches:.4f} m  "
                     f"worst10 {total_worst10_l1 / n_batches:.4f} m"
                     f"{vram_text}",
                     flush=True,
@@ -1296,7 +1502,7 @@ def run_epoch(
                 batches_at_last_log = n_batches
 
             with torch.no_grad():
-                pred_m = pred * (D_MAX - DEPTH_MIN) + DEPTH_MIN
+                pred_m = pred_loss * (D_MAX - DEPTH_MIN) + DEPTH_MIN
                 tbl_ch = imgs[:, 0, NUM_BINS:NUM_BINS + 1]
                 if viz is not None:
                     viz.add_batch(imgs[:, 0, :NUM_BINS], dep_t, mask_t, pred_m, table_depth=tbl_ch)
@@ -1332,7 +1538,7 @@ def run_epoch(
     )
 
     n = max(n_batches, 1)
-    return total_loss / n, total_l1 / n, total_worst10_l1 / n
+    return total_loss / n, total_l1 / n, total_p95 / n, total_worst10_l1 / n
 
 
 def _event_activity_image(voxels: np.ndarray) -> np.ndarray:
@@ -1474,27 +1680,53 @@ def debug_multiview_samples(
 # Main
 # ---------------------------------------------------------------------------
 
-def _is_sequence(p: Path) -> bool:
+def _is_sequence(p: Path, fix_transform: bool = False) -> bool:
     return (
         (p / "events" / "voxels_cam0.h5").exists()
         and (p / "hdf5" / "depth_in_event_frame.h5").exists()
         and (p / "hdf5" / "poses.h5").exists()
-        and (p / "hdf5" / "table_plane.h5").exists()
+        and (p / "hdf5" / _table_plane_filename(fix_transform)).exists()
     )
 
 
-def _find_sequences(root: Path) -> list[Path]:
+def _find_sequences(root: Path, fix_transform: bool = False) -> list[Path]:
     """Return a sequence at root, or all valid immediate child sequences."""
-    if _is_sequence(root):
+    if _is_sequence(root, fix_transform=fix_transform):
         return [root]
     if not root.is_dir():
         return []
-    return sorted(d for d in root.iterdir() if d.is_dir() and _is_sequence(d))
+    return sorted(
+        d for d in root.iterdir()
+        if d.is_dir() and _is_sequence(d, fix_transform=fix_transform)
+    )
 
 
 def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
     for group in optimizer.param_groups:
         group["lr"] = lr
+
+
+class ModelEMA:
+    """Exponential moving average of parameters and floating-point buffers."""
+
+    def __init__(self, model: nn.Module, decay: float):
+        self.decay = float(decay)
+        self.model = copy.deepcopy(model).eval()
+        for parameter in self.model.parameters():
+            parameter.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        source = model.state_dict()
+        for name, averaged in self.model.state_dict().items():
+            current = source[name].detach()
+            if averaged.is_floating_point():
+                averaged.mul_(self.decay).add_(
+                    current.to(dtype=averaged.dtype),
+                    alpha=1.0 - self.decay,
+                )
+            else:
+                averaged.copy_(current)
 
 
 def _make_optimizer(args: argparse.Namespace, model: nn.Module) -> torch.optim.Optimizer:
@@ -1557,6 +1789,12 @@ def main() -> None:
     )
     parser.add_argument("--data_dir", type=Path, default=DATA_ROOT,
                         help="Dataset root containing train/ and eval/ sequence folders")
+    parser.add_argument("--train_sequence_count", type=int, default=0,
+                        help="Use only N deterministically ordered training sequences; 0 uses all")
+    parser.add_argument("--train_sequence_seed", type=int, default=42,
+                        help="Seed defining the nested deterministic training-sequence ordering")
+    parser.add_argument("--train_frame_fraction", type=float, default=1.0,
+                        help="Random fraction sampled independently from each training sequence per epoch")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4,
@@ -1580,6 +1818,12 @@ def main() -> None:
                         help="LR decay factor for step/plateau schedules.")
     parser.add_argument("--lr_plateau_patience", type=int, default=5,
                         help="Validation-L1 patience for --lr_scheduler plateau.")
+    parser.add_argument("--ema_decay", type=float, default=0.0,
+                        help="EMA decay used for validation/checkpoints; 0 disables EMA")
+    parser.add_argument("--early_stopping_patience", type=int, default=0,
+                        help="Stop after this many epochs without validation improvement; 0 disables")
+    parser.add_argument("--freeze_batch_norm", action="store_true",
+                        help="Keep BatchNorm layers in eval mode during training so running stats do not drift")
     parser.add_argument("--lambda_grad", type=float, default=0.5,
                         help="Weight for multi-scale gradient loss term.")
     parser.add_argument("--lambda_smooth", type=float, default=0.01,
@@ -1590,25 +1834,46 @@ def main() -> None:
                         help="Weight for surface-normal loss term.")
     parser.add_argument("--l1_loss_only", action="store_true",
                         help="Train directly with masked metric L1 in metres, ignoring auxiliary loss terms.")
+    parser.add_argument("--lambda_worst_percent", type=float, default=0.0,
+                        help="Weight for metric L1 over the worst valid prediction pixels")
+    parser.add_argument("--worst_percent", type=float, default=0.10,
+                        help="Fraction of valid pixels used by --lambda_worst_percent")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--base_channels", type=int, default=32)
     parser.add_argument("--feature_channels", type=int, default=0,
                         help="Shared CNN output channels; 0 means base_channels*4")
     parser.add_argument("--feature_encoder",
-                        choices=("cnn", "cnn_8", "resnet18", "resnet18_h4",
+                        choices=("cnn", "cnn_8", "casmvsnet_fpn", "deep_fpn", "resnet18", "resnet18_h4",
                                  "resnet34", "resnet34_h4", "resnet50", "efficientnet_b0"),
                         default="cnn",
-                        help="Shared per-view feature encoder; cnn keeps the original lightweight H/4 encoder")
+                        help="Shared per-view feature encoder; casmvsnet_fpn is available in modern_multiview.py")
+    parser.add_argument(
+        "--decoder_type",
+        choices=("auto", "two_stage_fpn", "three_stage_fpn"),
+        default="auto",
+        help=(
+            "Modern MVS decoder/cascade layout: auto preserves existing "
+            "behavior; two_stage_fpn uses H/4 global then H/2 local geometry "
+            "with casmvsnet_fpn/deep_fpn; three_stage_fpn explicitly selects "
+            "the existing three-stage FPN decoder"
+        ),
+    )
     parser.add_argument("--cost_channels", type=int, default=0,
                         help="3D cost CNN base width; 0 means max(base_channels//2, 8)")
     parser.add_argument("--correlation_groups", type=int, default=0,
-                        help="Modern MVS only: group-correlation channels; 0 selects automatically")
+                        help="Modern MVS only: group-correlation channels; for casmvsnet_fpn "
+                             "this is the per-stage maximum; 0 selects automatically")
+    parser.add_argument("--cost_volume_type", choices=("correlation", "variance"),
+                        default="correlation",
+                        help="Modern MVS only: primary multi-view cost-volume aggregation")
     parser.add_argument("--reference_channels", type=int, default=0,
                         help="Modern MVS only: compressed reference channels added to each cost volume")
     parser.add_argument("--coarse_cost_channels", type=int, default=0,
                         help="Modern MVS only: coarse 3D hourglass base width; 0 uses --cost_channels")
     parser.add_argument("--fine_cost_channels", type=int, default=0,
                         help="Modern MVS only: fine 3D hourglass base width; 0 uses --cost_channels")
+    parser.add_argument("--middle_cost_channels", type=int, default=0,
+                        help="CasMVSNet FPN only: H/4 3D hourglass base width; 0 uses --cost_channels")
     parser.add_argument("--refiner_channels", type=int, default=0,
                         help="Modern MVS only: full-resolution 2D refiner width; 0 selects automatically")
     parser.add_argument("--hourglass_levels", type=int, default=2,
@@ -1617,6 +1882,8 @@ def main() -> None:
                         help="Modern MVS only: coarse hourglass levels; 0 uses --hourglass_levels")
     parser.add_argument("--fine_hourglass_levels", type=int, default=0,
                         help="Modern MVS only: fine hourglass levels; 0 uses --hourglass_levels")
+    parser.add_argument("--middle_hourglass_levels", type=int, default=0,
+                        help="CasMVSNet FPN only: H/4 hourglass levels; 0 uses --hourglass_levels")
     parser.add_argument("--learned_view_weighting", action="store_true",
                         help="Modern MVS only: learn per-view, per-depth reliability before aggregation")
     parser.add_argument("--two_mode_fine_candidates", action="store_true",
@@ -1625,6 +1892,22 @@ def main() -> None:
                         help="Modern MVS only: directly supervise the H/2 fine-stage depth")
     parser.add_argument("--fine_loss_weight", type=float, default=0.3,
                         help="Weight of direct fine-stage metric L1 supervision")
+    parser.add_argument("--middle_supervision", action="store_true",
+                        help="Three-stage FPN only: directly supervise middle-stage depth")
+    parser.add_argument("--middle_loss_weight", type=float, default=0.3,
+                        help="Weight of direct H/4 middle-stage metric L1 supervision")
+    parser.add_argument("--middle_feature_channels", type=int, default=0,
+                        help="Three-stage FPN only: middle-stage output channels; "
+                             "0 uses feature_channels/2")
+    parser.add_argument("--fine_feature_channels", type=int, default=0,
+                        help="Three-stage FPN only: final-stage output channels; "
+                             "0 uses feature_channels/4")
+    parser.add_argument("--fullres_fine_volume", action="store_true",
+                        help="Three-stage FPN only: construct the final cost volume at input "
+                             "resolution and bypass depth upsampling and the 2-D refiner")
+    parser.add_argument("--h4_coarse_volume", action="store_true",
+                        help="Full-resolution FPN mode only: construct the global coarse "
+                             "cost volume at H/4 instead of H/8")
     parser.add_argument("--variance_channels", type=int, default=0,
                         help="Modern MVS only: compressed channels for cross-view correlation variance")
     parser.add_argument("--convex_upsampling", action="store_true",
@@ -1635,6 +1918,14 @@ def main() -> None:
                         help="Modern MVS only: odd number of full-resolution local depth hypotheses")
     parser.add_argument("--fullres_window", type=float, default=0.01,
                         help="Modern MVS only: full-resolution local search half-window in metres")
+    parser.add_argument("--fpn_dropout", type=float, default=0.0,
+                        help="Modern MVS only: Dropout2d probability on FPN outputs")
+    parser.add_argument("--reference_dropout", type=float, default=0.0,
+                        help="Modern MVS only: Dropout2d probability on reference features")
+    parser.add_argument("--hourglass_dropout", type=float, default=0.0,
+                        help="Modern MVS only: Dropout3d probability at hourglass bottlenecks")
+    parser.add_argument("--drop_path_rate", type=float, default=0.0,
+                        help="Modern MVS only: stochastic-depth rate on FPN fusion")
     parser.add_argument("--model_scale", type=float, default=1.0,
                         help="Width multiplier for base_channels and derived feature/cost channels; explicit feature/cost overrides still win")
     parser.add_argument("--num_views", type=int, default=5)
@@ -1647,6 +1938,10 @@ def main() -> None:
                         help="Number of coarse inverse-depth planes between DEPTH_MIN and D_MAX")
     parser.add_argument("--fine_depths", type=int, default=5,
                         help="Number of fine per-pixel depth hypotheses around the coarse estimate")
+    parser.add_argument("--middle_depths", type=int, default=8,
+                        help="CasMVSNet FPN only: H/4 local depth hypotheses")
+    parser.add_argument("--middle_window", type=float, default=0.12,
+                        help="CasMVSNet FPN only: H/4 local search half-window in metres")
     parser.add_argument("--fine_window", type=float, default=0.08,
                         help="Fine-stage sigma/window in metres before multiplying by offsets")
     parser.add_argument("--fine_offset_radius", type=float, default=2.0,
@@ -1676,6 +1971,10 @@ def main() -> None:
                         help="Ignore spatial mask; dep>0 validity is always applied")
     parser.add_argument("--fill_invalid", action="store_true",
                         help="Fill pixels with no depth measurement using the table-plane prior")
+    parser.add_argument("-fix_transform", "--fix_transform", action="store_true",
+                        help="Opt-in geometry fix: scale event intrinsics through the stored "
+                             "resize + centred crop transform instead of the historical direct "
+                             "native-resolution -> tensor-resolution scaling")
     parser.add_argument("--no_augmentations", action="store_true",
                         help="Disable all training-time multi-view data augmentations")
     parser.add_argument("--no_source_view_dropout", action="store_true",
@@ -1705,6 +2004,10 @@ def main() -> None:
         parser.error("--pose_view_selection requires odd --num_views for balanced before/after sources")
     if args.model_scale <= 0:
         parser.error("--model_scale must be > 0")
+    if args.train_sequence_count < 0:
+        parser.error("--train_sequence_count must be >= 0")
+    if not (0 < args.train_frame_fraction <= 1):
+        parser.error("--train_frame_fraction must be in (0, 1]")
     if args.lr <= 0:
         parser.error("--lr must be > 0")
     if args.min_lr is not None and args.min_lr < 0:
@@ -1721,20 +2024,38 @@ def main() -> None:
         parser.error("--lr_gamma must be between 0 and 1")
     if args.lr_plateau_patience < 0:
         parser.error("--lr_plateau_patience must be >= 0")
+    if args.ema_decay < 0 or args.ema_decay >= 1:
+        parser.error("--ema_decay must be in [0, 1)")
+    if args.early_stopping_patience < 0:
+        parser.error("--early_stopping_patience must be >= 0")
     if args.lambda_confidence < 0:
         parser.error("--lambda_confidence must be >= 0")
+    if args.lambda_worst_percent < 0:
+        parser.error("--lambda_worst_percent must be >= 0")
+    if not (0 < args.worst_percent <= 1):
+        parser.error("--worst_percent must be in (0, 1]")
     if args.correlation_groups < 0:
         parser.error("--correlation_groups must be >= 0")
     if args.reference_channels < 0:
         parser.error("--reference_channels must be >= 0")
-    if args.coarse_cost_channels < 0 or args.fine_cost_channels < 0:
-        parser.error("--coarse_cost_channels and --fine_cost_channels must be >= 0")
+    if any(x < 0 for x in (
+        args.coarse_cost_channels, args.middle_cost_channels, args.fine_cost_channels
+    )):
+        parser.error("stage-specific cost channel counts must be >= 0")
     if args.refiner_channels < 0:
         parser.error("--refiner_channels must be >= 0")
     if args.hourglass_levels < 1:
         parser.error("--hourglass_levels must be >= 1")
-    if args.coarse_hourglass_levels < 0 or args.fine_hourglass_levels < 0:
-        parser.error("--coarse_hourglass_levels and --fine_hourglass_levels must be >= 0")
+    if any(x < 0 for x in (
+        args.coarse_hourglass_levels,
+        args.middle_hourglass_levels,
+        args.fine_hourglass_levels,
+    )):
+        parser.error("stage-specific hourglass levels must be >= 0")
+    if args.middle_depths < 3:
+        parser.error("--middle_depths must be >= 3")
+    if args.middle_window <= 0:
+        parser.error("--middle_window must be > 0")
     if args.fine_loss_weight < 0:
         parser.error("--fine_loss_weight must be >= 0")
     if args.variance_channels < 0:
@@ -1743,6 +2064,9 @@ def main() -> None:
         parser.error("--fullres_depths must be an odd integer >= 3")
     if args.fullres_window <= 0:
         parser.error("--fullres_window must be > 0")
+    for name in ("fpn_dropout", "reference_dropout", "hourglass_dropout", "drop_path_rate"):
+        if not (0 <= getattr(args, name) < 1):
+            parser.error(f"--{name} must be in [0, 1)")
     if args.confidence_abs_tolerance < 0:
         parser.error("--confidence_abs_tolerance must be >= 0")
     if args.confidence_rel_tolerance < 0:
@@ -1760,8 +2084,8 @@ def main() -> None:
 
     train_root = args.data_dir / "train"
     eval_root = args.data_dir / "eval"
-    train_seqs = _find_sequences(train_root)
-    val_seqs = _find_sequences(eval_root)
+    train_seqs = _find_sequences(train_root, fix_transform=args.fix_transform)
+    val_seqs = _find_sequences(eval_root, fix_transform=args.fix_transform)
 
     if not train_seqs or not val_seqs:
         missing = []
@@ -1772,13 +2096,32 @@ def main() -> None:
         sys.exit(
             f"[ERROR] No valid sequences found in: {', '.join(missing)}\n"
             "        --data_dir must contain train/ and eval/, each holding one or more\n"
-            "        valid sequences with voxels, depth, poses.h5, and table_plane.h5.\n"
+            f"        valid sequences with voxels, depth, poses.h5, and {_table_plane_filename(args.fix_transform)}.\n"
             "        Run: python3 data_precomputation/precompute_table_plane.py"
         )
+
+    all_train_seqs = train_seqs
+    sequence_rng = np.random.default_rng(args.train_sequence_seed)
+    sequence_order = sequence_rng.permutation(len(all_train_seqs))
+    ordered_train_seqs = [all_train_seqs[int(i)] for i in sequence_order]
+    if args.train_sequence_count > len(all_train_seqs):
+        parser.error(
+            f"--train_sequence_count={args.train_sequence_count} exceeds the "
+            f"{len(all_train_seqs)} available training sequences"
+        )
+    train_seqs = (
+        ordered_train_seqs[:args.train_sequence_count]
+        if args.train_sequence_count > 0
+        else ordered_train_seqs
+    )
 
     print(f"Dataset root: {args.data_dir}")
     print(f"  Train ({len(train_seqs)}): {[d.name for d in train_seqs]}")
     print(f"  Eval  ({len(val_seqs)}): {[d.name for d in val_seqs]}")
+    print(
+        f"  Train sequence subset: {len(train_seqs)}/{len(all_train_seqs)} "
+        f"(seed={args.train_sequence_seed})"
+    )
 
     ds_kw = dict(
         calib=calib,
@@ -1789,6 +2132,8 @@ def main() -> None:
         num_depths=args.num_depths,
         use_mask=not args.no_mask,
         fill_invalid=args.fill_invalid,
+        fix_transform=args.fix_transform,
+        pose_channels=False,
     )
     train_aug = MultiViewAugConfig(
         enabled=not args.no_augmentations,
@@ -1806,6 +2151,17 @@ def main() -> None:
     train_ds = ConcatDataset(train_sets) if len(train_sets) > 1 else train_sets[0]
     val_ds = ConcatDataset(val_sets) if len(val_sets) > 1 else val_sets[0]
     print(f"  Train samples: {len(train_ds)},  Val samples: {len(val_ds)}")
+    if args.train_frame_fraction < 1.0:
+        sampled_per_epoch = sum(
+            min(len(ds), max(1, int(round(len(ds) * args.train_frame_fraction))))
+            for ds in train_sets
+        )
+        print(
+            f"  Train frame sampling: {100.0 * args.train_frame_fraction:.1f}% "
+            f"per sequence per epoch ({sampled_per_epoch}/{len(train_ds)} samples)"
+        )
+    else:
+        print("  Train frame sampling: all frames")
     print(
         f"  Multi-view: views={args.num_views}, interval={args.view_interval}, "
         f"coarse inverse-depth planes={args.num_depths} [{DEPTH_MIN:.3f}, {D_MAX:.3f}] m"
@@ -1826,15 +2182,20 @@ def main() -> None:
         f"  Loss weights: grad={args.lambda_grad:g}, smooth={args.lambda_smooth:g}, "
         f"mean={args.lambda_mean:g}, normal={args.lambda_normal:g}, "
         f"l1_loss_only={args.l1_loss_only}, "
+        f"worst={args.lambda_worst_percent:g} "
+        f"(top {100.0 * args.worst_percent:g}%), "
         f"confidence={args.lambda_confidence:g} "
         f"(abs_tol={args.confidence_abs_tolerance:g} m, "
-        f"rel_tol={args.confidence_rel_tolerance:g})\n"
+        f"rel_tol={args.confidence_rel_tolerance:g}), "
+        f"middle={args.middle_loss_weight:g} enabled={args.middle_supervision}, "
+        f"fine={args.fine_loss_weight:g} enabled={args.fine_supervision}\n"
     )
     min_lr = args.min_lr if args.min_lr is not None else args.lr * 1e-2
     print(
         f"  Optimizer: {args.optimizer}, lr={args.lr:g}, weight_decay={args.weight_decay:g}, "
         f"scheduler={args.lr_scheduler}, min_lr={min_lr:g}, "
-        f"warmup_epochs={args.warmup_epochs}, lr_gamma={args.lr_gamma:g}\n"
+        f"warmup_epochs={args.warmup_epochs}, lr_gamma={args.lr_gamma:g}, "
+        f"freeze_batch_norm={args.freeze_batch_norm}\n"
     )
     print(
         "  Train augmentations: "
@@ -1857,7 +2218,20 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
         persistent_workers=(args.workers > 0),
     )
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kw)
+    train_sampler = None
+    if args.train_frame_fraction < 1.0:
+        train_sampler = PerSequenceFractionSampler(
+            [len(ds) for ds in train_sets],
+            args.train_frame_fraction,
+            args.seed,
+        )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        **loader_kw,
+    )
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, **loader_kw)
 
     in_ch = NUM_BINS + 1
@@ -1899,6 +2273,22 @@ def main() -> None:
         fullres_geometry=args.fullres_geometry,
         fullres_depths=args.fullres_depths,
         fullres_window=args.fullres_window,
+        fpn_dropout=args.fpn_dropout,
+        reference_dropout=args.reference_dropout,
+        hourglass_dropout=args.hourglass_dropout,
+        drop_path_rate=args.drop_path_rate,
+        cost_volume_type=args.cost_volume_type,
+        middle_depths=args.middle_depths,
+        middle_window=args.middle_window,
+        middle_cost_channels=args.middle_cost_channels,
+        middle_hourglass_levels=args.middle_hourglass_levels,
+        middle_feature_channels=args.middle_feature_channels,
+        fine_feature_channels=args.fine_feature_channels,
+        middle_supervision=args.middle_supervision,
+        middle_loss_weight=args.middle_loss_weight,
+        fullres_fine_volume=args.fullres_fine_volume,
+        h4_coarse_volume=args.h4_coarse_volume,
+        decoder_type=args.decoder_type,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1907,8 +2297,10 @@ def main() -> None:
         f"{model_arch}  in_ch={in_ch}  model_scale={args.model_scale:g}  "
         f"base={base_channels}  feature={feature_channels}  "
         f"feature_encoder={args.feature_encoder}  cost={cost_channels}  "
-        f"coarse_depths={args.num_depths}  fine_depths={args.fine_depths}  "
+        f"coarse_depths={args.num_depths}  middle_depths={args.middle_depths}  "
+        f"fine_depths={args.fine_depths}  "
         f"masked_warp_aggregation={args.masked_warp_aggregation}  "
+        f"cost_volume_type={args.cost_volume_type}  "
         f"cost_volume_ref_features={args.cost_volume_ref_features}  "
         f"coarse_supervision={args.coarse_supervision}  "
         f"uncertainty={args.uncertainty}  "
@@ -1921,6 +2313,9 @@ def main() -> None:
 
     optimizer = _make_optimizer(args, model)
     scheduler = _make_lr_scheduler(args, optimizer)
+    ema = ModelEMA(model, args.ema_decay) if args.ema_decay > 0 else None
+    if ema is not None:
+        print(f"EMA: enabled (decay={args.ema_decay:g}); validation/checkpoints use EMA weights")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     tb_log_dir = tensorboard_run_dir("multiview", args.name, args.tb_root)
@@ -1955,13 +2350,18 @@ def main() -> None:
     )
 
     best_val_l1 = float("inf")
+    best_val_p95 = float("inf")
+    best_val_worst10 = float("inf")
+    epochs_without_improvement = 0
     ckpt: dict = {}
     for epoch in range(1, args.epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         if args.warmup_epochs > 0 and epoch <= args.warmup_epochs:
             warmup_lr = args.lr * epoch / args.warmup_epochs
             _set_optimizer_lr(optimizer, warmup_lr)
 
-        tr_loss, tr_l1, tr_worst10 = run_epoch(
+        tr_loss, tr_l1, tr_p95, tr_worst10 = run_epoch(
             model, train_loader, optimizer, device,
             viz=viz_train,
             activity_diag=activity_train,
@@ -1979,9 +2379,16 @@ def main() -> None:
             confidence_rel_tolerance=args.confidence_rel_tolerance,
             fine_supervision=args.fine_supervision,
             fine_loss_weight=args.fine_loss_weight,
+            middle_supervision=args.middle_supervision,
+            middle_loss_weight=args.middle_loss_weight,
+            lambda_worst_percent=args.lambda_worst_percent,
+            worst_percent=args.worst_percent,
+            ema_model=ema,
+            freeze_batch_norm=args.freeze_batch_norm,
         )
-        va_loss, va_l1, va_worst10 = run_epoch(
-            model, val_loader, None, device,
+        validation_model = ema.model if ema is not None else model
+        va_loss, va_l1, va_p95, va_worst10 = run_epoch(
+            validation_model, val_loader, None, device,
             viz=viz_val,
             activity_diag=activity_val,
             error_diag=error_val,
@@ -1998,6 +2405,10 @@ def main() -> None:
             confidence_rel_tolerance=args.confidence_rel_tolerance,
             fine_supervision=args.fine_supervision,
             fine_loss_weight=args.fine_loss_weight,
+            middle_supervision=args.middle_supervision,
+            middle_loss_weight=args.middle_loss_weight,
+            lambda_worst_percent=args.lambda_worst_percent,
+            worst_percent=args.worst_percent,
         )
         if scheduler is not None and epoch > args.warmup_epochs:
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -2023,6 +2434,7 @@ def main() -> None:
             f"Epoch {epoch:03d}/{args.epochs}  "
             f"loss: {tr_loss:.4f}/{va_loss:.4f}  "
             f"L1: {tr_l1:.4f}/{va_l1:.4f} m  "
+            f"p95: {tr_p95:.4f}/{va_p95:.4f} m  "
             f"worst10: {tr_worst10:.4f}/{va_worst10:.4f} m  "
             f"lr: {current_lr:.3e}  "
             f"VRAM: {vram_a:.0f}/{vram_r:.0f} MB"
@@ -2032,37 +2444,62 @@ def main() -> None:
         writer.add_scalar("loss/val", va_loss, epoch)
         writer.add_scalar("l1/train", tr_l1, epoch)
         writer.add_scalar("l1/val", va_l1, epoch)
+        writer.add_scalar("p95/train", tr_p95, epoch)
+        writer.add_scalar("p95/val", va_p95, epoch)
         writer.add_scalar("l1_worst10/train", tr_worst10, epoch)
         writer.add_scalar("l1_worst10/val", va_worst10, epoch)
         writer.add_scalar("lr", current_lr, epoch)
 
         ckpt = {
             "epoch": epoch,
-            "model": model.state_dict(),
+            "model": validation_model.state_dict(),
             "model_arch": model_arch,
             "val_l1": va_l1,
+            "val_p95": va_p95,
+            "val_l1_worst10": va_worst10,
+            "train_sequence_count": len(train_seqs),
+            "train_sequence_seed": args.train_sequence_seed,
+            "train_sequences": [d.name for d in train_seqs],
+            "train_frame_fraction": args.train_frame_fraction,
             "base": base_channels,
             "base_channels_arg": args.base_channels,
             "feature_channels": feature_channels,
             "feature_encoder": args.feature_encoder,
+            "decoder_type": args.decoder_type,
             "cost_channels": cost_channels,
             "correlation_groups": args.correlation_groups,
+            "cost_volume_type": args.cost_volume_type,
             "reference_channels": args.reference_channels,
             "coarse_cost_channels": args.coarse_cost_channels,
+            "middle_cost_channels": args.middle_cost_channels,
             "fine_cost_channels": args.fine_cost_channels,
             "refiner_channels": args.refiner_channels,
             "hourglass_levels": args.hourglass_levels,
             "coarse_hourglass_levels": args.coarse_hourglass_levels,
+            "middle_hourglass_levels": args.middle_hourglass_levels,
             "fine_hourglass_levels": args.fine_hourglass_levels,
             "learned_view_weighting": args.learned_view_weighting,
             "two_mode_fine_candidates": args.two_mode_fine_candidates,
             "fine_supervision": args.fine_supervision,
             "fine_loss_weight": args.fine_loss_weight,
+            "middle_supervision": args.middle_supervision,
+            "middle_loss_weight": args.middle_loss_weight,
+            "middle_feature_channels": args.middle_feature_channels,
+            "fine_feature_channels": args.fine_feature_channels,
+            "fullres_fine_volume": args.fullres_fine_volume,
+            "h4_coarse_volume": args.h4_coarse_volume,
             "variance_channels": args.variance_channels,
             "convex_upsampling": args.convex_upsampling,
             "fullres_geometry": args.fullres_geometry,
             "fullres_depths": args.fullres_depths,
             "fullres_window": args.fullres_window,
+            "fpn_dropout": args.fpn_dropout,
+            "reference_dropout": args.reference_dropout,
+            "hourglass_dropout": args.hourglass_dropout,
+            "drop_path_rate": args.drop_path_rate,
+            "ema_decay": args.ema_decay,
+            "early_stopping_patience": args.early_stopping_patience,
+            "freeze_batch_norm": args.freeze_batch_norm,
             "model_scale": args.model_scale,
             "in_ch": in_ch,
             "num_views": args.num_views,
@@ -2070,6 +2507,8 @@ def main() -> None:
             "pose_view_selection": args.pose_view_selection,
             "pose_move_threshold": args.pose_move_threshold,
             "num_depths": args.num_depths,
+            "middle_depths": args.middle_depths,
+            "middle_window": args.middle_window,
             "fine_depths": args.fine_depths,
             "fine_window": args.fine_window,
             "fine_offset_radius": args.fine_offset_radius,
@@ -2097,17 +2536,46 @@ def main() -> None:
             "confidence_abs_tolerance": args.confidence_abs_tolerance,
             "confidence_rel_tolerance": args.confidence_rel_tolerance,
             "l1_loss_only": args.l1_loss_only,
+            "lambda_worst_percent": args.lambda_worst_percent,
+            "worst_percent": args.worst_percent,
             "depth_min": DEPTH_MIN,
             "depth_max": D_MAX,
         }
         if va_l1 < best_val_l1:
             best_val_l1 = va_l1
-            torch.save(ckpt, args.out_dir / f"best_{args.name}.pth")
-            print(f"  -> new best checkpoint  (val L1 = {va_l1:.4f} m)")
+            epochs_without_improvement = 0
+            torch.save(ckpt, args.out_dir / f"best_l1_{args.name}.pth")
+            print(f"  -> new best L1 checkpoint  (val L1 = {va_l1:.4f} m)")
+        else:
+            epochs_without_improvement += 1
+        if va_p95 < best_val_p95:
+            best_val_p95 = va_p95
+            torch.save(ckpt, args.out_dir / f"best_p95_{args.name}.pth")
+            print(f"  -> new best p95 checkpoint  (val p95 = {va_p95:.4f} m)")
+        if va_worst10 < best_val_worst10:
+            best_val_worst10 = va_worst10
+            torch.save(ckpt, args.out_dir / f"best_l1_worst10_{args.name}.pth")
+            print(
+                "  -> new best worst10 checkpoint  "
+                f"(val worst10 L1 = {va_worst10:.4f} m)"
+            )
+        if (
+            args.early_stopping_patience > 0
+            and epochs_without_improvement >= args.early_stopping_patience
+        ):
+            print(
+                f"Early stopping after {epochs_without_improvement} epochs "
+                f"without validation improvement."
+            )
+            break
 
     torch.save(ckpt, args.out_dir / f"last_{args.name}.pth")
     writer.close()
-    print(f"\nDone. Best val L1: {best_val_l1:.4f} m")
+    print(
+        f"\nDone. Best val L1: {best_val_l1:.4f} m, "
+        f"p95: {best_val_p95:.4f} m, "
+        f"worst10 L1: {best_val_worst10:.4f} m"
+    )
 
 
 if __name__ == "__main__":
