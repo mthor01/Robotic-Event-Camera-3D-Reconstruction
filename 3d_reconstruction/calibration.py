@@ -10,10 +10,10 @@ Two modes:
      new frames via robot arm movements. Overwrites existing frames.
 
 Usage (calibration-only, default):
-    python calibration_recording_and_calibration.py --output-dir camera_data
+    python calibration.py --output-dir camera_data
 
 Usage (collect new data with robot arm):
-    python calibration_recording_and_calibration.py --collect-data \
+    python calibration.py --collect-data \
         [--zmq-bind tcp://0.0.0.0:6002] [--output-dir camera_data]
 
 Protocol for --collect-data mode (this script = REP,  agent in Docker A = REQ):
@@ -1255,10 +1255,10 @@ def main():
         epilog="""
 Examples:
   # Calibrate using existing frames (default)
-  python calibration_recording_and_calibration.py --output-dir camera_data
+  python calibration.py --output-dir camera_data
 
   # Collect new data with robot arm (overwrites existing frames)
-  python calibration_recording_and_calibration.py --collect-data --output-dir camera_data
+  python calibration.py --collect-data --output-dir camera_data
         """
     )
     parser.add_argument(

@@ -1,19 +1,17 @@
 #!/usr/bin/env bash
 # Run the full precompute pipeline in order:
 #   1. project_realsense_to_event.py
-#   2. precompute_spatial_mask.py
-#   3. precompute_table_plane.py
-#   4. precompute_voxels.py
+#   2. precompute_table_plane.py
+#   3. precompute_voxels.py
 #
 # Usage:
 #   ./precompute_all.sh                                         # all objects, default settings
 #   ./precompute_all.sh --data_dir data/real/bottle             # single object
 #   ./precompute_all.sh --data_dir data/real/bottle data/real/cube
 #   ./precompute_all.sh --data_root data/real                   # explicit root (default)
-#   ./precompute_all.sh --no-hw-trigger                         # disable HW trigger (voxel step only)
 #
 # Per-step flags:
-#   Use --project, --mask, --table, --voxel as section markers.
+#   Use --project, --table, --voxel as section markers.
 #   Flags before any marker are forwarded to ALL steps.
 #   Flags after a marker are forwarded only to that step.
 #
@@ -21,9 +19,8 @@
 #     ./precompute_all.sh --data_dir data/real/bottle \
 #         --voxel --num_bins 7 --float16
 #
-#     ./precompute_all.sh --no-hw-trigger \
+#     ./precompute_all.sh \
 #         --project --resize_h 260 --resize_w 346 \
-#         --mask   --cube_side 0.03 \
 #         --table  --table_z 0.02 \
 #         --voxel  --num_bins 7 --workers 2
 
@@ -33,7 +30,6 @@ set -e
 DATA_ARGS=()      # --data_root / --data_dir  (shared, not forwarded to scripts directly)
 ALL_ARGS=()       # forwarded to every script
 PROJECT_ARGS=()   # forwarded only to project_realsense_to_event.py
-MASK_ARGS=()      # forwarded only to precompute_spatial_mask.py
 TABLE_ARGS=()     # forwarded only to precompute_table_plane.py
 VOXEL_ARGS=()     # forwarded only to precompute_voxels.py
 
@@ -44,11 +40,6 @@ i=1
 while [[ $i -le $# ]]; do
     arg="${!i}"
     case "$arg" in
-        --no-hw-trigger)
-            # Only precompute_voxels.py understands this flag
-            VOXEL_ARGS+=("--no-hw-trigger")
-            i=$((i + 1))
-            ;;
         --data_dir)
             current_target="ALL"  # reset section on data args
             DATA_ARGS+=("--data_dir")
@@ -68,10 +59,6 @@ while [[ $i -le $# ]]; do
             current_target="PROJECT"
             i=$((i + 1))
             ;;
-        --mask)
-            current_target="MASK"
-            i=$((i + 1))
-            ;;
         --table)
             current_target="TABLE"
             i=$((i + 1))
@@ -83,7 +70,6 @@ while [[ $i -le $# ]]; do
         *)
             case "$current_target" in
                 PROJECT) PROJECT_ARGS+=("$arg") ;;
-                MASK)    MASK_ARGS+=("$arg") ;;
                 TABLE)   TABLE_ARGS+=("$arg") ;;
                 VOXEL)   VOXEL_ARGS+=("$arg") ;;
                 *)       ALL_ARGS+=("$arg") ;;
@@ -108,7 +94,6 @@ echo " precompute_all.sh"
 echo " Data args:    ${DATA_ARGS[*]}"
 [[ ${#ALL_ARGS[@]}     -gt 0 ]] && echo " All steps:    ${ALL_ARGS[*]}"
 [[ ${#PROJECT_ARGS[@]} -gt 0 ]] && echo " --project:    ${PROJECT_ARGS[*]}"
-[[ ${#MASK_ARGS[@]}    -gt 0 ]] && echo " --mask:       ${MASK_ARGS[*]}"
 [[ ${#TABLE_ARGS[@]}   -gt 0 ]] && echo " --table:      ${TABLE_ARGS[*]}"
 [[ ${#VOXEL_ARGS[@]}   -gt 0 ]] && echo " --voxel:      ${VOXEL_ARGS[*]}"
 echo "============================================================"
@@ -125,7 +110,6 @@ run_step() {
 }
 
 run_step project_realsense_to_event.py "${PROJECT_ARGS[@]}"
-run_step precompute_spatial_mask.py    "${MASK_ARGS[@]}"
 run_step precompute_table_plane.py     "${TABLE_ARGS[@]}"
 run_step precompute_voxels.py          "${VOXEL_ARGS[@]}"
 

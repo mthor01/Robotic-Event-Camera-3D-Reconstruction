@@ -11,9 +11,9 @@ Output:
     viz_and_tests/plots/all_poses_<object_name>.png by default
 
 Usage:
-    python3 viz_and_tests/visualize_all_poses.py --data_dir data/real/lego_5
-    python3 viz_and_tests/visualize_all_poses.py --data_dir data/real/lego_5 --stride 5
-    python3 viz_and_tests/visualize_all_poses.py --data_dir data/real/lego_5 --out_png /tmp/poses.png
+    python3 viz_and_tests/visualize_all_poses.py --data_dir data/new/train/1
+    python3 viz_and_tests/visualize_all_poses.py --data_dir data/new/train/1 --stride 5
+    python3 viz_and_tests/visualize_all_poses.py --data_dir data/new/train/1 --out_png /tmp/poses.png
 """
 
 from __future__ import annotations

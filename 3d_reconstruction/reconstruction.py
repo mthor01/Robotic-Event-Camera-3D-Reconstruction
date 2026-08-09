@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Depth-map / point-cloud reconstruction for table-prior checkpoints.
+Depth-map, point-cloud, and TSDF reconstruction from trained depth models.
 
-Supports single- and multi-view early-fusion unet_table checkpoints, recurrent
-U-Net checkpoints, and legacy or modern geometric multiview checkpoints trained
-with training/multiview.py or training/modern_multiview.py.
+Supports single- and multi-view early-fusion U-Net checkpoints, recurrent
+U-Net checkpoints, and geometric multiview checkpoints produced by the two
+current training entry points: ``training/train_unet.py`` and
+``training/multiview.py``.
 Uses the precomputed table-plane channel stored in hdf5/table_plane.h5
 (produced by data_precomputation/precompute_table_plane.py) instead of
 computing it on-the-fly.
@@ -23,17 +24,17 @@ training/results/<checkpoint_name>/ (or to --out_dir):
 Usage:
     python3 reconstruction.py \\
         --checkpoint training/checkpoints/unet_table/best_myrun.pth \\
-        --data_dir   data/real/lego_1
+        --data_dir   data/new/eval/1
 
     python3 reconstruction.py \\
         --checkpoint training/checkpoints/unet_table/best_myrun.pth \\
-        --data_dir   data/real/lego_1 \\
+        --data_dir   data/new/eval/1 \\
         --indices 0 50 100 200 400 \\
         --out_dir results/lego_1_table
 
     python3 reconstruction.py \\
         --checkpoint training/checkpoints/unet_table/best_myrun.pth \\
-        --data_dir   data/real/eval
+        --data_dir   data/new/eval
 """
 
 import sys
@@ -66,12 +67,10 @@ from config import (
     TSDF_VOXEL_SIZE, TSDF_SDF_TRUNC_FACTOR, TSDF_DEPTH_MAX,
     SPATIAL_CUBE_SIDE, SPATIAL_TARGET_X, SPATIAL_TARGET_Y, SPATIAL_TARGET_Z,
 )
-from train_unet import UNet
-from train_unet_table import RecurrentUNet
-#from train_ere import EReFormer
+from spatial_mask import points_in_cube
+from train_unet import RecurrentUNet, UNet
 from multiview import (
-    MultiViewDepthNet,
-    _gaussian_depth_candidates,
+    ModernMVSNet,
     _inverse_depth_candidates,
     _linear_depth_candidates,
 )
@@ -142,7 +141,7 @@ def _detect_table_ckpt_type(ckpt: dict) -> str:
     """Infer which table-prior training script produced a checkpoint."""
     if (
         "num_views" in ckpt
-        and "num_depths" in ckpt
+        and "coarse_depths" in ckpt
         and ("feature_channels" in ckpt or any(k.startswith("feature.") for k in ckpt.get("model", {}).keys()))
     ):
         return "multiview"
@@ -158,61 +157,9 @@ def _detect_table_ckpt_type(ckpt: dict) -> str:
     return "unknown"
 
 
-def _infer_multiview_feature_encoder(ckpt: dict) -> str:
-    """Return the multiview.py feature encoder saved in or implied by a checkpoint."""
-    if ckpt.get("feature_encoder"):
-        return str(ckpt["feature_encoder"])
-
-    # Older multiview checkpoints may predate the explicit feature_encoder
-    # metadata. Recover the obvious cases from state-dict key layout.
-    state = ckpt.get("model", {})
-    keys = state.keys()
-    if any(k.startswith("feature.encoder.") for k in keys):
-        if any(k.startswith("feature.encoder.5.0.conv3.") for k in keys):
-            return "resnet50"
-        if any(k.startswith("feature.encoder.5.3.") for k in keys):
-            return "resnet34_h4"
-        if any(k.startswith("feature.encoder.5.2.") for k in keys):
-            return "resnet18_h4"
-        if any(k.startswith("feature.encoder.5.0.downsample.0.") for k in keys):
-            # This could also be plain resnet18/resnet34; the h4 variants have
-            # identical parameter shapes, so prefer h4 because it preserves the
-            # feature stride used by current multiview.py recipes.
-            return "resnet18_h4"
-        if any(k.startswith("feature.encoder.3.") for k in keys):
-            return "efficientnet_b0"
-        raise ValueError(
-            "This multiview checkpoint uses a torchvision feature encoder but "
-            "does not store 'feature_encoder', and reconstruction.py could "
-            "not infer which encoder to build. Re-save the checkpoint with a "
-            "recent multiview.py or add the 'feature_encoder' metadata."
-        )
-    if any(k.startswith("feature.net.15.") for k in keys):
-        return "cnn_8"
-    return "cnn"
-
-
 def _infer_multiview_model_arch(ckpt: dict) -> str:
-    """Return the legacy or modern multiview architecture for a checkpoint."""
-    saved_arch = ckpt.get("model_arch")
-    if saved_arch:
-        return str(saved_arch)
-
-    # Early modern checkpoints may not have stored model_arch. Their FPN,
-    # separate coarse/fine cost regularizers, and full-resolution refiner are
-    # unambiguous and must not be loaded into the legacy MultiViewDepthNet.
-    state = ckpt.get("model", {})
-    modern_prefixes = (
-        "feature.stem.",
-        "feature.coarse_proj.",
-        "feature.fine_proj.",
-        "coarse_cost.",
-        "fine_cost.",
-        "refiner.",
-    )
-    if any(key.startswith(modern_prefixes) for key in state):
-        return "ModernMVSNet"
-    return "MultiViewDepthNet"
+    """Return the sole supported multiview architecture."""
+    return str(ckpt.get("model_arch", "ModernMVSNet"))
 
 
 def load_model(ckpt_path: Path, device: torch.device):
@@ -245,17 +192,10 @@ def load_model(ckpt_path: Path, device: torch.device):
         return model, ckpt, ckpt_type
 
     if ckpt_type == "multiview":
-        feature_encoder = _infer_multiview_feature_encoder(ckpt)
         model_arch = _infer_multiview_model_arch(ckpt)
-        model_cls = MultiViewDepthNet
-        if model_arch == "ModernMVSNet":
-            from modern_multiview import ModernMVSNet, upgrade_legacy_modern_state_dict
-
-            model_cls = ModernMVSNet
-            ckpt["model"] = upgrade_legacy_modern_state_dict(ckpt["model"])
-        elif model_arch not in ("MultiViewDepthNet", "legacy_multiview"):
+        if model_arch != "ModernMVSNet":
             raise ValueError(f"Unsupported multiview checkpoint architecture: {model_arch}")
-        model = model_cls(
+        model = ModernMVSNet(
             in_ch=ckpt.get("in_ch", NUM_BINS + 1),
             base=ckpt.get("base", ckpt.get("base_channels_arg", 32)),
             feature_ch=ckpt.get("feature_channels", None),
@@ -264,12 +204,6 @@ def load_model(ckpt_path: Path, device: torch.device):
             fine_window=ckpt.get("fine_window", 0.08),
             fine_offset_radius=ckpt.get("fine_offset_radius", 2.0),
             learned_fine_window=ckpt.get("learned_fine_window", False),
-            masked_warp_aggregation=ckpt.get("masked_warp_aggregation", False),
-            cost_volume_ref_features=ckpt.get("cost_volume_ref_features", False),
-            single_view_fallback=ckpt.get("single_view_fallback", False),
-            feature_encoder=feature_encoder,
-            decoder_type=ckpt.get("decoder_type", "auto"),
-            correlation_groups=ckpt.get("correlation_groups", 0),
             reference_channels=ckpt.get("reference_channels", 0),
             coarse_cost_channels=ckpt.get("coarse_cost_channels", 0),
             fine_cost_channels=ckpt.get("fine_cost_channels", 0),
@@ -279,33 +213,18 @@ def load_model(ckpt_path: Path, device: torch.device):
                 "no_refiner_reference_input", False
             ),
             no_2d_refinement=ckpt.get("no_2d_refinement", False),
-            hourglass_levels=ckpt.get("hourglass_levels", 2),
-            coarse_hourglass_levels=ckpt.get("coarse_hourglass_levels", 0),
-            fine_hourglass_levels=ckpt.get("fine_hourglass_levels", 0),
-            learned_view_weighting=ckpt.get("learned_view_weighting", False),
-            two_mode_fine_candidates=ckpt.get("two_mode_fine_candidates", False),
-            fine_supervision=ckpt.get("fine_supervision", False),
-            fine_loss_weight=ckpt.get("fine_loss_weight", 0.3),
-            variance_channels=ckpt.get("variance_channels", 0),
-            convex_upsampling=ckpt.get("convex_upsampling", False),
-            fullres_geometry=ckpt.get("fullres_geometry", False),
-            fullres_depths=ckpt.get("fullres_depths", 3),
-            fullres_window=ckpt.get("fullres_window", 0.01),
+            coarse_hourglass_levels=ckpt.get("coarse_hourglass_levels", 2),
+            fine_hourglass_levels=ckpt.get("fine_hourglass_levels", 2),
             fpn_dropout=ckpt.get("fpn_dropout", 0.0),
             reference_dropout=ckpt.get("reference_dropout", 0.0),
             hourglass_dropout=ckpt.get("hourglass_dropout", 0.0),
             drop_path_rate=ckpt.get("drop_path_rate", 0.0),
-            cost_volume_type=ckpt.get("cost_volume_type", "correlation"),
             middle_depths=ckpt.get("middle_depths", 8),
             middle_window=ckpt.get("middle_window", 0.12),
             middle_cost_channels=ckpt.get("middle_cost_channels", 0),
-            middle_hourglass_levels=ckpt.get("middle_hourglass_levels", 0),
+            middle_hourglass_levels=ckpt.get("middle_hourglass_levels", 2),
             middle_feature_channels=ckpt.get("middle_feature_channels", 0),
             fine_feature_channels=ckpt.get("fine_feature_channels", 0),
-            middle_supervision=ckpt.get("middle_supervision", False),
-            middle_loss_weight=ckpt.get("middle_loss_weight", 0.3),
-            fullres_fine_volume=ckpt.get("fullres_fine_volume", False),
-            h4_coarse_volume=ckpt.get("h4_coarse_volume", False),
         ).to(device)
         incompatible = model.load_state_dict(ckpt["model"], strict=False)
         unexpected = list(incompatible.unexpected_keys)
@@ -334,10 +253,10 @@ def load_model(ckpt_path: Path, device: torch.device):
     if ckpt_type == "unknown":
         raise ValueError(
             f"Checkpoint does not appear to be a supported table-prior checkpoint: {ckpt_path}\n"
-            "Expected a unet_table checkpoint ('table_z' or 'in_ch' > NUM_BINS) "
+            "Expected a table-prior U-Net checkpoint ('table_z' or 'in_ch' > NUM_BINS) "
             "an EReFormer checkpoint ('embed_dim'/'window_size' metadata or patch_embed weights), "
-            "or a multiview.py/modern_multiview.py checkpoint "
-            "('num_views'/'num_depths' metadata)."
+            "or a multiview.py checkpoint "
+            "('num_views'/'coarse_depths' metadata)."
         )
     raise AssertionError(f"Unhandled checkpoint type: {ckpt_type}")
 
@@ -683,17 +602,13 @@ def _infer_multiview(
     cam_mats = torch.from_numpy(np.stack([T_cam_from_world[i] for i in view_ids])).unsqueeze(0).to(device)
     K_t = torch.from_numpy(K.astype(np.float32)).unsqueeze(0).to(device)
     candidate_fn = (
-        _gaussian_depth_candidates
-        if ckpt.get("gaussian_depth_candidates", False)
-        else (
-            _linear_depth_candidates
-            if ckpt.get("linear_depth_candidates", False)
-            else _inverse_depth_candidates
-        )
+        _linear_depth_candidates
+        if ckpt.get("linear_depth_candidates", False)
+        else _inverse_depth_candidates
     )
     depth_values = torch.from_numpy(
         candidate_fn(
-            int(ckpt.get("num_depths", 32)),
+            int(ckpt.get("coarse_depths", 32)),
             float(ckpt.get("depth_min", DEPTH_MIN)),
             float(ckpt.get("depth_max", D_MAX)),
         )
@@ -885,521 +800,13 @@ def write_error_report(out_path: Path, depth_stats: Optional[dict], recon_stats:
     out_path.write_text("\n".join(lines))
 
 
-def _camera_center(T_world_from_cam: np.ndarray) -> np.ndarray:
-    return T_world_from_cam[:3, 3]
 
 
-def _sample_nearest(arr: np.ndarray, u: np.ndarray, v: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    H, W = arr.shape
-    u_nn = np.rint(u).astype(np.int64)
-    v_nn = np.rint(v).astype(np.int64)
-    inside = (u_nn >= 0) & (u_nn < W) & (v_nn >= 0) & (v_nn < H)
-    sampled = np.zeros_like(u, dtype=np.float32)
-    if inside.any():
-        sampled[inside] = arr[v_nn[inside], u_nn[inside]].astype(np.float32)
-    return sampled, inside
 
 
-def _sample_bilinear(arr: np.ndarray, u: np.ndarray, v: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    H, W = arr.shape
-    inside = (u >= 0.0) & (u <= W - 1) & (v >= 0.0) & (v <= H - 1)
-    sampled = np.zeros_like(u, dtype=np.float32)
-    if not inside.any():
-        return sampled, inside
-
-    ui = u[inside]
-    vi = v[inside]
-    x0 = np.floor(ui).astype(np.int64)
-    y0 = np.floor(vi).astype(np.int64)
-    x1 = np.clip(x0 + 1, 0, W - 1)
-    y1 = np.clip(y0 + 1, 0, H - 1)
-    wx = (ui - x0).astype(np.float32)
-    wy = (vi - y0).astype(np.float32)
-
-    arr_f = arr.astype(np.float32, copy=False)
-    top = arr_f[y0, x0] * (1.0 - wx) + arr_f[y0, x1] * wx
-    bot = arr_f[y1, x0] * (1.0 - wx) + arr_f[y1, x1] * wx
-    sampled[inside] = top * (1.0 - wy) + bot * wy
-    return sampled, inside
 
 
-def _sample_image(arr: np.ndarray, u: np.ndarray, v: np.ndarray, mode: str) -> Tuple[np.ndarray, np.ndarray]:
-    if mode == "bilinear":
-        return _sample_bilinear(arr, u, v)
-    if mode == "nearest":
-        return _sample_nearest(arr, u, v)
-    raise ValueError(f"Unknown sampling mode: {mode}")
 
-
-def reproject_depth_agreement(
-    depth_i: np.ndarray,
-    depth_j: np.ndarray,
-    T_world_from_i: np.ndarray,
-    T_world_from_j: np.ndarray,
-    K: np.ndarray,
-    threshold: float = 0.025,
-    relative_threshold: Optional[float] = None,
-    stride: int = 1,
-    sample_mode: str = "nearest",
-    ref_agreement_mask: Optional[np.ndarray] = None,
-    return_comparable: bool = False,
-) -> np.ndarray | Tuple[np.ndarray, np.ndarray]:
-    """
-    Return pixels in depth_i whose projected 3-D points agree with depth_j.
-
-    depth_i and depth_j are predicted depth maps in their own camera frames.
-    T_world_from_i / T_world_from_j map from each camera frame to the shared
-    world frame.  Agreement is measured as absolute z-depth difference in
-    camera j after reprojection.
-    """
-    H_full, W_full = depth_i.shape
-
-    def empty_result() -> np.ndarray | Tuple[np.ndarray, np.ndarray]:
-        empty = np.zeros((H_full, W_full), dtype=bool)
-        if return_comparable:
-            return empty, empty.copy()
-        return empty
-
-    stride = max(1, int(stride))
-    if stride > 1:
-        depth_i_eval = depth_i[::stride, ::stride]
-        depth_j_eval = depth_j[::stride, ::stride]
-        K_eval = K.copy()
-        K_eval[0, :] /= stride
-        K_eval[1, :] /= stride
-    else:
-        depth_i_eval = depth_i
-        depth_j_eval = depth_j
-        K_eval = K
-
-    H, W = depth_i_eval.shape
-    valid_i = depth_i_eval > 0.0
-    if not valid_i.any() or not (depth_j_eval > 0.0).any():
-        return empty_result()
-
-    yy, xx = np.nonzero(valid_i)
-    z_i = depth_i_eval[yy, xx].astype(np.float32)
-    x_i = (xx.astype(np.float32) - K_eval[0, 2]) * z_i / K_eval[0, 0]
-    y_i = (yy.astype(np.float32) - K_eval[1, 2]) * z_i / K_eval[1, 1]
-
-    pts_i = np.stack([x_i, y_i, z_i, np.ones_like(z_i)], axis=0)
-    T_j_from_i = (np.linalg.inv(T_world_from_j) @ T_world_from_i).astype(np.float32)
-    pts_j = T_j_from_i @ pts_i
-
-    z_j = pts_j[2]
-    front = z_j > 1e-6
-    if not front.any():
-        return empty_result()
-
-    u = K_eval[0, 0] * pts_j[0] / z_j + K_eval[0, 2]
-    v = K_eval[1, 1] * pts_j[1] / z_j + K_eval[1, 2]
-
-    ref_depth, inside_sample = _sample_image(depth_j_eval, u, v, sample_mode)
-    inside = front & inside_sample
-    agree = np.zeros_like(z_j, dtype=bool)
-    comparable = np.zeros_like(z_j, dtype=bool)
-    if inside.any():
-        abs_error = np.abs(ref_depth[inside] - z_j[inside])
-        depth_agree = (ref_depth[inside] > 0.0) & (abs_error <= threshold)
-        if relative_threshold is not None:
-            rel_error = abs_error / np.maximum(z_j[inside], 1e-6)
-            depth_agree &= rel_error <= relative_threshold
-            occlusion_margin = np.maximum(
-                threshold,
-                relative_threshold * np.maximum(z_j[inside], 1e-6),
-            )
-        else:
-            occlusion_margin = threshold
-
-        # If the reference depth is substantially closer than the reprojected
-        # point, that reference view is probably occluded. Treat it as
-        # non-comparable instead of as negative evidence against depth_i.
-        ref_valid = ref_depth[inside] > 0.0
-        occluded_in_ref = ref_valid & (ref_depth[inside] < z_j[inside] - occlusion_margin)
-        comparable[inside] = ref_valid & ~occluded_in_ref
-
-        if ref_agreement_mask is not None:
-            ref_mask_eval = ref_agreement_mask[::stride, ::stride] if stride > 1 else ref_agreement_mask
-            ref_mask_sampled, ref_mask_inside = _sample_image(
-                ref_mask_eval.astype(np.float32), u[inside], v[inside], sample_mode
-            )
-            depth_agree &= ref_mask_inside & (ref_mask_sampled > 0.5)
-
-        agree[inside] = depth_agree
-
-    mask = np.zeros((H, W), dtype=bool)
-    mask[yy[agree], xx[agree]] = True
-    comparable_mask = np.zeros((H, W), dtype=bool)
-    comparable_mask[yy[comparable], xx[comparable]] = True
-    if stride > 1:
-        mask = np.repeat(np.repeat(mask, stride, axis=0), stride, axis=1)
-        mask = mask[:H_full, :W_full]
-        comparable_mask = np.repeat(np.repeat(comparable_mask, stride, axis=0), stride, axis=1)
-        comparable_mask = comparable_mask[:H_full, :W_full]
-    if return_comparable:
-        return mask, comparable_mask
-    return mask
-
-
-def choose_consistency_refs(
-    frame_idx: int,
-    candidates: list,
-    max_refs: int,
-    pose_baseline: bool = False,
-    min_baseline: float = 0.01,
-    max_baseline: float = 0.08,
-) -> list:
-    """Pick nearest other candidate frames as multi-view consistency references."""
-    max_refs = max(1, max_refs)
-    if pose_baseline:
-        target = next(c for c in candidates if c["frame_idx"] == frame_idx)
-        target_center = _camera_center(target["T"])
-        scored = []
-        for cand in candidates:
-            if cand["frame_idx"] == frame_idx:
-                continue
-            baseline = float(np.linalg.norm(_camera_center(cand["T"]) - target_center))
-            if min_baseline <= baseline <= max_baseline:
-                scored.append((baseline, cand))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [cand for _, cand in scored[:max_refs]]
-
-    refs = [c for c in candidates if c["frame_idx"] != frame_idx]
-    refs.sort(key=lambda c: abs(c["frame_idx"] - frame_idx))
-    return refs[:max_refs]
-
-
-def multiview_consistency_mask(
-    depth_m: np.ndarray,
-    T_world_from_cam: np.ndarray,
-    refs: list,
-    K: np.ndarray,
-    threshold: float,
-    relative_threshold: Optional[float],
-    min_agree: int,
-    stride: int,
-    sample_mode: str,
-    bidirectional: bool,
-    occlusion_aware: bool = False,
-    min_comparable: int = 1,
-) -> np.ndarray:
-    """Keep pixels that agree with at least min_agree nearby candidate views."""
-    if not refs:
-        return np.ones(depth_m.shape, dtype=bool)
-
-    votes = np.zeros(depth_m.shape, dtype=np.uint16)
-    comparable_votes = np.zeros(depth_m.shape, dtype=np.uint16)
-    for ref in refs:
-        ref_mask = None
-        if bidirectional:
-            ref_mask = reproject_depth_agreement(
-                ref["pred_masked"],
-                depth_m,
-                ref["T"],
-                T_world_from_cam,
-                K,
-                threshold=threshold,
-                relative_threshold=relative_threshold,
-                stride=stride,
-                sample_mode=sample_mode,
-            )
-        result = reproject_depth_agreement(
-            depth_m,
-            ref["pred_masked"],
-            T_world_from_cam,
-            ref["T"],
-            K,
-            threshold=threshold,
-            relative_threshold=relative_threshold,
-            stride=stride,
-            sample_mode=sample_mode,
-            ref_agreement_mask=ref_mask,
-            return_comparable=occlusion_aware,
-        )
-        if occlusion_aware:
-            agree_mask, comparable_mask = result
-            votes += agree_mask
-            comparable_votes += comparable_mask
-        else:
-            votes += result
-    keep = votes >= max(1, min_agree)
-    if occlusion_aware:
-        keep &= comparable_votes >= max(1, min_comparable)
-    return keep
-
-
-def _camera_view_bin(
-    T_world_from_cam: np.ndarray,
-    target: np.ndarray,
-    n_bins: int,
-) -> int:
-    center = _camera_center(T_world_from_cam)
-    angle = math.atan2(float(center[1] - target[1]), float(center[0] - target[0]))
-    angle01 = (angle + math.pi) / (2.0 * math.pi)
-    return min(max(int(angle01 * n_bins), 0), n_bins - 1)
-
-
-def _select_pose_diverse_consistency_frames(
-    scored_frames: list,
-    keep_count: int,
-    center: np.ndarray,
-    view_bins: int,
-    min_center_distance: float,
-) -> tuple[list, int]:
-    if keep_count <= 0 or not scored_frames:
-        return [], 0
-    if view_bins <= 1:
-        selected = sorted(scored_frames, key=lambda c: (-c["score"], c["frame_idx"]))[:keep_count]
-        return selected, 1 if selected else 0
-
-    bins: dict[int, list] = {}
-    for cand in scored_frames:
-        view_bin = _camera_view_bin(cand["T"], center, view_bins)
-        cand["view_bin"] = view_bin
-        bins.setdefault(view_bin, []).append(cand)
-    for items in bins.values():
-        items.sort(key=lambda c: (-c["score"], c["frame_idx"]))
-
-    active_bins = sorted(
-        bins,
-        key=lambda b: (-bins[b][0]["score"], bins[b][0]["frame_idx"]),
-    )
-    selected: list = []
-    selected_ids: set[int] = set()
-
-    def far_enough(cand) -> bool:
-        if min_center_distance <= 0.0:
-            return True
-        center = _camera_center(cand["T"])
-        return all(
-            np.linalg.norm(center - _camera_center(prev["T"])) >= min_center_distance
-            for prev in selected
-        )
-
-    while len(selected) < keep_count and active_bins:
-        progressed = False
-        for view_bin in list(active_bins):
-            candidates = bins[view_bin]
-            while candidates and candidates[0]["frame_idx"] in selected_ids:
-                candidates.pop(0)
-            pick_idx = None
-            for i, cand in enumerate(candidates):
-                if far_enough(cand):
-                    pick_idx = i
-                    break
-            if pick_idx is None:
-                active_bins.remove(view_bin)
-                continue
-            cand = candidates.pop(pick_idx)
-            selected.append(cand)
-            selected_ids.add(cand["frame_idx"])
-            progressed = True
-            if len(selected) >= keep_count:
-                break
-            if not candidates:
-                active_bins.remove(view_bin)
-        if not progressed:
-            break
-
-    if len(selected) < keep_count:
-        remaining = [
-            cand for cand in sorted(scored_frames, key=lambda c: (-c["score"], c["frame_idx"]))
-            if cand["frame_idx"] not in selected_ids
-        ]
-        selected.extend(remaining[:keep_count - len(selected)])
-
-    used_bins = len({cand.get("view_bin", -1) for cand in selected})
-    return selected, used_bins
-
-
-def _pose_diversity_center(
-    scored_frames: list,
-    target: np.ndarray,
-    mode: str,
-) -> np.ndarray:
-    if mode == "target" or not scored_frames:
-        return target
-    if mode == "camera_mean":
-        centers = np.stack([_camera_center(c["T"]) for c in scored_frames], axis=0)
-        return centers.mean(axis=0)
-    raise ValueError(f"Unknown pose diversity center mode: {mode}")
-
-
-def _temporal_region_index(
-    frame_idx: int,
-    n_regions: int,
-    region_start: int,
-    region_count: int,
-) -> int:
-    local_idx = int(frame_idx) - int(region_start)
-    return min(
-        max(local_idx * n_regions // max(int(region_count), 1), 0),
-        n_regions - 1,
-    )
-
-
-def _select_temporal_region_consistency_frames(
-    scored_frames: list,
-    n_total: int,
-    n_regions: int,
-    use_filtered_depth: bool,
-    region_start: int = 0,
-) -> list:
-    if n_regions <= 0 or not scored_frames:
-        return []
-
-    regions: list[list] = [[] for _ in range(n_regions)]
-    for cand in scored_frames:
-        frame_idx = int(cand["frame_idx"])
-        region_idx = _temporal_region_index(frame_idx, n_regions, region_start, n_total)
-        regions[region_idx].append(cand)
-
-    selected = []
-    for region_idx, candidates in enumerate(regions):
-        finite = [c for c in candidates if np.isfinite(c["score"])]
-        if not finite:
-            continue
-        region_center = region_start + (region_idx + 0.5) * n_total / n_regions
-        best = max(finite, key=lambda c: (c["score"], -abs(c["frame_idx"] - region_center)))
-        selected.append({
-            "score": best["score"],
-            "frame_idx": best["frame_idx"],
-            "pred_depth": best["pred_filtered"] if use_filtered_depth else best["pred_masked"],
-            "gt_depth": best["gt_masked"],
-            "T": best["T"],
-            "consistency": best["consistency"],
-            "coverage": best["coverage"],
-            "region_idx": region_idx,
-        })
-    return selected
-
-
-def _select_temporal_region_mae_frames(
-    candidates: list,
-    n_total: int,
-    n_regions: int,
-    use_filtered_depth: bool,
-    region_start: int = 0,
-) -> list:
-    if n_regions <= 0 or not candidates:
-        return []
-
-    regions: list[list] = [[] for _ in range(n_regions)]
-    for cand in candidates:
-        frame_idx = int(cand["frame_idx"])
-        region_idx = _temporal_region_index(frame_idx, n_regions, region_start, n_total)
-        regions[region_idx].append(cand)
-
-    selected = []
-    for region_idx, region_candidates in enumerate(regions):
-        finite = [c for c in region_candidates if np.isfinite(c["mae_m"])]
-        if not finite:
-            continue
-        region_center = region_start + (region_idx + 0.5) * n_total / n_regions
-        best = min(
-            finite,
-            key=lambda c: (c["mae_m"], abs(c["frame_idx"] - region_center)),
-        )
-        selected.append({
-            "mae_m": best["mae_m"],
-            "frame_idx": best["frame_idx"],
-            "pred_depth": best["pred_filtered"] if use_filtered_depth else best["pred_masked"],
-            "gt_depth": best["gt_masked"],
-            "T": best["T"],
-            "region_idx": region_idx,
-        })
-    return selected
-
-
-def _select_temporal_region_worst5_frames(
-    candidates: list,
-    n_total: int,
-    n_regions: int,
-    use_filtered_depth: bool,
-    region_start: int = 0,
-) -> list:
-    if n_regions <= 0 or not candidates:
-        return []
-
-    regions: list[list] = [[] for _ in range(n_regions)]
-    for cand in candidates:
-        frame_idx = int(cand["frame_idx"])
-        region_idx = _temporal_region_index(frame_idx, n_regions, region_start, n_total)
-        regions[region_idx].append(cand)
-
-    selected = []
-    for region_idx, region_candidates in enumerate(regions):
-        finite = [
-            cand
-            for cand in region_candidates
-            if np.isfinite(cand.get("worst5_mean_m", float("inf")))
-        ]
-        if not finite:
-            continue
-        region_center = region_start + (region_idx + 0.5) * n_total / n_regions
-        best = min(
-            finite,
-            key=lambda cand: (
-                cand["worst5_mean_m"],
-                abs(cand["frame_idx"] - region_center),
-            ),
-        )
-        selected.append({
-            "worst5_mean_m": best["worst5_mean_m"],
-            "frame_idx": best["frame_idx"],
-            "pred_depth": (
-                best["pred_filtered"]
-                if use_filtered_depth
-                else best["pred_masked"]
-            ),
-            "gt_depth": best["gt_masked"],
-            "T": best["T"],
-            "region_idx": region_idx,
-        })
-    return selected
-
-
-def _select_temporal_region_uncertainty_frames(
-    candidates: list,
-    n_total: int,
-    n_regions: int,
-    use_filtered_depth: bool,
-    region_start: int = 0,
-) -> list:
-    if n_regions <= 0 or not candidates:
-        return []
-
-    regions: list[list] = [[] for _ in range(n_regions)]
-    for cand in candidates:
-        frame_idx = int(cand["frame_idx"])
-        region_idx = _temporal_region_index(frame_idx, n_regions, region_start, n_total)
-        regions[region_idx].append(cand)
-
-    selected = []
-    for region_idx, region_candidates in enumerate(regions):
-        finite = [
-            cand for cand in region_candidates
-            if np.isfinite(cand.get("uncertainty", float("inf")))
-        ]
-        if not finite:
-            continue
-        region_center = region_start + (region_idx + 0.5) * n_total / n_regions
-        best = min(
-            finite,
-            key=lambda cand: (
-                cand["uncertainty"],
-                abs(cand["frame_idx"] - region_center),
-            ),
-        )
-        selected.append({
-            "uncertainty": best["uncertainty"],
-            "frame_idx": best["frame_idx"],
-            "pred_depth": best["pred_filtered"] if use_filtered_depth else best["pred_masked"],
-            "gt_depth": best["gt_masked"],
-            "T": best["T"],
-            "region_idx": region_idx,
-        })
-    return selected
 
 
 def _select_global_mae_frames(
@@ -1421,59 +828,8 @@ def _select_global_mae_frames(
     ]
 
 
-def _select_global_worst5_frames(
-    candidates: list,
-    keep_count: int,
-    use_filtered_depth: bool,
-) -> list:
-    finite = [
-        cand
-        for cand in candidates
-        if np.isfinite(cand.get("worst5_mean_m", float("inf")))
-    ]
-    selected = sorted(
-        finite,
-        key=lambda cand: (cand["worst5_mean_m"], cand["frame_idx"]),
-    )
-    return [
-        {
-            "worst5_mean_m": cand["worst5_mean_m"],
-            "frame_idx": cand["frame_idx"],
-            "pred_depth": (
-                cand["pred_filtered"]
-                if use_filtered_depth
-                else cand["pred_masked"]
-            ),
-            "gt_depth": cand["gt_masked"],
-            "T": cand["T"],
-        }
-        for cand in selected[:keep_count]
-    ]
 
 
-def _select_global_uncertainty_frames(
-    candidates: list,
-    keep_count: int,
-    use_filtered_depth: bool,
-) -> list:
-    finite = [
-        cand for cand in candidates
-        if np.isfinite(cand.get("uncertainty", float("inf")))
-    ]
-    selected = sorted(
-        finite,
-        key=lambda cand: (cand["uncertainty"], cand["frame_idx"]),
-    )
-    return [
-        {
-            "uncertainty": cand["uncertainty"],
-            "frame_idx": cand["frame_idx"],
-            "pred_depth": cand["pred_filtered"] if use_filtered_depth else cand["pred_masked"],
-            "gt_depth": cand["gt_masked"],
-            "T": cand["T"],
-        }
-        for cand in selected[:keep_count]
-    ]
 
 
 def tsdf_fuse(
@@ -1609,8 +965,7 @@ def tsdf_fuse(
 
     if cube_center is not None and cube_half_side > 0.0:
         verts  = np.asarray(mesh.vertices)
-        diff   = np.abs(verts - cube_center[None, :])
-        inside = np.where(np.all(diff <= cube_half_side, axis=1))[0]
+        inside = np.flatnonzero(points_in_cube(verts, cube_center, cube_half_side))
         mesh   = mesh.select_by_index(inside)
         mesh.compute_vertex_normals()
         print(f"  Cube crop (side={cube_half_side*2*100:.0f} cm) → "
@@ -1981,65 +1336,6 @@ def save_depth_png(depth_m: np.ndarray, mask: np.ndarray,
     plt.imsave(str(path), img)
 
 
-def save_used_depth_images(
-    output_dir: Path,
-    frame_ids: list[int],
-    pred_frames: list[Tuple[np.ndarray, np.ndarray]],
-    gt_frames: list[Tuple[np.ndarray, np.ndarray]],
-    depth_min: float,
-    depth_max: float,
-) -> None:
-    """Save GT, the exact TSDF input depth, and their error for every used frame."""
-    if not (
-        len(frame_ids) == len(pred_frames) == len(gt_frames)
-    ):
-        raise ValueError(
-            "Final frame IDs, predicted depths, and GT depths must have equal lengths."
-        )
-    used_dir = output_dir / "used_depth_images"
-    used_dir.mkdir(parents=True, exist_ok=True)
-
-    for frame_idx, (pred_depth, _), (gt_depth, _) in zip(
-        frame_ids, pred_frames, gt_frames
-    ):
-        pred_valid = np.isfinite(pred_depth) & (pred_depth > 0.0)
-        gt_valid = np.isfinite(gt_depth) & (gt_depth > 0.0)
-        compared = pred_valid & gt_valid
-        error = np.abs(pred_depth - gt_depth)
-
-        figure, axes = plt.subplots(1, 3, figsize=(12, 3.8))
-        panels = (
-            (gt_depth, gt_valid, depth_min, depth_max, "GT depth"),
-            (pred_depth, pred_valid, depth_min, depth_max, "Predicted depth used"),
-            (error, compared, 0.0, 0.1, "Absolute error"),
-        )
-        for axis, (values, valid, vmin, vmax, title) in zip(axes, panels):
-            image = colorize(np.where(valid, values, 0.0), vmin, vmax)
-            image[~valid] = 40
-            if title == "Absolute error":
-                image[gt_valid & ~pred_valid] = np.array(
-                    [255, 0, 255], dtype=np.uint8
-                )
-            axis.imshow(image)
-            axis.set_title(title)
-            axis.set_xticks([])
-            axis.set_yticks([])
-
-        mae = float(error[compared].mean()) if compared.any() else math.nan
-        coverage = float(compared.sum() / max(int(gt_valid.sum()), 1))
-        figure.suptitle(
-            f"Frame {frame_idx} | MAE {mae * 100.0:.2f} cm | "
-            f"predicted GT coverage {coverage:.1%} | magenta = missing prediction"
-        )
-        figure.tight_layout()
-        figure.savefig(
-            used_dir / f"frame_{frame_idx:05d}.png",
-            dpi=140,
-            bbox_inches="tight",
-        )
-        plt.close(figure)
-
-    print(f"  Used depths    : saved {len(frame_ids)} images to {used_dir}")
 
 
 def save_overview(samples: list, out_path: Path,
@@ -2092,41 +1388,10 @@ def save_overview(samples: list, out_path: Path,
     print(f"  Overview → {out_path}")
 
 
-def event_support_mask(vox_np: np.ndarray, percentile: float) -> Tuple[np.ndarray, float]:
-    activity = np.abs(vox_np).sum(axis=0)
-    nonzero = activity[activity > 0.0]
-    if len(nonzero) == 0:
-        return np.zeros(activity.shape, dtype=bool), 0.0
-    threshold = float(np.percentile(nonzero, percentile))
-    return activity >= threshold, threshold
 
 
-def depth_smoothness_score(depth_m: np.ndarray, valid: np.ndarray) -> float:
-    if not valid.any():
-        return float("inf")
-    gx = np.diff(depth_m, axis=1, prepend=depth_m[:, :1])
-    gy = np.diff(depth_m, axis=0, prepend=depth_m[:1, :])
-    grad = np.sqrt(gx[valid] ** 2 + gy[valid] ** 2)
-    if len(grad) == 0:
-        return float("inf")
-    return float(np.median(grad))
 
 
-def table_workspace_mask(
-    pred_m: np.ndarray,
-    table_norm: np.ndarray,
-    depth_min: float,
-    depth_max: float,
-    front_margin: float,
-    behind_margin: float,
-) -> np.ndarray:
-    table_depth = table_norm.astype(np.float32) * (depth_max - depth_min) + depth_min
-    return (
-        np.isfinite(table_depth)
-        & (table_depth > depth_min)
-        & (pred_m >= table_depth - front_margin)
-        & (pred_m <= table_depth + behind_margin)
-    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2227,7 +1492,7 @@ def _run_sequence_directory(args: argparse.Namespace) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Depth-map / point-cloud reconstruction for table-prior checkpoints.",
+        description="Depth-map, point-cloud, and TSDF reconstruction from trained depth models.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--checkpoint", type=str, required=True,
@@ -2247,37 +1512,10 @@ def main() -> None:
                         help="Use every Nth frame for the mesh (overrides --mesh_frame_count)")
     parser.add_argument("--mesh_frame_count", type=int, default=80,
                         help="Total number of evenly spaced frames to predict when --frame_step is not set")
-    parser.add_argument("--uncertainty_frames", type=int, default=None, metavar="N",
-                        help="Fuse the N lowest-uncertainty predicted frames")
     parser.add_argument("--best_mae_frames", type=int, default=None, metavar="N",
                         help="Fuse the N predicted frames with the lowest whole-image MAE")
-    parser.add_argument(
-        "--best_worst5_frames",
-        type=int,
-        default=None,
-        metavar="N",
-        help=(
-            "Fuse the N predicted frames with the lowest mean error among "
-            "their worst 5%% of valid GT pixels"
-        ),
-    )
-    parser.add_argument("--consistency_frames", type=int, default=None, metavar="N",
-                        help="Fuse the N predicted frames with the highest GT-free multi-view consistency score")
-    parser.add_argument("--regions", action="store_true",
-                        help="Select one best frame from each of N temporal regions instead of selecting the global best N frames")
-    parser.add_argument("--best_consistency_view_bins", type=int, default=8,
-                        help="Azimuth bins around the target used to spread global --consistency_frames selection; 1 disables bin balancing")
-    parser.add_argument("--best_consistency_view_center", choices=("camera_mean", "target"),
-                        default="camera_mean",
-                        help="Center used for azimuth binning in global --consistency_frames selection")
-    parser.add_argument("--best_consistency_min_center_distance", type=float, default=0.015,
-                        help="Minimum camera-center spacing in metres during global --consistency_frames selection")
     parser.add_argument("--indices", type=int, nargs="+", default=None,
                         help="Explicit visualisation frame indices (overrides --n_frames)")
-    parser.add_argument("--start_idx", type=int, default=0,
-                        help="First target frame index to consider for reconstruction, inclusive")
-    parser.add_argument("--end_idx", type=int, default=None,
-                        help="Last target frame index to consider for reconstruction, inclusive")
     parser.add_argument("--out_dir", type=str, default=None,
                         help="Output directory (default: training/results/<checkpoint_name>)")
     parser.add_argument("--depth_min", type=float, default=DEPTH_MIN)
@@ -2327,66 +1565,6 @@ def main() -> None:
             "without projecting them into the event-camera plane"
         ),
     )
-    parser.add_argument("--filter", action="store_true",
-                        help="Filter predicted TSDF depth with multi-frame reprojection consistency")
-    parser.add_argument("--consistency_threshold", type=float, default=0.025,
-                        help="Max reprojection depth disagreement in metres when --filter is enabled")
-    parser.add_argument("--consistency_relative_threshold", type=float, default=None,
-                        help="Optional relative depth disagreement threshold when --filter is enabled")
-    parser.add_argument("--consistency_refs", type=int, default=3,
-                        help="Number of nearby mesh candidates to compare against when --filter is enabled")
-    parser.add_argument("--pose_baseline_refs", action="store_true",
-                        help="Select consistency references by camera baseline instead of temporal distance")
-    parser.add_argument("--min_ref_baseline", type=float, default=0.01,
-                        help="Minimum camera-center baseline in metres for --pose_baseline_refs")
-    parser.add_argument("--max_ref_baseline", type=float, default=0.08,
-                        help="Maximum camera-center baseline in metres for --pose_baseline_refs")
-    parser.add_argument("--consistency_min_agree", type=int, default=1,
-                        help="Minimum agreeing reference views required per pixel when --filter is enabled")
-    parser.add_argument("--consistency_stride", type=int, default=2,
-                        help="Evaluate multi-view consistency every N pixels; 1 is full resolution")
-    parser.add_argument("--bilinear_consistency", action="store_true",
-                        help="Use bilinear projected-depth sampling for consistency instead of nearest pixel")
-    parser.add_argument("--bidirectional_consistency", action="store_true",
-                        help="Require target->reference agreement to land on reference pixels that also agree back")
-    parser.add_argument("--occlusion_aware_consistency", action="store_true",
-                        help="Treat reference views with a closer occluding surface as abstentions instead of failed agreement")
-    parser.add_argument("--consistency_min_comparable", type=int, default=1,
-                        help="Minimum non-occluded reference views required per pixel with --occlusion_aware_consistency")
-    parser.add_argument("--min_frame_consistency", type=float, default=0.02,
-                        help="Skip predicted mesh frames with a lower consistent-pixel fraction when --filter is enabled")
-    parser.add_argument("--event_support_filter", action="store_true",
-                        help="Mask predicted TSDF/point-cloud pixels with low event activity")
-    parser.add_argument("--event_activity_percentile", type=float, default=15.0,
-                        help="Nonzero event-activity percentile kept by --event_support_filter")
-    parser.add_argument("--workspace_depth_filter", action="store_true",
-                        help="Mask predicted TSDF/point-cloud pixels outside a table-plane depth band")
-    parser.add_argument("--workspace_front_margin", type=float, default=0.20,
-                        help="Allowed metres in front of the table-plane depth for --workspace_depth_filter")
-    parser.add_argument("--workspace_behind_margin", type=float, default=0.03,
-                        help="Allowed metres behind the table-plane depth for --workspace_depth_filter")
-    parser.add_argument("--rank_consistency_frames", action="store_true",
-                        help="Rank consistency-filtered frames and keep a pose-diverse high-score subset")
-    parser.add_argument("--ranked_frame_count", type=int, default=40,
-                        help="Maximum frames kept by --rank_consistency_frames")
-    parser.add_argument("--rank_min_center_distance", type=float, default=0.015,
-                        help="Minimum camera-center distance in metres for --rank_consistency_frames")
-    parser.add_argument("--smoothness_score", action="store_true",
-                        help="Penalize high median depth gradients when --rank_consistency_frames is enabled")
-    parser.add_argument("--smoothness_weight", type=float, default=20.0,
-                        help="Strength of the smoothness penalty in ranked frame scores")
-    parser.add_argument("--save_consistency_masks", action="store_true",
-                        help="Save kept and removed pixel masks for consistency-filtered frames")
-    parser.add_argument("--consistency_mask_count", type=int, default=10,
-                        help="Maximum debug masks saved by --save_consistency_masks")
-    parser.add_argument(
-        "--save_used_depth_images",
-        action="store_true",
-        help=(
-            "Save one GT/prediction/error comparison PNG for every final frame "
-            "used by TSDF fusion."
-        ),
-    )
     parser.add_argument("--error_stride", type=int, default=4,
                         help="Pixel stride for reconstruction-level point-cloud error")
     parser.add_argument("--error_max_points", type=int, default=5000,
@@ -2399,24 +1577,6 @@ def main() -> None:
     parser.add_argument("--target_x", type=float, default=SPATIAL_TARGET_X)
     parser.add_argument("--target_y", type=float, default=SPATIAL_TARGET_Y)
     parser.add_argument("--target_z", type=float, default=SPATIAL_TARGET_Z)
-    parser.add_argument(
-        "--min_pose_z",
-        type=float,
-        default=None,
-        help=(
-            "Exclude target frame indices whose recorded end-effector Z position "
-            "in the robot base/world frame is below this value in metres."
-        ),
-    )
-    parser.add_argument(
-        "--max_pose_z",
-        type=float,
-        default=None,
-        help=(
-            "Exclude target frame indices whose recorded end-effector Z position "
-            "in the robot base/world frame is above this value in metres."
-        ),
-    )
     args = parser.parse_args()
     if args.mesh_frame_count <= 0:
         parser.error("--mesh_frame_count must be > 0")
@@ -2424,54 +1584,12 @@ def main() -> None:
         parser.error("--tsdf_confidence_levels must be > 0")
     if not 0.0 <= args.tsdf_min_confidence < 1.0:
         parser.error("--tsdf_min_confidence must be in [0, 1)")
-    for flag, count in (
-        ("--uncertainty_frames", args.uncertainty_frames),
-        ("--best_mae_frames", args.best_mae_frames),
-        ("--best_worst5_frames", args.best_worst5_frames),
-        ("--consistency_frames", args.consistency_frames),
-    ):
-        if count is not None and count <= 0:
-            parser.error(f"{flag} must be > 0")
-    if args.best_consistency_view_bins <= 0:
-        parser.error("--best_consistency_view_bins must be > 0")
-    if args.best_consistency_min_center_distance < 0:
-        parser.error("--best_consistency_min_center_distance must be >= 0")
-    if args.consistency_min_comparable <= 0:
-        parser.error("--consistency_min_comparable must be > 0")
-    if args.uncertainty_frames is not None and args.rank_consistency_frames:
-        parser.error("--uncertainty_frames cannot be combined with --rank_consistency_frames")
+    if args.best_mae_frames is not None and args.best_mae_frames <= 0:
+        parser.error("--best_mae_frames must be > 0")
     if args.surface_samples <= 0:
         parser.error("--surface_samples must be > 0")
     if args.render_eval_frames < 0:
         parser.error("--render_eval_frames must be >= 0")
-    if (
-        args.min_pose_z is not None
-        and args.max_pose_z is not None
-        and args.min_pose_z > args.max_pose_z
-    ):
-        parser.error("--min_pose_z must be <= --max_pose_z")
-    if args.start_idx < 0:
-        parser.error("--start_idx must be >= 0")
-    if args.end_idx is not None and args.end_idx < 0:
-        parser.error("--end_idx must be >= 0")
-    if args.end_idx is not None and args.start_idx > args.end_idx:
-        parser.error("--start_idx must be <= --end_idx")
-    selection_modes = [
-        args.best_mae_frames is not None,
-        args.best_worst5_frames is not None,
-        args.consistency_frames is not None,
-        args.uncertainty_frames is not None,
-    ]
-    if sum(bool(x) for x in selection_modes) > 1:
-        parser.error(
-            "--best_mae_frames, --best_worst5_frames, --consistency_frames, "
-            "and --uncertainty_frames are mutually exclusive"
-        )
-    if args.regions and not any(selection_modes):
-        parser.error(
-            "--regions requires --best_mae_frames N, --best_worst5_frames N, "
-            "--consistency_frames N, or --uncertainty_frames N"
-        )
 
     if _run_sequence_directory(args):
         return
@@ -2544,10 +1662,7 @@ def main() -> None:
 
     # ── Model ─────────────────────────────────────────────────────
     model, ckpt, ckpt_type = load_model(ckpt_path, device)
-    use_uncertainty_selection = args.uncertainty_frames is not None
-    use_learned_uncertainty = (
-        use_uncertainty_selection or args.uncertainty_weighted_tsdf
-    )
+    use_learned_uncertainty = args.uncertainty_weighted_tsdf
     if use_learned_uncertainty:
         if ckpt_type != "multiview":
             parser.error("Learned uncertainty is only supported for multiview.py checkpoints")
@@ -2573,10 +1688,10 @@ def main() -> None:
     if ckpt_type == "multiview":
         print(f"  architecture   : {_infer_multiview_model_arch(ckpt)}")
         print(f"  num_views      : {ckpt.get('num_views', 5)}")
-        print(f"  num_depths     : {ckpt.get('num_depths', 32)}")
+        print(f"  coarse_depths  : {ckpt.get('coarse_depths', 32)}")
         print(f"  view_interval  : {ckpt.get('view_interval', 5)}")
         print(f"  pose selection : {ckpt.get('pose_view_selection', False)}")
-        print(f"  feature encoder: {_infer_multiview_feature_encoder(ckpt)}")
+        print("  feature encoder: deep_fpn")
         print(f"  uncertainty    : {bool(ckpt.get('uncertainty', False))}")
     if ckpt_type == "unet_table":
         print(f"  num_views      : {ckpt.get('num_views', 1)}")
@@ -2659,17 +1774,8 @@ def main() -> None:
     n_total = min(n_total, n_vox, n_tbl, n_rgb)   # don't go past what's precomputed
     if T_cam_from_world is not None:
         n_total = min(n_total, len(T_cam_from_world))
-    if args.start_idx >= n_total:
-        parser.error(
-            f"--start_idx={args.start_idx} is outside the available frame range "
-            f"0..{n_total - 1}"
-        )
-    frame_start = int(args.start_idx)
-    frame_end = n_total - 1 if args.end_idx is None else min(int(args.end_idx), n_total - 1)
-    if frame_start > frame_end:
-        parser.error(
-            f"Selected index range {frame_start}..{frame_end} contains no available frames"
-        )
+    frame_start = 0
+    frame_end = n_total - 1
     region_count = frame_end - frame_start + 1
 
     # ── Frame selection ────────────────────────────────────────────
@@ -2694,34 +1800,6 @@ def main() -> None:
             picks      = np.round(np.linspace(0, len(mesh_frames) - 1, args.n_frames)).astype(int)
             viz_frames = sorted({mesh_frames[i] for i in picks})
 
-    if args.min_pose_z is not None or args.max_pose_z is not None:
-        if not use_poses:
-            parser.error("--min_pose_z/--max_pose_z require hdf5/poses.h5")
-
-        def pose_z_is_allowed(frame_idx: int) -> bool:
-            pose_z = float(ee_T_all[frame_idx, 2, 3])
-            if args.min_pose_z is not None and pose_z < args.min_pose_z:
-                return False
-            if args.max_pose_z is not None and pose_z > args.max_pose_z:
-                return False
-            return True
-
-        mesh_before = len(mesh_frames)
-        viz_before = len(viz_frames)
-        mesh_frames = [idx for idx in mesh_frames if pose_z_is_allowed(idx)]
-        viz_frames = [idx for idx in viz_frames if pose_z_is_allowed(idx)]
-        if not mesh_frames:
-            parser.error(
-                "The requested pose-Z range excludes every reconstruction frame."
-            )
-        print(
-            "Pose-Z filter    : "
-            f"{args.min_pose_z if args.min_pose_z is not None else '-inf'} to "
-            f"{args.max_pose_z if args.max_pose_z is not None else '+inf'} m "
-            f"(mesh {mesh_before}->{len(mesh_frames)}, "
-            f"viz {viz_before}->{len(viz_frames)})"
-        )
-
     run_frames = sorted(set(mesh_frames) | set(viz_frames))
 
     print(f"Total frames     : {n_total}")
@@ -2734,63 +1812,10 @@ def main() -> None:
     else:
         print(f"Frame step       : {step}  ({len(mesh_frames)} prediction frames)")
     print(f"Viz frames ({len(viz_frames):3d}) : {viz_frames}")
-    if args.filter:
-        print(f"TSDF filter      : multi-frame consistency "
-              f"(threshold={args.consistency_threshold * 100:.1f} cm, "
-              f"rel={args.consistency_relative_threshold}, "
-              f"refs={args.consistency_refs}, "
-              f"min_agree={args.consistency_min_agree}, "
-              f"stride={max(1, args.consistency_stride)}, "
-              f"min_frame={args.min_frame_consistency:.1%})")
-        if args.pose_baseline_refs:
-            print(f"  ref baselines  : {args.min_ref_baseline * 100:.1f}-{args.max_ref_baseline * 100:.1f} cm")
-        if args.bilinear_consistency:
-            print("  sampling       : bilinear")
-        if args.bidirectional_consistency:
-            print("  direction      : bidirectional")
-        if args.occlusion_aware_consistency:
-            print(
-                "  occlusion      : closer reference surfaces abstain "
-                f"(min comparable refs={args.consistency_min_comparable})"
-            )
-    if args.event_support_filter:
-        print(f"Event support    : keep >= p{args.event_activity_percentile:g} of nonzero activity")
-    if args.workspace_depth_filter:
-        print(
-            f"Workspace filter : table depth -{args.workspace_front_margin * 100:.1f}/"
-            f"+{args.workspace_behind_margin * 100:.1f} cm"
-        )
-    if args.rank_consistency_frames:
-        print(
-            f"Frame ranking    : top {args.ranked_frame_count}, "
-            f"min center dist={args.rank_min_center_distance * 100:.1f} cm, "
-            f"smoothness={args.smoothness_score}"
-        )
     if args.best_mae_frames is not None:
         print(
             f"MAE frame select : keep {args.best_mae_frames} "
-            f"{'temporal-region winners' if args.regions else 'globally lowest-MAE frames'}"
-        )
-    if args.best_worst5_frames is not None:
-        print(
-            f"Worst-5% select  : keep {args.best_worst5_frames} "
-            f"{'temporal-region winners' if args.regions else 'globally lowest worst-5% means'}"
-        )
-    if args.consistency_frames is not None:
-        print(
-            f"Consistency select: keep {args.consistency_frames} "
-            f"{'temporal-region winners' if args.regions else 'globally highest-score frames'}"
-        )
-        if not args.regions:
-            print(
-                f"  pose diversity : view_bins={args.best_consistency_view_bins}, "
-                f"view_center={args.best_consistency_view_center}, "
-                f"min_center_dist={args.best_consistency_min_center_distance * 100:.1f} cm"
-            )
-    if use_uncertainty_selection:
-        print(
-            f"Uncertainty select: keep {args.uncertainty_frames} "
-            f"{'temporal-region winners' if args.regions else 'globally lowest-uncertainty frames'}"
+            "globally lowest-MAE frames"
         )
     if args.uncertainty_weighted_tsdf:
         print(
@@ -2902,43 +1927,10 @@ def main() -> None:
                 gt = resize_crop(gt, resize_hw, crop_hw, mode="bilinear")
             gt_valid = np.isfinite(gt) & (gt > depth_min) & (gt < depth_max)
             pred_valid = np.isfinite(pred_m) & (pred_m > depth_min) & (pred_m < depth_max)
-            if args.event_support_filter:
-                event_valid, activity_threshold = event_support_mask(
-                    vox_np, args.event_activity_percentile
-                )
-                pred_valid &= event_valid
-            else:
-                activity_threshold = None
-            if args.workspace_depth_filter:
-                pred_valid &= table_workspace_mask(
-                    pred_m,
-                    tbl_eval,
-                    depth_min,
-                    depth_max,
-                    front_margin=args.workspace_front_margin,
-                    behind_margin=args.workspace_behind_margin,
-                )
             gt_mask = gt_valid.astype(np.float32)
             pred_mask = pred_valid.astype(np.float32)
-            if uncertainty_map is not None and pred_valid.any():
-                frame_uncertainty = float(np.mean(uncertainty_map[pred_valid]))
-            else:
-                frame_uncertainty = float("inf")
-
             frame_err = depth_error_stats(pred_m, gt, gt_mask)
             merge_depth_error_stats(depth_error_total, frame_err)
-            valid_abs_error = np.abs(pred_m[gt_valid] - gt[gt_valid])
-            if valid_abs_error.size:
-                worst_count = max(
-                    1,
-                    int(math.ceil(0.05 * valid_abs_error.size)),
-                )
-                worst_start = valid_abs_error.size - worst_count
-                worst5_mean_m = float(
-                    np.partition(valid_abs_error, worst_start)[worst_start:].mean()
-                )
-            else:
-                worst5_mean_m = float("inf")
 
             # Per-frame point cloud
             pts = depth_to_pointcloud(pred_m, pred_mask, K)
@@ -2957,10 +1949,6 @@ def main() -> None:
                     "gt_masked": gt_masked,
                     "valid": pred_valid,
                     "mae_m": frame_err["abs_sum"] / frame_err["n"] if frame_err["n"] > 0 else float("inf"),
-                    "worst5_mean_m": worst5_mean_m,
-                    "smoothness": depth_smoothness_score(pred_m, pred_valid),
-                    "uncertainty": frame_uncertainty,
-                    "event_activity_threshold": activity_threshold,
                     "T": T_base_from_event,
                 })
 
@@ -2992,234 +1980,27 @@ def main() -> None:
         if rgb_f is not None:
             rgb_f.close()
 
-    # ── Multi-view candidate selection ────────────────────────────
-    filtered_candidates = []
-    consistency_candidates = []
-    if mesh_candidates:
-        if args.filter or args.consistency_frames is not None:
-            t_cons0 = time.perf_counter()
-            skipped = 0
-            fractions = []
-            sample_mode = "bilinear" if args.bilinear_consistency else "nearest"
-            mask_debug_dir = out_dir / "consistency_masks"
-            saved_masks = 0
-            for cand in mesh_candidates:
-                valid = cand["valid"]
-                valid_count = int(valid.sum())
-                refs = choose_consistency_refs(
-                    cand["frame_idx"],
-                    mesh_candidates,
-                    max_refs=args.consistency_refs,
-                    pose_baseline=args.pose_baseline_refs,
-                    min_baseline=args.min_ref_baseline,
-                    max_baseline=args.max_ref_baseline,
-                )
-                consistent = multiview_consistency_mask(
-                    cand["pred_masked"],
-                    cand["T"],
-                    refs,
-                    K,
-                    threshold=args.consistency_threshold,
-                    relative_threshold=args.consistency_relative_threshold,
-                    min_agree=args.consistency_min_agree,
-                    stride=args.consistency_stride,
-                    sample_mode=sample_mode,
-                    bidirectional=args.bidirectional_consistency,
-                    occlusion_aware=args.occlusion_aware_consistency,
-                    min_comparable=args.consistency_min_comparable,
-                )
-                keep = valid & consistent
-                frac = float(keep.sum() / valid_count) if valid_count > 0 else 0.0
-                fractions.append(frac)
+    # ── Select the lowest-MAE frames for TSDF fusion ─────────────
+    mesh_data = [(c["pred_masked"], c["T"]) for c in mesh_candidates]
+    gt_mesh_data = [(c["gt_masked"], c["T"]) for c in mesh_candidates]
+    final_mesh_frame_ids = [c["frame_idx"] for c in mesh_candidates]
 
-                if args.filter and frac < args.min_frame_consistency:
-                    skipped += 1
-                    continue
-
-                pred_filtered = np.where(keep, cand["pred_masked"], np.float32(0.0)).astype(np.float32)
-                coverage = float(keep.mean())
-                score = frac * np.sqrt(coverage)
-                if args.smoothness_score:
-                    smoothness = cand.get("smoothness", float("inf"))
-                    if np.isfinite(smoothness):
-                        score /= 1.0 + args.smoothness_weight * smoothness
-                    else:
-                        score = 0.0
-                scored = {
-                    "frame_idx": cand["frame_idx"],
-                    "pred_masked": cand["pred_masked"],
-                    "pred_filtered": pred_filtered,
-                    "gt_masked": cand["gt_masked"],
-                    "T": cand["T"],
-                    "mae_m": cand["mae_m"],
-                    "worst5_mean_m": cand["worst5_mean_m"],
-                    "score": float(score),
-                    "consistency": frac,
-                    "coverage": coverage,
-                    "uncertainty": cand["uncertainty"],
-                }
-                consistency_candidates.append(scored)
-                if args.filter:
-                    filtered_candidates.append(scored)
-
-                if args.save_consistency_masks and saved_masks < max(0, args.consistency_mask_count):
-                    mask_debug_dir.mkdir(exist_ok=True)
-                    frame_idx = cand["frame_idx"]
-                    removed = valid & ~consistent
-                    plt.imsave(str(mask_debug_dir / f"consistency_{frame_idx:05d}.png"),
-                               keep.astype(np.uint8) * 255, cmap="gray")
-                    plt.imsave(str(mask_debug_dir / f"removed_{frame_idx:05d}.png"),
-                               removed.astype(np.uint8) * 255, cmap="gray")
-                    saved_masks += 1
-
-            if args.rank_consistency_frames:
-                ranked = sorted(filtered_candidates, key=lambda c: c["score"], reverse=True)
-                selected = []
-                for cand in ranked:
-                    center = _camera_center(cand["T"])
-                    if all(
-                        np.linalg.norm(center - _camera_center(prev["T"])) >= args.rank_min_center_distance
-                        for prev in selected
-                    ):
-                        selected.append(cand)
-                    if len(selected) >= max(1, args.ranked_frame_count):
-                        break
-                filtered_candidates = selected
-
-            if args.filter:
-                for cand in filtered_candidates:
-                    mesh_data.append((cand["pred_filtered"], cand["T"]))
-                    gt_mesh_data.append((cand["gt_masked"], cand["T"]))
-                final_mesh_frame_ids = [c["frame_idx"] for c in filtered_candidates]
-            else:
-                mesh_data = [(c["pred_masked"], c["T"]) for c in mesh_candidates]
-                gt_mesh_data = [(c["gt_masked"], c["T"]) for c in mesh_candidates]
-                final_mesh_frame_ids = [c["frame_idx"] for c in mesh_candidates]
-
-            if fractions:
-                kept = len(mesh_data) if args.filter else len(mesh_candidates)
-                print(
-                    f"MV consistency   : scored {len(consistency_candidates)}/{len(mesh_candidates)} mesh frames, "
-                    f"kept={kept} "
-                    f"(skipped={skipped}, median consistent pixels={np.median(fractions):.1%}, "
-                    f"time={time.perf_counter() - t_cons0:.1f}s)"
-                )
-                if args.rank_consistency_frames and filtered_candidates:
-                    scores = [c["score"] for c in filtered_candidates]
-                    print(
-                        f"  ranked scores  : min={min(scores):.4f}, "
-                        f"median={np.median(scores):.4f}, max={max(scores):.4f}"
-                    )
-                if args.save_consistency_masks:
-                    print(f"  mask debug     : saved {saved_masks} frame masks to {mask_debug_dir}")
-        else:
-            mesh_data = [(c["pred_masked"], c["T"]) for c in mesh_candidates]
-            gt_mesh_data = [(c["gt_masked"], c["T"]) for c in mesh_candidates]
-            final_mesh_frame_ids = [c["frame_idx"] for c in mesh_candidates]
-
-    if args.consistency_frames is not None and consistency_candidates and mesh_data and gt_mesh_data:
-        scored_frames = [
-            {
-                "score": c["score"],
-                "frame_idx": c["frame_idx"],
-                "pred_depth": c["pred_filtered"] if args.filter else c["pred_masked"],
-                "gt_depth": c["gt_masked"],
-                "T": c["T"],
-                "consistency": c["consistency"],
-                "coverage": c["coverage"],
-            }
-            for c in consistency_candidates
-            if np.isfinite(c["score"])
-        ]
-        keep_count = min(args.consistency_frames, len(scored_frames))
-        diversity_center = None
-        used_bins = 0
-        if args.regions:
-            selected = _select_temporal_region_consistency_frames(
-                consistency_candidates,
-                region_count,
-                keep_count,
-                use_filtered_depth=args.filter,
-                region_start=frame_start,
-            )
-        else:
-            diversity_center = _pose_diversity_center(
-                scored_frames,
-                cube_center,
-                args.best_consistency_view_center,
-            )
-            selected, used_bins = _select_pose_diverse_consistency_frames(
-                scored_frames,
-                keep_count,
-                diversity_center,
-                args.best_consistency_view_bins,
-                args.best_consistency_min_center_distance,
-            )
-        mesh_data = [(cand["pred_depth"], cand["T"]) for cand in selected]
-        gt_mesh_data = [(cand["gt_depth"], cand["T"]) for cand in selected]
-        final_mesh_frame_ids = [cand["frame_idx"] for cand in selected]
-        if selected:
-            scores = [cand["score"] for cand in selected]
-            consistency = [cand["consistency"] for cand in selected]
-            coverage = [cand["coverage"] for cand in selected]
-            mode_detail = (
-                f"filled regions={len({cand['region_idx'] for cand in selected})}/"
-                f"{args.consistency_frames}"
-                if args.regions
-                else f"view bins={used_bins}/{args.best_consistency_view_bins}"
-            )
-            print(
-                f"Consistency select: kept {len(selected)}/{len(scored_frames)} finite-score frames "
-                f"(best={max(scores):.4f}, worst kept={min(scores):.4f}, "
-                f"median consistency={np.median(consistency):.1%}, "
-                f"median coverage={np.median(coverage):.1%}, {mode_detail})"
-            )
-            if diversity_center is not None:
-                print(
-                    f"  diversity center: "
-                    f"{diversity_center[0]:.4f}, {diversity_center[1]:.4f}, "
-                    f"{diversity_center[2]:.4f} ({args.best_consistency_view_center})"
-                )
-            print(
-                "  selected frames: "
-                + ", ".join(str(cand["frame_idx"]) for cand in selected[:20])
-                + (" ..." if len(selected) > 20 else "")
-            )
-        else:
-            print("Consistency select: no finite-score mesh frames available; keeping no TSDF frames")
-
-    if args.best_mae_frames is not None and mesh_candidates and mesh_data and gt_mesh_data:
-        candidates = filtered_candidates if args.filter else mesh_candidates
-        keep_count = min(args.best_mae_frames, len(candidates))
-        if args.regions:
-            selected = _select_temporal_region_mae_frames(
-                candidates,
-                region_count,
-                keep_count,
-                use_filtered_depth=args.filter,
-                region_start=frame_start,
-            )
-        else:
-            selected = _select_global_mae_frames(
-                candidates,
-                keep_count,
-                use_filtered_depth=args.filter,
-            )
+    if args.best_mae_frames is not None and mesh_candidates:
+        keep_count = min(args.best_mae_frames, len(mesh_candidates))
+        selected = _select_global_mae_frames(
+            mesh_candidates,
+            keep_count,
+            use_filtered_depth=False,
+        )
         mesh_data = [(cand["pred_depth"], cand["T"]) for cand in selected]
         gt_mesh_data = [(cand["gt_depth"], cand["T"]) for cand in selected]
         final_mesh_frame_ids = [cand["frame_idx"] for cand in selected]
         if selected:
             maes = [cand["mae_m"] for cand in selected]
-            mode_detail = (
-                f"filled regions={len({cand['region_idx'] for cand in selected})}/"
-                f"{args.best_mae_frames}"
-                if args.regions
-                else "global ranking"
-            )
             print(
-                f"MAE frame select : kept {len(selected)}/{len(candidates)} candidates "
-                f"(best={min(maes) * 100:.2f} cm, worst kept={max(maes) * 100:.2f} cm, "
-                f"{mode_detail})"
+                f"MAE frame select : kept {len(selected)}/{len(mesh_candidates)} candidates "
+                f"(best={min(maes) * 100:.2f} cm, "
+                f"worst kept={max(maes) * 100:.2f} cm)"
             )
             print(
                 "  selected frames: "
@@ -3227,114 +2008,10 @@ def main() -> None:
                 + (" ..." if len(selected) > 20 else "")
             )
         else:
-            print("MAE frame select : no finite-MAE candidates available; keeping no TSDF frames")
-
-    if (
-        args.best_worst5_frames is not None
-        and mesh_candidates
-        and mesh_data
-        and gt_mesh_data
-    ):
-        candidates = filtered_candidates if args.filter else mesh_candidates
-        keep_count = min(args.best_worst5_frames, len(candidates))
-        if args.regions:
-            selected = _select_temporal_region_worst5_frames(
-                candidates,
-                region_count,
-                keep_count,
-                use_filtered_depth=args.filter,
-                region_start=frame_start,
-            )
-        else:
-            selected = _select_global_worst5_frames(
-                candidates,
-                keep_count,
-                use_filtered_depth=args.filter,
-            )
-        mesh_data = [(cand["pred_depth"], cand["T"]) for cand in selected]
-        gt_mesh_data = [(cand["gt_depth"], cand["T"]) for cand in selected]
-        final_mesh_frame_ids = [cand["frame_idx"] for cand in selected]
-        if selected:
-            worst5_means = [cand["worst5_mean_m"] for cand in selected]
-            mode_detail = (
-                f"filled regions={len({cand['region_idx'] for cand in selected})}/"
-                f"{args.best_worst5_frames}"
-                if args.regions
-                else "global ranking"
-            )
-            print(
-                f"Worst-5% select  : kept {len(selected)}/{len(candidates)} candidates "
-                f"(best={min(worst5_means) * 100:.2f} cm, "
-                f"worst kept={max(worst5_means) * 100:.2f} cm, "
-                f"{mode_detail})"
-            )
-            print(
-                "  selected frames: "
-                + ", ".join(str(cand["frame_idx"]) for cand in selected[:20])
-                + (" ..." if len(selected) > 20 else "")
-            )
-        else:
-            print(
-                "Worst-5% select  : no finite worst-5% candidates available; "
-                "keeping no TSDF frames"
-            )
-
-    if use_uncertainty_selection and mesh_candidates and mesh_data and gt_mesh_data:
-        candidates = filtered_candidates if args.filter else mesh_candidates
-        keep_count = min(args.uncertainty_frames, len(candidates))
-        if args.regions:
-            selected = _select_temporal_region_uncertainty_frames(
-                candidates,
-                region_count,
-                keep_count,
-                use_filtered_depth=args.filter,
-                region_start=frame_start,
-            )
-        else:
-            selected = _select_global_uncertainty_frames(
-                candidates,
-                keep_count,
-                use_filtered_depth=args.filter,
-            )
-        mesh_data = [(cand["pred_depth"], cand["T"]) for cand in selected]
-        gt_mesh_data = [(cand["gt_depth"], cand["T"]) for cand in selected]
-        final_mesh_frame_ids = [cand["frame_idx"] for cand in selected]
-        if selected:
-            uncertainties = [cand["uncertainty"] for cand in selected]
-            mode_detail = (
-                f"filled regions={len({cand['region_idx'] for cand in selected})}/"
-                f"{args.uncertainty_frames}"
-                if args.regions
-                else "global ranking"
-            )
-            print(
-                f"Uncertainty select: kept {len(selected)}/{len(candidates)} candidates "
-                f"(best={min(uncertainties):.4f}, "
-                f"worst kept={max(uncertainties):.4f}, "
-                f"{mode_detail})"
-            )
-            print(
-                "  selected frames: "
-                + ", ".join(str(cand["frame_idx"]) for cand in selected[:20])
-                + (" ..." if len(selected) > 20 else "")
-            )
-        else:
-            print("Uncertainty select: no finite-uncertainty candidates available; keeping no TSDF frames")
+            print("MAE frame select : no finite-MAE candidates available")
 
     print(f"Inference/prep   : {len(run_frames)} frames in {t_infer_total:.1f}s")
-
-    if args.save_used_depth_images:
-        if mesh_data and gt_mesh_data:
-            save_used_depth_images(
-                out_dir,
-                final_mesh_frame_ids,
-                mesh_data,
-                gt_mesh_data,
-                depth_min,
-                depth_max,
-            )
-        else:
-            print("  Used depths    : no final TSDF frames available")
+    print(f"Inference/prep   : {len(run_frames)} frames in {t_infer_total:.1f}s")
 
     depth_summary = summarize_depth_error(depth_error_total)
     if depth_summary is not None:
@@ -3383,18 +2060,8 @@ def main() -> None:
     gt_mesh_created = False
     if args.best_mae_frames is not None:
         frame_selection_name = "best_mae"
-    elif args.best_worst5_frames is not None:
-        frame_selection_name = "best_worst5"
-    elif args.consistency_frames is not None:
-        frame_selection_name = "best_consistency"
-    elif args.uncertainty_frames is not None:
-        frame_selection_name = "best_uncertainty"
-    elif args.rank_consistency_frames:
-        frame_selection_name = "ranked_consistency"
     else:
         frame_selection_name = "all_frames"
-    if args.regions:
-        frame_selection_name += "_regions"
 
     sequence_name = data_dir.name
     pred_mesh_ext = ".ply" if args.color_mesh else ".obj"

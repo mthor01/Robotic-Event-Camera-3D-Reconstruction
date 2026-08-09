@@ -3,9 +3,9 @@ Centralized configuration for the 3D reconstruction pipeline.
 
 All shared constants used across recording, preprocessing, training,
 reconstruction and visualization scripts are defined here.
-Import what you need:
+Import constants directly from this module, for example:
 
-    from reconstruction_config import FPS, WHITE_THRESH, ...
+    from config import FPS, TRAIN_RESIZE_HW, TRAIN_CROP_HW
 """
 
 from pathlib import Path
@@ -15,8 +15,8 @@ from pathlib import Path
 # ═══════════════════════════════════════════════════════════════════
 CALIB_DIR = Path("camera_data")
 DATA_ROOT = Path("data/real")
+# Dataset root used by the temporal-alignment diagnostic scripts.
 TEMPORAL_CHECK_ROOT = Path("data/temporal_check")
-LIGHT_CHECK_ROOT = Path("data/light_check")
 DEFAULT_OUT_DIR = Path("checkpoints_e2depth")
 
 # ═══════════════════════════════════════════════════════════════════
@@ -25,17 +25,19 @@ DEFAULT_OUT_DIR = Path("checkpoints_e2depth")
 FPS = 30
 DELTA_T_US = int(1e6 / FPS)  # microseconds per frame
 
-# Manual offset (signed integer, in depth frames) applied when aligning event
-# frames to depth frames.  Positive = depth is ahead of events (shift event
-# lookup forward); negative = depth is behind events (shift lookup backward).
-# Set to 0 for no correction.  Example: set to -2 if depth is 2 frames behind.
-DEPTH_EVENT_ALIGN_OFFSET_FRAMES: int = 0
-
 # ═══════════════════════════════════════════════════════════════════
 #  RealSense camera resolution
 # ═══════════════════════════════════════════════════════════════════
 RS_WIDTH = 640
 RS_HEIGHT = 480
+
+# ═══════════════════════════════════════════════════════════════════
+#  Model input preprocessing
+# ═══════════════════════════════════════════════════════════════════
+# Precomputation and reconstruction apply the same transforms. Camera
+# intrinsics must undergo this resize and centre crop as well.
+TRAIN_RESIZE_HW = (288, 384)  # (H, W) intermediate resize
+TRAIN_CROP_HW   = (240, 320)  # (H, W) final model input
 
 # ═══════════════════════════════════════════════════════════════════
 #  Event camera biases
@@ -58,12 +60,6 @@ D_MAX = 0.7    # maximum depth in metres (tabletop range)
 DEPTH_MIN = 0.05  # minimum depth in metres (5 cm)
 
 # ═══════════════════════════════════════════════════════════════════
-#  Depth parameters — pose-to-plane encoding (full robot reach)
-# ═══════════════════════════════════════════════════════════════════
-POSE_D_MAX = 10.0  # maximum depth for pose-to-plane feature (metres)
-POSE_ALPHA = 4.6   # ln(10.0 / 0.1) ≈ 4.6, covers 0.1 m to 10 m
-
-# ═══════════════════════════════════════════════════════════════════
 #  TSDF reconstruction
 # ═══════════════════════════════════════════════════════════════════
 TSDF_VOXEL_SIZE = 0.002        # metres
@@ -73,17 +69,19 @@ TSDF_DEPTH_MAX = 0.8           # metres (larger range for 3-D reconstruction)
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Spatial masking (cube around target position)
+#  Shared workspace cube for evaluation, reconstruction, and table prior
 # ═══════════════════════════════════════════════════════════════════
 SPATIAL_CUBE_SIDE = 0.32    # metres (32 cm cube)
 SPATIAL_CUBE_X_OFFSET = 0.05   # metres — shift of cube centre along X in robot base frame
 SPATIAL_CUBE_Z_OFFSET = -0.03
 SPATIAL_CUBE_CENTER_Z = SPATIAL_CUBE_Z_OFFSET + SPATIAL_CUBE_SIDE / 2  # metres — Z of cube centre in robot base frame
-DEPTH_BLEED_RADIUS = 1      # px — half-width of bleed-correction kernel (3×3 default)
 # Target point (cube centre) in robot base frame
 SPATIAL_TARGET_X = 0.3 + SPATIAL_CUBE_X_OFFSET   # metres (robot workspace X + cube shift)
 SPATIAL_TARGET_Y = 0.0                            # metres (centred on robot Y axis)
 SPATIAL_TARGET_Z = SPATIAL_CUBE_CENTER_Z          # metres
+
+# Depth-projection bleed correction (3×3 kernel by default).
+DEPTH_BLEED_RADIUS = 1
 
 # Vertical offset applied on top of the cube-bottom to place the table plane
 # (positive = raise the plane above the cube bottom, negative = lower it)
@@ -97,13 +95,6 @@ DEPTH_VIZ_P_HIGH = 98
 # Fixed colour range for depth images/videos (independent of training range)
 DEPTH_VIZ_MIN = 0.05   # metres — maps to bottom of TURBO colourmap
 DEPTH_VIZ_MAX = 0.7    # metres — maps to top of TURBO colourmap
-
-# ═══════════════════════════════════════════════════════════════════
-#  Resizing and Cropping resolutions
-# ═══════════════════════════════════════════════════════════════════
-TRAIN_RESIZE_HW = (288, 384)  # (H, W) resize before crop during training
-TRAIN_CROP_HW   = (240, 320)  # (H, W) center crop after resize during training
-
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -30,7 +30,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Allow imports from the parent directory (e.g. reconstruction_config)
+# Allow imports from 3d_reconstruction when this file is run directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 

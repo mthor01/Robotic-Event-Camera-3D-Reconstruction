@@ -6,7 +6,7 @@ For each depth frame the script intersects the per-pixel camera rays with the
 horizontal plane  z = table_z  (in the robot base frame) and stores the
 resulting camera-space depth, normalised to [0, 1] using the training range
 [DEPTH_MIN, D_MAX].  The result can be concatenated with the event voxels as
-an extra input channel during training (train_unet_table.py).
+an extra input channel during training (train_unet.py).
 
 Output (per recording):
     hdf5/table_plane.h5 — dataset "table_plane" (N, H, W) float32 in [0, 1]
@@ -19,7 +19,7 @@ Optional debug image:
 
 Usage:
     python3 data_precomputation/precompute_table_plane.py
-    python3 data_precomputation/precompute_table_plane.py --data_dir data/real/lego_1
+    python3 data_precomputation/precompute_table_plane.py --data_dir data/new/train/1
     python3 data_precomputation/precompute_table_plane.py --debug --overwrite
     python3 data_precomputation/precompute_table_plane.py --table_z 0.02
 """
@@ -356,7 +356,7 @@ def main() -> None:
         if path.is_absolute():
             return path
         # Resolve relative paths against the 3d_reconstruction/ directory so that
-        # e.g. --data_dir data/real/lego_1 works regardless of the cwd.
+        # Relative paths such as data/new/train/1 work regardless of the cwd.
         return (_HERE.parent / path).resolve()
 
     if args.table_z is None:

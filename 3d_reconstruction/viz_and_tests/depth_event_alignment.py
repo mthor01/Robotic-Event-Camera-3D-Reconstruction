@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Temporal alignment analysis: RGB frame rate-of-change vs event activity.
+"""Legacy temporal-alignment diagnostic: RGB rate-of-change vs event activity.
 
 Both signals dip at every direction reversal during a TemporalAlignmentAgent
 recording:
@@ -8,11 +8,12 @@ recording:
   - Event activity: per-frame pixel std of the event frame.
     Also dips at reversals because the camera is momentarily still.
 
-Matching the trough positions in both signals gives the frame-level offset
-between the RGB/depth stream and the event stream without using pose data.
+Matching trough positions estimates a frame-level stream offset without pose
+data. Current recordings use hardware-trigger timestamps and do not require
+this estimate; this utility remains useful for inspecting older recordings.
 
 Usage:
-    python depth_event_alignment.py --data_dir data/real/temporal_check
+    python depth_event_alignment.py --data_dir data/temporal_check
     python depth_event_alignment.py --data_root data/real
 """
 

@@ -35,7 +35,6 @@ import msgpack
 from franka_pipeline.logging import get_logger, setup_logging
 from franka_pipeline.agents.episode_control_wrapper_agent import EpisodeControlWrapperAgent
 from franka_pipeline.agents.hemisphere_grid_agent import HemisphereGridAgent
-from franka_pipeline.agents.light_check_agent import LightCheckAgent
 from franka_pipeline.agents.random_hemisphere_agent import RandomHemisphereAgent
 from franka_pipeline.agents.temporal_alignment_agent import TemporalAlignmentAgent
 from franka_pipeline.robot_controllers.controller import (
@@ -822,9 +821,6 @@ def main(
                     num_sweeps=20,
                 )
             )
-        elif agent_type.lower() == "light_check":
-            logger.info("Using LightCheckAgent (hold position for 40 s)")
-            return EpisodeControlWrapperAgent(LightCheckAgent(duration_sec=40.0))
         else:
             raise ValueError(f"Unknown agent_type: {agent_type!r}")
 
@@ -1014,8 +1010,8 @@ def main(
                 # treat reset as continuing same episode id (matching your original behavior)
                 pub.publish_event("episode_start", ep=ep_count)
 
-            # Check if agent is complete (from HemisphereGridAgent, RandomSphereAgent, or TemporalAlignmentAgent)
-            is_complete = metadata.get("hemisphere_complete", False) or metadata.get("sphere_complete", False) or metadata.get("temporal_alignment_complete", False) or metadata.get("light_check_complete", False)
+            # Check completion signals emitted by the recording agents.
+            is_complete = metadata.get("hemisphere_complete", False) or metadata.get("sphere_complete", False) or metadata.get("temporal_alignment_complete", False)
             if is_complete:
                 logger.info("Agent recording complete! All poses visited.")
                 if pose_thread is not None:

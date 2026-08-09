@@ -43,11 +43,11 @@ xhost +local:root
 ##########Record Data############
 python3 main.py --real-robot
 
-python3 rec_data.py --hw-sync
+python3 rec_data.py
 
-bash precompute_all.sh --data_root data/real/new_data --voxel --float16
+bash precompute_all.sh --data_root data/... --voxel --float16
 
-python3 project_realsense_to_event.py --data_root data/real                     #--save-videos
+python3 project_realsense_to_event.py --data_root data/...                     #--save-videos
 
 python3 precompute_spatial_mask.py --overwrite
 
@@ -55,26 +55,27 @@ python3 precompute_voxels.py --overwrite
 
 python3 precompute_pose_depth.py 
 
-###########Data Tests##############
-python3 viz_and_tests/visualize_masks.py                          #--data_dir data/real/headphones
-
-###########Temporal Test###########
-
   
 ##########Calibration############
 python main.py --calibration-poses calibration_poses.npy --agent-type multi_cam_calibrate
 
-python3 calibration_recording_and_calibration.py --output-dir camera_data
+python3 calibration.py --output-dir camera_data
 
 python3 verify_calibration.py --data-dir camera_data
-
-python 3d_reconstruction/projection_check.py --data-dir camera_data --out-dir proj_vis
 
 python3 viz_and_tests/pose_time_analysis.py --data-dir data/temporal_check
 
 ##########Training################
-python3 project_realsense_to_event.py --data_dir data/real/1 
 
-python3 real_train.py 
+sbatch multiview.sbatch
 
-tensorboard --logdir=checkpoints_e2depth
+sbatch train_unet.sbatch
+
+tensorboard --logdir 3d_reconstruction/training/checkpoints/tensorboard
+
+
+
+##########Evaluation and Reconstruction############
+sbatch reconstruction.sbatch
+
+sbatch eval.sbatch

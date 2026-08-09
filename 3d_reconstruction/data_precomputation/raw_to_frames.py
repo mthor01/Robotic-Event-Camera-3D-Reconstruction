@@ -1,3 +1,10 @@
+"""Convert two standalone event-camera RAW files into frames and HDF5 data.
+
+This fixed-path utility targets the older two-event-camera capture layout. It
+does not produce the hardware-trigger-aligned voxel files used by training;
+use ``precompute_voxels.py`` for recorded reconstruction sequences.
+"""
+
 import time
 import sys
 import cv2

@@ -142,7 +142,6 @@ def main() -> None:
         num_views=args.num_views,
         pose_view_selection=True,
         pose_move_threshold=args.pose_move_threshold,
-        use_mask=False,
         fill_invalid=False,
     )
     dataset_item = _find_dataset_item(dataset, args.target_frame)

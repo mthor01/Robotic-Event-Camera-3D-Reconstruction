@@ -1,42 +1,41 @@
 #!/usr/bin/env python3
 """
-multiview.py - Multi-view event depth training with a table-plane prior.
+multiview.py - Three-stage multi-view event-depth training with a table-plane prior.
 
-This is the multi-view counterpart to train_unet_table.py.  Each sample uses a
+This is the multi-view counterpart to train_unet.py. Each sample uses a
 target event voxel frame plus neighbouring source frames:
 
     [x_i | table_plane_channel_i] for i in target + source frames
 
-A shared 2D CNN extracts per-view features.  Source features are first warped
-into the target frustum for coarse inverse-depth candidates using poses from
-hdf5/poses.h5 and event-camera calibration from camera_data/.  The coarse
-distribution is regressed to a rough depth map, then a second cost volume uses
-per-pixel fine hypotheses around that rough depth:
+A deep FPN extracts shared H/8, H/4, and H/2 features. Source features are
+warped into the target frustum using poses from hdf5/poses.h5 and event-camera
+calibration from camera_data/. Variance cost volumes regress coarse depth,
+middle local candidates, and final fine candidates:
 
     d_i(u, v) = d_hat(u, v) + sigma(u, v) * epsilon_i
 
-sigma is either a fixed window or predicted from target features.
+The coarse stage samples inverse depth globally. Middle and fine stages sample
+local linear-depth windows around the preceding prediction; the fine window
+can optionally be predicted from target features. Only the final prediction is
+supervised and returned.
 
 Usage:
-    python3 training/multiview.py --data_dir data/real
-    python3 training/multiview.py --data_dir data/real --num_views 5
-    python3 training/multiview.py --num_depths 32 --fine_depths 5 --view_interval 5
+    python3 training/multiview.py --data_dir data/new/train
+    python3 training/multiview.py --data_dir data/new/train --num_views 5
+    python3 training/multiview.py --coarse_depths 32 --fine_depths 5 --view_interval 5
     python3 training/multiview.py --pose_view_selection --pose_move_threshold 0.01 --num_views 5
-    python3 training/multiview.py --masked_warp_aggregation
-    python3 training/multiview.py --cost_volume_ref_features
     python3 training/multiview.py --base_channels 64 --feature_channels 256 --cost_channels 32
-    python3 training/multiview.py --feature_encoder resnet18_h4
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import math
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import NormalDist
 
 import numpy as np
 import torch
@@ -47,7 +46,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 from train_unet import (
     DEPTH_MIN, D_MAX, NUM_BINS, _SCRIPT_DIR, DATA_ROOT,
-    compute_loss, _l1_metres, _smoothness_loss, _worst_percent_l1_metres,
+    _charbonnier, _gradient_loss, _l1_metres, _normal_loss,
+    _worst_percent_l1_metres,
 )
 from tensorboard_helper import (
     DEFAULT_TB_ROOT,
@@ -124,52 +124,18 @@ def _scale_K_resize_crop(
     return K_scaled.astype(np.float32)
 
 
-def _inverse_depth_candidates(num_depths: int, depth_min: float, depth_max: float) -> np.ndarray:
-    if num_depths < 2:
-        raise ValueError(f"--num_depths must be >= 2, got {num_depths}")
-    inv = np.linspace(1.0 / depth_min, 1.0 / depth_max, num_depths, dtype=np.float32)
+def _inverse_depth_candidates(coarse_depths: int, depth_min: float, depth_max: float) -> np.ndarray:
+    if coarse_depths < 2:
+        raise ValueError(f"--coarse_depths must be >= 2, got {coarse_depths}")
+    inv = np.linspace(1.0 / depth_min, 1.0 / depth_max, coarse_depths, dtype=np.float32)
     return (1.0 / inv).astype(np.float32)
 
 
-def _linear_depth_candidates(num_depths: int, depth_min: float, depth_max: float) -> np.ndarray:
+def _linear_depth_candidates(coarse_depths: int, depth_min: float, depth_max: float) -> np.ndarray:
     """Return uniformly spaced metric-depth hypotheses."""
-    if num_depths < 2:
-        raise ValueError(f"--num_depths must be >= 2, got {num_depths}")
-    return np.linspace(depth_min, depth_max, num_depths, dtype=np.float32)
-
-
-def _gaussian_depth_candidates(
-    num_depths: int,
-    depth_min: float,
-    depth_max: float,
-) -> np.ndarray:
-    """Return quantiles of a midpoint-centred Gaussian truncated to the range.
-
-    The standard deviation is one sixth of the depth range, placing the range
-    boundaries at mean +/- three standard deviations. Sampling evenly in the
-    truncated CDF concentrates hypotheses near the middle while retaining the
-    exact minimum and maximum depths.
-    """
-    if num_depths < 2:
-        raise ValueError(f"--num_depths must be >= 2, got {num_depths}")
-    if depth_max <= depth_min:
-        raise ValueError(
-            f"depth_max must be greater than depth_min, got {depth_min} and {depth_max}"
-        )
-
-    mean = 0.5 * (depth_min + depth_max)
-    std = (depth_max - depth_min) / 6.0
-    distribution = NormalDist(mu=mean, sigma=std)
-    cdf_min = distribution.cdf(depth_min)
-    cdf_max = distribution.cdf(depth_max)
-    quantiles = np.linspace(cdf_min, cdf_max, num_depths, dtype=np.float64)
-    candidates = np.asarray(
-        [distribution.inv_cdf(float(q)) for q in quantiles],
-        dtype=np.float32,
-    )
-    candidates[0] = np.float32(depth_min)
-    candidates[-1] = np.float32(depth_max)
-    return candidates
+    if coarse_depths < 2:
+        raise ValueError(f"--coarse_depths must be >= 2, got {coarse_depths}")
+    return np.linspace(depth_min, depth_max, coarse_depths, dtype=np.float32)
 
 
 def _pose_channels_from_base_event(T_base_from_event: np.ndarray) -> np.ndarray:
@@ -305,10 +271,8 @@ class MultiViewTableDataset(Dataset):
         view_interval: int = 5,
         pose_view_selection: bool = False,
         pose_move_threshold: float = 0.01,
-        num_depths: int = 32,
+        coarse_depths: int = 32,
         linear_depth_candidates: bool = False,
-        gaussian_depth_candidates: bool = False,
-        use_mask: bool = True,
         fill_invalid: bool = False,
         pose_channels: bool = False,
         recurrent: bool = False,
@@ -346,7 +310,6 @@ class MultiViewTableDataset(Dataset):
 
         self.voxels_path = self.seq_dir / "events" / "voxels_cam0.h5"
         self.depth_path = self.seq_dir / "hdf5" / "depth_in_event_frame.h5"
-        self.mask_path = self.seq_dir / "hdf5" / "spatial_mask.h5"
         self.poses_path = self.seq_dir / "hdf5" / "poses.h5"
         self.table_plane_path = self.seq_dir / "hdf5" / "table_plane.h5"
 
@@ -371,7 +334,6 @@ class MultiViewTableDataset(Dataset):
             ee_T = f["ee_T"][:].astype(np.float32)
 
         self.n_frames = min(n_d, n_v, n_t, len(ee_T))
-        self.has_mask = use_mask and self.mask_path.exists()
         if not corrected_table_transform:
             raise RuntimeError(
                 f"{self.table_plane_path} uses obsolete direct-scaling geometry. "
@@ -391,23 +353,13 @@ class MultiViewTableDataset(Dataset):
             (crop_h, crop_w),
         )
         self.linear_depth_candidates = bool(linear_depth_candidates)
-        self.gaussian_depth_candidates = bool(gaussian_depth_candidates)
-        if self.linear_depth_candidates and self.gaussian_depth_candidates:
-            raise ValueError(
-                "--linear_depth_candidates and --gaussian_depth_candidates "
-                "are mutually exclusive"
-            )
-        if self.gaussian_depth_candidates:
-            self.depth_values = _gaussian_depth_candidates(
-                num_depths, DEPTH_MIN, D_MAX
-            )
-        elif self.linear_depth_candidates:
+        if self.linear_depth_candidates:
             self.depth_values = _linear_depth_candidates(
-                num_depths, DEPTH_MIN, D_MAX
+                coarse_depths, DEPTH_MIN, D_MAX
             )
         else:
             self.depth_values = _inverse_depth_candidates(
-                num_depths, DEPTH_MIN, D_MAX
+                coarse_depths, DEPTH_MIN, D_MAX
             )
 
         ee_T = ee_T[:self.n_frames]
@@ -465,7 +417,6 @@ class MultiViewTableDataset(Dataset):
 
         self._vox = None
         self._dep = None
-        self._msk = None
         self._tbl = None
 
     @staticmethod
@@ -523,8 +474,6 @@ class MultiViewTableDataset(Dataset):
             self._vox = h5py.File(self.voxels_path, "r")["voxels"]
         if self._dep is None:
             self._dep = h5py.File(self.depth_path, "r")["depth"]
-        if self.has_mask and self._msk is None:
-            self._msk = h5py.File(self.mask_path, "r")["mask"]
         if self._tbl is None:
             self._tbl = h5py.File(self.table_plane_path, "r")["table_plane"]
 
@@ -666,8 +615,6 @@ class MultiViewTableDataset(Dataset):
         dep = self._dep[idx].astype(np.float32)
         dep = np.minimum(dep, D_MAX)
         valid = (dep > 0).astype(np.float32)
-        if self.has_mask:
-            valid *= self._msk[idx].astype(np.float32)
 
         dep_t = torch.from_numpy(dep).unsqueeze(0)
         msk_t = torch.from_numpy(valid).unsqueeze(0)
@@ -733,268 +680,251 @@ class PerSequenceFractionSampler(Sampler[int]):
 # Network
 # ---------------------------------------------------------------------------
 
-class SharedFeatureCNN(nn.Module):
-    """Shared encoder applied to target and source frames."""
+class Residual2dBlock(nn.Module):
+    """Basic residual block used by the deeper FPN encoder."""
 
-    def __init__(self, in_ch: int, base: int, feature_ch: int, output_stride: int = 4):
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
         super().__init__()
-        if output_stride not in (4, 8):
-            raise ValueError(f"Unsupported SharedFeatureCNN output stride: {output_stride}")
+        self.conv1 = nn.Conv2d(
+            in_ch, out_ch, 3, stride=stride, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.projection = (
+            nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch),
+            )
+            if stride != 1 or in_ch != out_ch
+            else nn.Identity()
+        )
 
-        layers = [
-            nn.Conv2d(in_ch, base, 5, padding=2, bias=False),
-            nn.BatchNorm2d(base),
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = self.projection(x)
+        x = F.relu(self.bn1(self.conv1(x)), inplace=True)
+        x = self.bn2(self.conv2(x))
+        return F.relu(x + identity, inplace=True)
+
+
+def _residual2d_stage(
+    in_ch: int,
+    out_ch: int,
+    blocks: int,
+    stride: int,
+) -> nn.Sequential:
+    if blocks < 1:
+        raise ValueError("A residual stage must contain at least one block")
+    layers: list[nn.Module] = [Residual2dBlock(in_ch, out_ch, stride=stride)]
+    layers.extend(Residual2dBlock(out_ch, out_ch) for _ in range(blocks - 1))
+    return nn.Sequential(*layers)
+
+
+class DropPath(nn.Module):
+    """Per-sample stochastic depth for residual feature paths."""
+
+    def __init__(self, probability: float = 0.0):
+        super().__init__()
+        self.probability = float(probability)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.probability <= 0:
+            return x
+        keep = 1.0 - self.probability
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask = x.new_empty(shape).bernoulli_(keep)
+        return x * mask / keep
+
+
+class FeaturePyramid(nn.Module):
+    """Build the fixed deep, three-stage feature pyramid."""
+
+    def __init__(
+        self,
+        in_ch: int,
+        feature_ch: int,
+        base: int,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        middle_feature_ch: int = 0,
+        fine_feature_ch: int = 0,
+    ):
+        super().__init__()
+        self.feature_ch = feature_ch
+        if middle_feature_ch < 0 or fine_feature_ch < 0:
+            raise ValueError("FPN feature-channel overrides must be >= 0")
+        self.middle_ch = middle_feature_ch or max(16, feature_ch // 2)
+        self.fine_ch = fine_feature_ch or max(8, feature_ch // 4)
+
+        # Bottom-up residual hierarchy (H/2, H/4, H/8), followed by
+        # lateral/top-down fusion. Each map drives one cascade stage.
+        c0 = max(8, feature_ch // 8)
+        c1, c2, c3 = c0 * 2, c0 * 4, c0 * 8
+        self.casmvs_stem = nn.Sequential(
+            nn.Conv2d(in_ch, c0, 3, padding=1, bias=False),
+            nn.BatchNorm2d(c0),
             nn.ReLU(inplace=True),
-            nn.Conv2d(base, base * 2, 5, stride=2, padding=2, bias=False),
-            nn.BatchNorm2d(base * 2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(base * 2, base * 2, 3, padding=1, bias=False),
-            nn.BatchNorm2d(base * 2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(base * 2, base * 4, 5, stride=2, padding=2, bias=False),
-            nn.BatchNorm2d(base * 4),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(base * 4, feature_ch, 3, padding=1, bias=False),
+        )
+        self.casmvs_half = _residual2d_stage(c0, c1, 3, stride=2)
+        self.casmvs_quarter = _residual2d_stage(c1, c2, 4, stride=2)
+        self.casmvs_eighth = _residual2d_stage(c2, c3, 6, stride=2)
+        self.casmvs_lateral_quarter = nn.Conv2d(c2, c3, 1, bias=False)
+        self.casmvs_lateral_half = nn.Conv2d(c1, c2, 1, bias=False)
+        self.casmvs_coarse_out = nn.Sequential(
+            nn.Conv2d(c3, feature_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(feature_ch),
             nn.ReLU(inplace=True),
-        ]
-        if output_stride == 8:
-            layers.extend([
-                nn.Conv2d(feature_ch, feature_ch, 3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(feature_ch),
-                nn.ReLU(inplace=True),
-            ])
+        )
+        self.casmvs_middle_out = nn.Sequential(
+            nn.Conv2d(c3, self.middle_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(self.middle_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.casmvs_fine_reduce = nn.Conv2d(c3, c2, 1, bias=False)
+        self.casmvs_fine_out = nn.Sequential(
+            nn.Conv2d(c2, self.fine_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(self.fine_ch),
+            nn.ReLU(inplace=True),
+        )
+        self.coarse_dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+        self.middle_dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+        self.fine_dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
+        self.fusion_drop_path = DropPath(drop_path)
 
-        self.net = nn.Sequential(*layers)
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        stem = self.casmvs_stem(x)
+        half = self.casmvs_half(stem)
+        quarter = self.casmvs_quarter(half)
+        eighth = self.casmvs_eighth(quarter)
+        quarter_fused = self.casmvs_lateral_quarter(quarter) + self.fusion_drop_path(
+            F.interpolate(eighth, size=quarter.shape[-2:], mode="bilinear", align_corners=False)
+        )
+        half_fused = self.casmvs_lateral_half(half) + self.fusion_drop_path(
+            F.interpolate(
+                self.casmvs_fine_reduce(quarter_fused),
+                size=half.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        )
+        coarse = self.coarse_dropout(self.casmvs_coarse_out(eighth))
+        middle = self.middle_dropout(self.casmvs_middle_out(quarter_fused))
+        fine = self.fine_dropout(self.casmvs_fine_out(half_fused))
+        return coarse, middle, fine
+
+
+class Conv3dBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
+        super().__init__()
+        groups = math.gcd(out_ch, min(8, out_ch))
+        self.net = nn.Sequential(
+            nn.Conv3d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False),
+            nn.GroupNorm(groups, out_ch),
+            nn.ReLU(inplace=True),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
-def _replace_first_conv(module: nn.Module, in_ch: int) -> bool:
-    """
-    Replace the first Conv2d found in a torchvision feature stem so non-RGB
-    event/table inputs can use the same backbone topology.
-    """
-    for name, child in module.named_children():
-        if isinstance(child, nn.Conv2d):
-            setattr(
-                module,
-                name,
-                nn.Conv2d(
-                    in_ch,
-                    child.out_channels,
-                    kernel_size=child.kernel_size,
-                    stride=child.stride,
-                    padding=child.padding,
-                    dilation=child.dilation,
-                    groups=1,
-                    bias=child.bias is not None,
-                    padding_mode=child.padding_mode,
-                ),
-            )
-            return True
-        if _replace_first_conv(child, in_ch):
-            return True
-    return False
+class CostHourglass3D(nn.Module):
+    """Configurable 3-D encoder/decoder; wide layers run on smaller volumes."""
 
-
-class TorchvisionFeatureEncoder(nn.Module):
-    """ResNet/EfficientNet feature encoder projected to the cost-volume width."""
-
-    def __init__(self, name: str, in_ch: int, feature_ch: int):
+    def __init__(
+        self,
+        in_ch: int,
+        base: int,
+        levels: int = 2,
+        bottleneck_dropout: float = 0.0,
+    ):
         super().__init__()
-        try:
-            from torchvision.models import efficientnet_b0, resnet18, resnet34, resnet50
-        except ImportError as exc:
-            raise ImportError(
-                f"--feature_encoder {name} requires torchvision to be installed"
-            ) from exc
-
-        if name == "resnet18":
-            backbone = resnet18(weights=None)
-            backbone.conv1 = nn.Conv2d(
-                in_ch, 64, kernel_size=7, stride=2, padding=3, bias=False
-            )
-            self.encoder = nn.Sequential(
-                backbone.conv1,
-                backbone.bn1,
-                backbone.relu,
-                backbone.maxpool,
-                backbone.layer1,
-                backbone.layer2,
-            )
-            out_ch = 128
-        elif name == "resnet18_h4":
-            backbone = resnet18(weights=None)
-            backbone.conv1 = nn.Conv2d(
-                in_ch, 64, kernel_size=7, stride=2, padding=3, bias=False
-            )
-            backbone.layer2[0].conv1.stride = (1, 1)
-            backbone.layer2[0].downsample[0].stride = (1, 1)
-            self.encoder = nn.Sequential(
-                backbone.conv1,
-                backbone.bn1,
-                backbone.relu,
-                backbone.maxpool,
-                backbone.layer1,
-                backbone.layer2,
-            )
-            out_ch = 128
-        elif name == "resnet34":
-            backbone = resnet34(weights=None)
-            backbone.conv1 = nn.Conv2d(
-                in_ch, 64, kernel_size=7, stride=2, padding=3, bias=False
-            )
-            self.encoder = nn.Sequential(
-                backbone.conv1,
-                backbone.bn1,
-                backbone.relu,
-                backbone.maxpool,
-                backbone.layer1,
-                backbone.layer2,
-            )
-            out_ch = 128
-        elif name == "resnet34_h4":
-            backbone = resnet34(weights=None)
-            backbone.conv1 = nn.Conv2d(
-                in_ch, 64, kernel_size=7, stride=2, padding=3, bias=False
-            )
-            backbone.layer2[0].conv1.stride = (1, 1)
-            backbone.layer2[0].downsample[0].stride = (1, 1)
-            self.encoder = nn.Sequential(
-                backbone.conv1,
-                backbone.bn1,
-                backbone.relu,
-                backbone.maxpool,
-                backbone.layer1,
-                backbone.layer2,
-            )
-            out_ch = 128
-        elif name == "resnet50":
-            backbone = resnet50(weights=None)
-            backbone.conv1 = nn.Conv2d(
-                in_ch, 64, kernel_size=7, stride=2, padding=3, bias=False
-            )
-            self.encoder = nn.Sequential(
-                backbone.conv1,
-                backbone.bn1,
-                backbone.relu,
-                backbone.maxpool,
-                backbone.layer1,
-                backbone.layer2,
-            )
-            out_ch = 512
-        elif name == "efficientnet_b0":
-            backbone = efficientnet_b0(weights=None)
-            if not _replace_first_conv(backbone.features[0], in_ch):
-                raise RuntimeError("Could not replace EfficientNet-B0 input convolution")
-            # Stages 0..3 yield stride-8 features; deeper stages make the
-            # cost volume very coarse for this depth-regression task.
-            self.encoder = nn.Sequential(*list(backbone.features.children())[:4])
-            out_ch = 40
-        else:
-            raise ValueError(f"Unsupported feature encoder: {name}")
-
-        self.project = nn.Sequential(
-            nn.Conv2d(out_ch, feature_ch, 1, bias=False),
-            nn.BatchNorm2d(feature_ch),
-            nn.ReLU(inplace=True),
+        base = max(4, base)
+        if levels < 1:
+            raise ValueError("hourglass levels must be >= 1")
+        self.stem = nn.Sequential(
+            Conv3dBlock(in_ch, base),
+            Conv3dBlock(base, base),
         )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.project(self.encoder(x))
-
-
-def make_feature_encoder(name: str, in_ch: int, base: int, feature_ch: int) -> nn.Module:
-    if name == "cnn":
-        return SharedFeatureCNN(in_ch, base, feature_ch)
-    if name == "cnn_8":
-        return SharedFeatureCNN(in_ch, base, feature_ch, output_stride=8)
-    return TorchvisionFeatureEncoder(name, in_ch, feature_ch)
-
-
-class CostVolumeCNN(nn.Module):
-    """Final CNN that regularises the depth cost volume."""
-
-    def __init__(self, in_ch: int, base: int):
-        super().__init__()
-
-        def block(cin: int, cout: int) -> nn.Sequential:
-            return nn.Sequential(
-                nn.Conv3d(cin, cout, 3, padding=1, bias=False),
-                nn.BatchNorm3d(cout),
-                nn.ReLU(inplace=True),
-            )
-
-        self.net = nn.Sequential(
-            block(in_ch, base),
-            block(base, base * 2),
-            block(base * 2, base * 2),
-            block(base * 2, base),
-            nn.Conv3d(base, 1, 3, padding=1),
+        self.down = nn.ModuleList()
+        self.up = nn.ModuleList()
+        channels = [base]
+        for level in range(levels):
+            in_width = channels[-1]
+            out_width = base * (2 ** (level + 1))
+            self.down.append(nn.Sequential(
+                Conv3dBlock(in_width, out_width, stride=2),
+                Conv3dBlock(out_width, out_width),
+            ))
+            channels.append(out_width)
+        for level in range(levels, 0, -1):
+            self.up.append(Conv3dBlock(channels[level], channels[level - 1]))
+        self.bottleneck_dropout = (
+            nn.Dropout3d(bottleneck_dropout)
+            if bottleneck_dropout > 0 else nn.Identity()
         )
+        self.out = nn.Conv3d(base, 1, 3, padding=1)
 
     def forward(self, volume: torch.Tensor) -> torch.Tensor:
-        return self.net(volume).squeeze(1)  # (B, D, H, W)
+        skips = [self.stem(volume)]
+        for down in self.down:
+            skips.append(down(skips[-1]))
+        x = self.bottleneck_dropout(skips[-1])
+        for up, skip in zip(self.up, reversed(skips[:-1])):
+            x = F.interpolate(
+                up(x), size=skip.shape[-3:], mode="trilinear", align_corners=False
+            ) + skip
+        return self.out(x).squeeze(1)
 
 
-class SingleViewFallbackHead(nn.Module):
-    """Small target-only decoder and fusion gate for the multi-view estimate."""
-
-    def __init__(self, feature_ch: int, base: int):
+class FullResolutionRefiner(nn.Module):
+    def __init__(
+        self,
+        in_ch: int,
+        fine_ch: int,
+        width: int,
+        max_residual_m: float,
+        use_reference_input: bool = True,
+    ):
         super().__init__()
-        hidden = max(base, 16)
-        fusion_ch = max(base // 2, 8)
-        self.low = nn.Sequential(
-            nn.Conv2d(feature_ch, hidden * 2, 3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden * 2),
+        self.max_residual_m = float(max_residual_m)
+        self.use_reference_input = bool(use_reference_input)
+        width = max(16, width)
+        body_in_ch = fine_ch + 1 + (in_ch if self.use_reference_input else 0)
+        self.body = nn.Sequential(
+            nn.Conv2d(body_in_ch, width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(width),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(width, width, 3, padding=1, bias=False),
+            nn.BatchNorm2d(width),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(width, width // 2, 3, padding=1, bias=False),
+            nn.BatchNorm2d(width // 2),
             nn.ReLU(inplace=True),
         )
-        self.mid = nn.Sequential(
-            nn.Conv2d(hidden * 2, hidden, 3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden, hidden, 3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden),
-            nn.ReLU(inplace=True),
-        )
-        self.high = nn.Sequential(
-            nn.Conv2d(hidden, fusion_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(fusion_ch),
-            nn.ReLU(inplace=True),
-        )
-        self.depth_head = nn.Sequential(
-            nn.Conv2d(fusion_ch, 1, 3, padding=1),
-            nn.Sigmoid(),
-        )
-        self.fusion_head = nn.Sequential(
-            nn.Conv2d(fusion_ch + 2, fusion_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(fusion_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(fusion_ch, 1, 3, padding=1),
-            nn.Sigmoid(),
-        )
+        self.residual = nn.Conv2d(width // 2, 1, 3, padding=1)
+        self.feature_channels = width // 2
 
     def forward(
         self,
-        ref_feat: torch.Tensor,
-        depth_mv: torch.Tensor,
-        out_hw: tuple[int, int],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        x = self.low(ref_feat)
-        x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
-        x = self.mid(x)
-        x = F.interpolate(x, size=out_hw, mode="bilinear", align_corners=False)
-        fusion_feat = self.high(x)
-        depth_single = self.depth_head(fusion_feat)
-        alpha = self.fusion_head(torch.cat([fusion_feat, depth_mv, depth_single], dim=1))
-        final = alpha * depth_mv + (1.0 - alpha) * depth_single
-        return final.clamp(0.0, 1.0), depth_single, alpha
+        target: torch.Tensor,
+        fine_feat: torch.Tensor,
+        depth_m: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        fine_full = F.interpolate(
+            fine_feat, size=depth_m.shape[-2:], mode="bilinear", align_corners=False
+        )
+        refiner_inputs = [fine_full, depth_m]
+        if self.use_reference_input:
+            refiner_inputs.insert(0, target)
+        features = self.body(torch.cat(refiner_inputs, dim=1))
+        residual = torch.tanh(self.residual(features)) * self.max_residual_m
+        return (depth_m + residual).clamp(DEPTH_MIN, D_MAX), features
 
 
-class MultiViewDepthNet(nn.Module):
-    """Shared feature CNN with coarse-to-fine warped cost volumes."""
+class ModernMVSNet(nn.Module):
+    """Modern three-stage coarse-to-fine MVS network with a deep FPN."""
+
+    architecture_name = "ModernMVSNet"
 
     def __init__(
         self,
@@ -1006,240 +936,285 @@ class MultiViewDepthNet(nn.Module):
         fine_window: float = 0.08,
         fine_offset_radius: float = 2.0,
         learned_fine_window: bool = False,
-        masked_warp_aggregation: bool = False,
-        cost_volume_ref_features: bool = False,
-        single_view_fallback: bool = False,
-        feature_encoder: str = "cnn",
-        correlation_groups: int = 0,
         reference_channels: int = 0,
         coarse_cost_channels: int = 0,
         fine_cost_channels: int = 0,
         refiner_channels: int = 0,
         refiner_max_residual_m: float | None = None,
-        hourglass_levels: int = 2,
-        coarse_hourglass_levels: int = 0,
-        fine_hourglass_levels: int = 0,
-        learned_view_weighting: bool = False,
-        two_mode_fine_candidates: bool = False,
-        fine_supervision: bool = False,
-        fine_loss_weight: float = 0.3,
-        variance_channels: int = 0,
-        convex_upsampling: bool = False,
-        fullres_geometry: bool = False,
-        fullres_depths: int = 3,
-        fullres_window: float = 0.01,
+        coarse_hourglass_levels: int = 2,
+        fine_hourglass_levels: int = 2,
         fpn_dropout: float = 0.0,
         reference_dropout: float = 0.0,
         hourglass_dropout: float = 0.0,
         drop_path_rate: float = 0.0,
-        cost_volume_type: str = "correlation",
         middle_depths: int = 8,
         middle_window: float = 0.12,
         middle_cost_channels: int = 0,
-        middle_hourglass_levels: int = 0,
+        middle_hourglass_levels: int = 2,
         middle_feature_channels: int = 0,
         fine_feature_channels: int = 0,
-        middle_supervision: bool = False,
-        middle_loss_weight: float = 0.3,
-        fullres_fine_volume: bool = False,
-        h4_coarse_volume: bool = False,
-        decoder_type: str = "auto",
         refiner_reference_input: bool = True,
         no_2d_refinement: bool = False,
     ):
         super().__init__()
-        del (
-            correlation_groups,
-            reference_channels,
-            coarse_cost_channels,
-            fine_cost_channels,
-            refiner_channels,
-            refiner_max_residual_m,
-            hourglass_levels,
-            coarse_hourglass_levels,
-            fine_hourglass_levels,
-            learned_view_weighting,
-            two_mode_fine_candidates,
-            fine_supervision,
-            fine_loss_weight,
-            variance_channels,
-            convex_upsampling,
-            fullres_geometry,
-            fullres_depths,
-            fullres_window,
-            fpn_dropout,
-            reference_dropout,
-            hourglass_dropout,
-            drop_path_rate,
-            cost_volume_type,
-            middle_depths,
-            middle_window,
-            middle_cost_channels,
-            middle_hourglass_levels,
-            middle_feature_channels,
-            fine_feature_channels,
-            middle_supervision,
-            middle_loss_weight,
-            fullres_fine_volume,
-            h4_coarse_volume,
-            decoder_type,
-            refiner_reference_input,
-            no_2d_refinement,
-        )
         if fine_depths < 3:
-            raise ValueError(f"fine_depths must be >= 3, got {fine_depths}")
-        feature_ch = feature_ch or base * 4
-        cost_base = cost_base or max(base // 2, 8)
-        self.fine_depths = fine_depths
+            raise ValueError("fine_depths must be >= 3")
+        if middle_depths < 3:
+            raise ValueError("middle_depths must be >= 3")
+        if middle_window <= 0:
+            raise ValueError("middle_window must be > 0")
+        feature_ch = feature_ch or max(32, base)
+        cost_base = cost_base or max(8, base // 4)
+        coarse_cost_base = coarse_cost_channels or cost_base
+        middle_cost_base = middle_cost_channels or cost_base
+        fine_cost_base = fine_cost_channels or cost_base
+        self.fine_depths = int(fine_depths)
+        self.middle_depths = int(middle_depths)
+        self.middle_window = float(middle_window)
         self.fine_window = float(fine_window)
-        self.fine_offset_radius = float(fine_offset_radius)
-        self.learned_fine_window = learned_fine_window
-        self.masked_warp_aggregation = masked_warp_aggregation
-        self.cost_volume_ref_features = cost_volume_ref_features
-        self.single_view_fallback = single_view_fallback
-        self.feature_encoder = feature_encoder
-        self.feature = make_feature_encoder(feature_encoder, in_ch, base, feature_ch)
-        cost_volume_ch = feature_ch * 2 + 1 if cost_volume_ref_features else feature_ch
-        self.coarse_cost_cnn = CostVolumeCNN(cost_volume_ch, cost_base)
-        self.fine_cost_cnn = CostVolumeCNN(cost_volume_ch, cost_base)
-        confidence_ch = feature_ch + 7
-        self.confidence_head = nn.Sequential(
-            nn.Conv2d(confidence_ch, max(cost_base * 2, 32), 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(max(cost_base * 2, 32), max(cost_base, 16), 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(max(cost_base, 16), 1, 1),
+        self.refiner_max_residual_override = refiner_max_residual_m is not None
+        if refiner_max_residual_m is not None and refiner_max_residual_m <= 0:
+            raise ValueError("--refiner_max_residual_m must be > 0")
+        self.refiner_max_residual_m = (
+            float(refiner_max_residual_m)
+            if refiner_max_residual_m is not None
+            else min(0.05, self.fine_window)
         )
-        if single_view_fallback:
-            self.single_view_head = SingleViewFallbackHead(feature_ch, base)
-        if learned_fine_window:
+        self.fine_offset_radius = float(fine_offset_radius)
+        self.learned_fine_window = bool(learned_fine_window)
+        self.reference_channels = int(reference_channels)
+        self.coarse_hourglass_levels = int(coarse_hourglass_levels)
+        self.middle_hourglass_levels = int(middle_hourglass_levels)
+        self.fine_hourglass_levels = int(fine_hourglass_levels)
+        self.refiner_reference_input = bool(refiner_reference_input)
+        self.no_2d_refinement = bool(no_2d_refinement)
+        self.reference_dropout = float(reference_dropout)
+        self.feature = FeaturePyramid(
+            in_ch,
+            feature_ch,
+            base,
+            dropout=fpn_dropout,
+            drop_path=drop_path_rate,
+            middle_feature_ch=middle_feature_channels,
+            fine_feature_ch=fine_feature_channels,
+        )
+        if self.no_2d_refinement and not self.refiner_reference_input:
+            raise ValueError(
+                "--no_refiner_reference_input has no effect when "
+                "--no_2d_refinement is active"
+            )
+        if self.refiner_max_residual_override and self.no_2d_refinement:
+            raise ValueError(
+                "--refiner_max_residual_m requires the 2-D residual refiner"
+            )
+        if self.reference_channels > 0:
+            self.coarse_reference = nn.Conv2d(
+                feature_ch, self.reference_channels, 1, bias=False
+            )
+            self.fine_reference = nn.Conv2d(
+                self.feature.fine_ch, self.reference_channels, 1, bias=False
+            )
+            self.middle_reference = nn.Conv2d(
+                self.feature.middle_ch, self.reference_channels, 1, bias=False
+            )
+        else:
+            self.coarse_reference = None
+            self.middle_reference = None
+            self.fine_reference = None
+        primary_coarse_channels = feature_ch
+        primary_fine_channels = self.feature.fine_ch
+        primary_middle_channels = self.feature.middle_ch
+        volume_channels_coarse = (
+            primary_coarse_channels + self.reference_channels + 1
+        )
+        volume_channels_fine = (
+            primary_fine_channels + self.reference_channels + 1
+        )
+        volume_channels_middle = (
+            primary_middle_channels
+            + self.reference_channels
+            + 1
+        )
+        self.coarse_cost = CostHourglass3D(
+            volume_channels_coarse,
+            coarse_cost_base,
+            self.coarse_hourglass_levels,
+            bottleneck_dropout=hourglass_dropout,
+        )
+        self.fine_cost = CostHourglass3D(
+            volume_channels_fine,
+            fine_cost_base,
+            self.fine_hourglass_levels,
+            bottleneck_dropout=hourglass_dropout,
+        )
+        self.middle_cost = CostHourglass3D(
+            volume_channels_middle,
+            middle_cost_base,
+            self.middle_hourglass_levels,
+            bottleneck_dropout=hourglass_dropout,
+        )
+        geometry_scales = "H/8/H/4/H/2"
+        refiner_summary = (
+            "none (bilinear only)"
+            if self.no_2d_refinement
+            else (
+                f"{refiner_channels or max(32, min(base // 2, 128))}"
+                f"/raw_reference={self.refiner_reference_input}"
+                f"/max_residual={self.refiner_max_residual_m:g}m"
+            )
+        )
+        self.capacity_summary = (
+            f"decoder=deep_three_stage_fpn  "
+            f"cascade_stages=3  "
+            f"feature_coarse/middle/fine={feature_ch}"
+            f"/{self.feature.middle_ch}"
+            f"/{self.feature.fine_ch}  "
+            f"volume_type=variance  "
+            f"reference={self.reference_channels}  "
+            f"cost_coarse/middle/fine={coarse_cost_base}"
+            f"/{middle_cost_base}"
+            f"/{fine_cost_base}  "
+            f"geometry_scales={geometry_scales}  "
+            f"refiner={refiner_summary}  "
+            f"hourglass_levels_coarse/middle/fine={self.coarse_hourglass_levels}"
+            f"/{self.middle_hourglass_levels}"
+            f"/{self.fine_hourglass_levels}  "
+            f"  dropout(fpn/ref/hg)={fpn_dropout:g}/{reference_dropout:g}/{hourglass_dropout:g}"
+            f"  drop_path={drop_path_rate:g}"
+        )
+
+        window_hidden = max(8, cost_base)
+        if self.learned_fine_window:
             self.window_head = nn.Sequential(
-                nn.Conv2d(feature_ch + 1, max(cost_base, 8), 3, padding=1, bias=False),
-                nn.BatchNorm2d(max(cost_base, 8)),
+                nn.Conv2d(self.feature.fine_ch + 1, window_hidden, 3, padding=1),
                 nn.ReLU(inplace=True),
-                nn.Conv2d(max(cost_base, 8), 1, 3, padding=1),
+                nn.Conv2d(window_hidden, 1, 3, padding=1),
             )
 
-    def _build_cost_volume(
+        refine_width = refiner_channels or max(32, min(base // 2, 128))
+        self.refiner = (
+            None
+            if self.no_2d_refinement
+            else FullResolutionRefiner(
+                in_ch,
+                self.feature.fine_ch,
+                refine_width,
+                max_residual_m=self.refiner_max_residual_m,
+                use_reference_input=self.refiner_reference_input,
+            )
+        )
+        refinement_feature_channels = (
+            self.feature.fine_ch
+            if self.no_2d_refinement
+            else self.refiner.feature_channels
+        )
+        confidence_in = refinement_feature_channels + 5
+        self.confidence_head = nn.Sequential(
+            nn.Conv2d(confidence_in, max(16, cost_base * 2), 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(max(16, cost_base * 2), 1, 1),
+        )
+
+    def _variance_volume(
         self,
         feats: torch.Tensor,
         cam_mats: torch.Tensor,
-        K_feat: torch.Tensor,
+        K: torch.Tensor,
         depth_values: torch.Tensor,
-        return_valid_ratio: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        B, V, Fch, Hf, Wf = feats.shape
-        D = depth_values.shape[0] if depth_values.dim() == 1 else depth_values.shape[1]
-        ref_feat = feats[:, 0]
-        ref_T = cam_mats[:, 0]
-        volume_sum = ref_feat.unsqueeze(2).expand(-1, -1, D, -1, -1)
-        volume_sq_sum = volume_sum ** 2
-        if self.masked_warp_aggregation:
-            valid_sum = torch.ones(
-                (B, 1, D, Hf, Wf),
-                device=feats.device,
-                dtype=feats.dtype,
+        reference_projection: nn.Module | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """MVSNet feature variance, including the reference as one observation."""
+        B, V, C, H, W = feats.shape
+        D = depth_values.shape[1]
+        ref = feats[:, 0].unsqueeze(2).expand(-1, -1, D, -1, -1)
+        feature_sum = ref.clone()
+        feature_sq_sum = ref.square()
+        observation_count = torch.ones(
+            (B, 1, D, H, W), device=feats.device, dtype=feats.dtype
+        )
+        geometric_valid_sum = torch.zeros_like(observation_count)
+
+        for view in range(1, V):
+            warped, valid = homo_warp_features(
+                feats[:, view],
+                cam_mats[:, view],
+                cam_mats[:, 0],
+                K,
+                depth_values,
+                return_valid_mask=True,
             )
+            # Invalid samples must not be treated as zero-valued observations.
+            feature_sum = feature_sum + warped * valid
+            feature_sq_sum = feature_sq_sum + warped.square() * valid
+            observation_count = observation_count + valid
+            geometric_valid_sum = geometric_valid_sum + valid
 
-        for v in range(1, V):
-            if self.masked_warp_aggregation:
-                warped, valid_mask = homo_warp_features(
-                    feats[:, v],
-                    cam_mats[:, v],
-                    ref_T,
-                    K_feat,
-                    depth_values,
-                    return_valid_mask=True,
+        mean = feature_sum / observation_count
+        feature_variance = (
+            feature_sq_sum / observation_count - mean.square()
+        ).clamp_min(0.0)
+        valid_ratio = geometric_valid_sum / max(V - 1, 1)
+        volume_parts = [feature_variance]
+        if reference_projection is not None:
+            reference = reference_projection(feats[:, 0])
+            if self.reference_dropout > 0:
+                reference = F.dropout2d(
+                    reference, p=self.reference_dropout, training=self.training
                 )
-                volume_sum = volume_sum + warped * valid_mask
-                volume_sq_sum = volume_sq_sum + (warped ** 2) * valid_mask
-                valid_sum = valid_sum + valid_mask
-            else:
-                warped = homo_warp_features(
-                    feats[:, v],
-                    cam_mats[:, v],
-                    ref_T,
-                    K_feat,
-                    depth_values,
-                )
-                volume_sum = volume_sum + warped
-                volume_sq_sum = volume_sq_sum + warped ** 2
-
-        if self.masked_warp_aggregation:
-            denom = valid_sum.clamp_min(1.0)
-            mean = volume_sum / denom
-            variance = volume_sq_sum / denom - mean ** 2
-            valid_ratio = valid_sum / float(V)
-        else:
-            variance = volume_sq_sum / V - (volume_sum / V) ** 2
-            valid_ratio = torch.ones(
-                (B, 1, D, Hf, Wf),
-                device=feats.device,
-                dtype=feats.dtype,
-            )
-
-        if self.cost_volume_ref_features:
-            ref_volume = ref_feat.unsqueeze(2).expand(-1, -1, D, -1, -1)
-            volume = torch.cat([variance, ref_volume, valid_ratio], dim=1)
-        else:
-            volume = variance
-        if return_valid_ratio:
-            return volume, valid_ratio
-        return volume
+            volume_parts.append(reference.unsqueeze(2).expand(-1, -1, D, -1, -1))
+        volume_parts.append(valid_ratio)
+        return torch.cat(volume_parts, dim=1), valid_ratio
 
     @staticmethod
-    def _regress_depth(prob: torch.Tensor, depth_values: torch.Tensor) -> torch.Tensor:
-        if depth_values.dim() == 1:
-            dv = depth_values[None, :, None, None]
-        elif depth_values.dim() == 2:
-            dv = depth_values[:, :, None, None]
-        elif depth_values.dim() == 4:
-            dv = depth_values
-        else:
-            raise ValueError(f"Unsupported depth_values shape: {tuple(depth_values.shape)}")
-        return torch.sum(prob * dv.to(device=prob.device, dtype=prob.dtype), dim=1, keepdim=True)
+    def _regress(prob: torch.Tensor, depth_values: torch.Tensor) -> torch.Tensor:
+        return torch.sum(prob * depth_values.to(prob.dtype), dim=1, keepdim=True)
 
     @staticmethod
-    def _depth_uncertainty(
-        prob: torch.Tensor,
-        depth_values: torch.Tensor,
-        mean_depth: torch.Tensor,
+    def _local_values(
+        center_m: torch.Tensor,
+        target_ref: torch.Tensor,
+        count: int,
+        half_window: float,
     ) -> torch.Tensor:
-        """Return per-pixel depth standard deviation in metres."""
-        if depth_values.dim() == 1:
-            dv = depth_values[None, :, None, None]
-        elif depth_values.dim() == 2:
-            dv = depth_values[:, :, None, None]
-        elif depth_values.dim() == 4:
-            dv = depth_values
-        else:
-            raise ValueError(f"Unsupported depth_values shape: {tuple(depth_values.shape)}")
-        dv = dv.to(device=prob.device, dtype=prob.dtype)
-        variance = torch.sum(prob * (dv - mean_depth).square(), dim=1, keepdim=True)
-        return variance.clamp_min(0.0).sqrt()
+        center_up = F.interpolate(
+            center_m, size=target_ref.shape[-2:], mode="bilinear", align_corners=False
+        )
+        offsets = torch.linspace(
+            -half_window,
+            half_window,
+            count,
+            device=center_up.device,
+            dtype=center_up.dtype,
+        )
+        return (center_up + offsets.view(1, count, 1, 1)).clamp(
+            DEPTH_MIN, D_MAX
+        )
 
-    def _fine_depth_values(
+    def _fine_values(
         self,
-        coarse_depth: torch.Tensor,
-        ref_feat: torch.Tensor,
+        coarse_m: torch.Tensor,
+        fine_ref: torch.Tensor,
     ) -> torch.Tensor:
-        B, _, Hf, Wf = coarse_depth.shape
-        dtype = coarse_depth.dtype
-        device = coarse_depth.device
+        coarse_up = F.interpolate(
+            coarse_m, size=fine_ref.shape[-2:], mode="bilinear", align_corners=False
+        )
+        if self.learned_fine_window:
+            scale = 0.25 + 0.75 * torch.sigmoid(
+                self.window_head(torch.cat([fine_ref, coarse_up], dim=1))
+            )
+            sigma = self.fine_window * scale
+        else:
+            sigma = torch.full_like(coarse_up, self.fine_window)
         offsets = torch.linspace(
             -self.fine_offset_radius,
             self.fine_offset_radius,
             self.fine_depths,
-            device=device,
-            dtype=dtype,
+            device=coarse_up.device,
+            dtype=coarse_up.dtype,
         )
-        if self.learned_fine_window:
-            window01 = torch.sigmoid(self.window_head(torch.cat([ref_feat, coarse_depth], dim=1)))
-            sigma = self.fine_window * (0.25 + 0.75 * window01)
-        else:
-            sigma = torch.full_like(coarse_depth, self.fine_window)
-        fine = coarse_depth + sigma * offsets.view(1, self.fine_depths, 1, 1)
-        return fine.clamp(DEPTH_MIN, D_MAX).view(B, self.fine_depths, Hf, Wf)
+        return (
+            coarse_up + sigma * offsets.view(1, self.fine_depths, 1, 1)
+        ).clamp(DEPTH_MIN, D_MAX)
 
     def forward(
         self,
@@ -1247,105 +1222,124 @@ class MultiViewDepthNet(nn.Module):
         cam_mats: torch.Tensor,
         K: torch.Tensor,
         depth_values: torch.Tensor,
-        return_coarse: bool = False,
         return_uncertainty: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         B, V, C, H, W = imgs.shape
-
-        feats = self.feature(imgs.reshape(B * V, C, H, W))
-        _, Fch, Hf, Wf = feats.shape
-        feats = feats.view(B, V, Fch, Hf, Wf)
-
-        K_feat = K.clone()
-        K_feat[:, 0, :] *= Wf / W
-        K_feat[:, 1, :] *= Hf / H
-
-        coarse_volume = self._build_cost_volume(feats, cam_mats, K_feat, depth_values)
-        coarse_cost = self.coarse_cost_cnn(coarse_volume)
-        coarse_prob = F.softmax(-coarse_cost.float(), dim=1).to(coarse_cost.dtype)
-        coarse_depth = self._regress_depth(coarse_prob, depth_values)
-
-        fine_values = self._fine_depth_values(coarse_depth, feats[:, 0])
-        fine_volume, fine_valid_ratio = self._build_cost_volume(
-            feats,
-            cam_mats,
-            K_feat,
-            fine_values,
-            return_valid_ratio=True,
-        )
-        fine_cost = self.fine_cost_cnn(fine_volume)
-        fine_prob = F.softmax(-fine_cost.float(), dim=1).to(fine_cost.dtype)
-        depth_low = self._regress_depth(fine_prob, fine_values)
-
-        depth_mv_m = F.interpolate(depth_low, size=(H, W), mode="bilinear", align_corners=False)
-        depth_mv_norm = ((depth_mv_m - DEPTH_MIN) / (D_MAX - DEPTH_MIN)).clamp(0.0, 1.0)
-        if self.single_view_fallback:
-            final_depth_norm, depth_single_norm, fusion_alpha = self.single_view_head(
-                feats[:, 0],
-                depth_mv_norm,
-                (H, W),
+        if depth_values.dim() == 1:
+            depth_values = depth_values.unsqueeze(0).expand(B, -1)
+        elif depth_values.dim() != 2:
+            raise ValueError(
+                f"Expected global depth_values with shape (D,) or (B,D), got "
+                f"{tuple(depth_values.shape)}"
             )
-            depth_single_low = F.interpolate(
-                depth_single_norm,
-                size=(Hf, Wf),
-                mode="bilinear",
-                align_corners=False,
-            ) * (D_MAX - DEPTH_MIN) + DEPTH_MIN
-            alpha_low = F.interpolate(
-                fusion_alpha,
-                size=(Hf, Wf),
-                mode="bilinear",
-                align_corners=False,
+        feature_levels = self.feature(imgs.reshape(B * V, C, H, W))
+        coarse_flat, middle_flat, fine_flat = feature_levels
+        middle = middle_flat.view(B, V, *middle_flat.shape[1:])
+        coarse = coarse_flat.view(B, V, *coarse_flat.shape[1:])
+        fine = fine_flat.view(B, V, *fine_flat.shape[1:])
+
+        K_coarse = K.clone()
+        K_coarse[:, 0, :] *= coarse.shape[-1] / W
+        K_coarse[:, 1, :] *= coarse.shape[-2] / H
+        coarse_values = depth_values[:, :, None, None].expand(
+            -1, -1, coarse.shape[-2], coarse.shape[-1]
+        )
+        coarse_volume, _ = self._variance_volume(
+            coarse,
+            cam_mats,
+            K_coarse,
+            coarse_values,
+            self.coarse_reference,
+        )
+        coarse_logits = self.coarse_cost(coarse_volume)
+        coarse_prob = F.softmax(-coarse_logits.float(), dim=1).to(coarse_logits.dtype)
+        coarse_m = self._regress(coarse_prob, coarse_values)
+
+        middle_values = self._local_values(
+            coarse_m,
+            middle[:, 0],
+            self.middle_depths,
+            self.middle_window,
+        )
+        K_middle = K.clone()
+        K_middle[:, 0, :] *= middle.shape[-1] / W
+        K_middle[:, 1, :] *= middle.shape[-2] / H
+        middle_volume, _ = self._variance_volume(
+            middle,
+            cam_mats,
+            K_middle,
+            middle_values,
+            self.middle_reference,
+        )
+        middle_logits = self.middle_cost(middle_volume)
+        middle_prob = F.softmax(-middle_logits.float(), dim=1).to(
+            middle_logits.dtype
+        )
+        middle_m = self._regress(middle_prob, middle_values)
+
+        fine_values = self._fine_values(middle_m, fine[:, 0])
+        K_fine = K.clone()
+        K_fine[:, 0, :] *= fine.shape[-1] / W
+        K_fine[:, 1, :] *= fine.shape[-2] / H
+        fine_volume, fine_valid = self._variance_volume(
+            fine,
+            cam_mats,
+            K_fine,
+            fine_values,
+            self.fine_reference,
+        )
+        fine_logits = self.fine_cost(fine_volume)
+        fine_prob = F.softmax(-fine_logits.float(), dim=1).to(fine_logits.dtype)
+        fine_m = self._regress(fine_prob, fine_values)
+        depth_full = F.interpolate(
+            fine_m, size=(H, W), mode="bilinear", align_corners=False
+        )
+        if self.no_2d_refinement:
+            refined_m = depth_full.clamp(DEPTH_MIN, D_MAX)
+            refinement_features = F.interpolate(
+                fine[:, 0], size=(H, W), mode="bilinear", align_corners=False
             )
         else:
-            final_depth_norm = depth_mv_norm
-            depth_single_low = depth_low
-            alpha_low = torch.ones_like(depth_low)
+            assert self.refiner is not None
+            refined_m, refinement_features = self.refiner(
+                imgs[:, 0], fine[:, 0], depth_full
+            )
 
-        confidence_m = None
+        final_norm = (
+            (refined_m - DEPTH_MIN) / (D_MAX - DEPTH_MIN)
+        ).clamp(0.0, 1.0)
+
+        confidence = None
         if return_uncertainty:
             eps = 1e-8
-            posterior_std = self._depth_uncertainty(fine_prob, fine_values, depth_low)
+            posterior_std = torch.sum(
+                fine_prob * (fine_values - fine_m).square(), dim=1, keepdim=True
+            ).clamp_min(0.0).sqrt()
             entropy = -(fine_prob * torch.log(fine_prob + eps)).sum(dim=1, keepdim=True)
             max_prob = fine_prob.max(dim=1, keepdim=True).values
-            coarse_fine_diff = torch.abs(depth_low - coarse_depth)
-            valid_ratio = fine_valid_ratio.mean(dim=2)
-            single_mv_diff = torch.abs(depth_single_low - depth_low)
-            confidence_features = torch.cat(
-                [
-                    feats[:, 0],
-                    posterior_std,
-                    entropy,
-                    max_prob,
-                    coarse_fine_diff,
-                    valid_ratio,
-                    single_mv_diff,
-                    alpha_low,
-                ],
-                dim=1,
+            valid_ratio = fine_valid.mean(dim=2)
+            previous_up = F.interpolate(
+                middle_m, size=fine_m.shape[-2:], mode="bilinear", align_corners=False
             )
-            confidence_low = torch.sigmoid(self.confidence_head(confidence_features))
-            confidence_m = F.interpolate(
-                confidence_low,
-                size=(H, W),
-                mode="bilinear",
-                align_corners=False,
+            coarse_fine = torch.abs(fine_m - previous_up)
+            diagnostics = torch.cat(
+                [posterior_std, entropy, max_prob, valid_ratio, coarse_fine], dim=1
             )
-            confidence_m = confidence_m.clamp(0.0, 1.0)
+            diagnostics = F.interpolate(
+                diagnostics, size=(H, W), mode="bilinear", align_corners=False
+            )
+            confidence = torch.sigmoid(
+                self.confidence_head(
+                    torch.cat([refinement_features, diagnostics], dim=1)
+                )
+            )
 
-        if not return_coarse:
-            if return_uncertainty:
-                return final_depth_norm, confidence_m
-            return final_depth_norm
-
-        coarse_depth_m = F.interpolate(coarse_depth, size=(H, W), mode="bilinear", align_corners=False)
-        coarse_depth_norm = ((coarse_depth_m - DEPTH_MIN) / (D_MAX - DEPTH_MIN)).clamp(0.0, 1.0)
         if return_uncertainty:
-            return coarse_depth_norm, final_depth_norm, confidence_m
-        return coarse_depth_norm, final_depth_norm
+            return final_norm, confidence
+        return final_norm
 
 
-# ---------------------------------------------------------------------------
+
 # Training / validation
 # ---------------------------------------------------------------------------
 
@@ -1359,32 +1353,16 @@ def run_epoch(
     error_diag=None,
     uncertainty_diag=None,
     lambda_grad: float = 0.5,
-    lambda_smooth: float = 0.01,
-    lambda_mean: float = 0.1,
     lambda_normal: float = 0.1,
     l1_loss_only: bool = False,
-    loss_mode: str = "legacy",
-    coarse_supervision: bool = False,
-    coarse_loss_weight: float = 0.3,
     uncertainty: bool = False,
     lambda_confidence: float = 0.1,
     confidence_abs_tolerance: float = 0.01,
     confidence_rel_tolerance: float = 0.01,
-    fine_supervision: bool = False,
-    fine_loss_weight: float = 0.3,
-    middle_supervision: bool = False,
-    middle_loss_weight: float = 0.3,
-    lambda_worst_percent: float = 0.0,
-    worst_percent: float = 0.10,
     ema_model=None,
-    freeze_batch_norm: bool = False,
 ) -> tuple[float, float, float, float]:
     is_train = optimizer is not None
     model.train(is_train)
-    if is_train and freeze_batch_norm:
-        for module in model.modules():
-            if isinstance(module, nn.modules.batchnorm._BatchNorm):
-                module.eval()
     ctx = torch.enable_grad() if is_train else torch.no_grad()
 
     total_loss = total_l1 = total_p95 = total_worst10_l1 = 0.0
@@ -1394,23 +1372,6 @@ def run_epoch(
     t_last = t_phase_start
     batches_at_last_log = 0
     use_cuda = device.type == "cuda" and torch.cuda.is_available()
-    depth_range_m = D_MAX - DEPTH_MIN
-
-    def normalized_l1(prediction: torch.Tensor, target: torch.Tensor,
-                      valid: torch.Tensor) -> torch.Tensor:
-        target_norm = ((target - DEPTH_MIN) / depth_range_m).clamp(0.0, 1.0)
-        return (
-            torch.abs(prediction - target_norm) * valid
-        ).sum() / valid.sum().clamp_min(1.0)
-
-    def normalized_worst_l1(prediction: torch.Tensor, target: torch.Tensor,
-                            valid: torch.Tensor) -> torch.Tensor:
-        target_norm = ((target - DEPTH_MIN) / depth_range_m).clamp(0.0, 1.0)
-        errors = torch.abs(prediction - target_norm)[valid > 0.5]
-        if errors.numel() == 0:
-            return prediction.sum() * 0.0
-        count = max(1, int(np.ceil(errors.numel() * worst_percent)))
-        return torch.topk(errors, k=min(count, errors.numel())).values.mean()
     if use_cuda:
         torch.cuda.reset_peak_memory_stats(device)
 
@@ -1429,106 +1390,26 @@ def run_epoch(
                 cam_mats,
                 K,
                 depth_values,
-                return_coarse=coarse_supervision,
                 return_uncertainty=uncertainty,
             )
             pred_unc = None
-            if coarse_supervision:
-                if uncertainty:
-                    coarse_pred, pred, pred_unc = model_out
-                else:
-                    coarse_pred, pred = model_out
+            if uncertainty:
+                pred, pred_unc = model_out
             else:
-                if uncertainty:
-                    pred, pred_unc = model_out
-                else:
-                    pred = model_out
+                pred = model_out
 
             pred_loss = pred
-            coarse_pred_loss = None
-            if coarse_supervision:
-                coarse_pred_loss = coarse_pred
-            if l1_loss_only or loss_mode == "mvs_l1":
+            if l1_loss_only:
                 loss_final = _l1_metres(pred_loss, dep_t, mask_t)
-                if loss_mode == "mvs_l1" and lambda_smooth > 0:
-                    loss_final = loss_final + lambda_smooth * depth_range_m * _smoothness_loss(
-                        pred_loss, imgs[:, 0, :NUM_BINS], mask_t
-                    )
             else:
-                loss_final, _ = compute_loss(
-                    pred_loss,
-                    dep_norm,
-                    mask_t,
-                    imgs[:, 0, :NUM_BINS],
-                    K=K[0],
-                    lambda_grad=lambda_grad,
-                    lambda_smooth=lambda_smooth,
-                    lambda_mean=lambda_mean,
-                    lambda_normal=lambda_normal,
+                loss_final = _charbonnier(pred_loss, dep_norm, mask_t)
+                loss_final = loss_final + lambda_grad * _gradient_loss(
+                    pred_loss, dep_norm, mask_t
+                )
+                loss_final = loss_final + lambda_normal * _normal_loss(
+                    pred_loss, dep_norm, mask_t, K[0]
                 )
             loss = loss_final
-            if lambda_worst_percent > 0:
-                if loss_mode == "unit_consistent":
-                    loss_worst = normalized_worst_l1(pred_loss, dep_t, mask_t)
-                else:
-                    loss_worst = _worst_percent_l1_metres(
-                        pred_loss,
-                        dep_t,
-                        mask_t,
-                        percent=worst_percent,
-                    )
-                loss = loss + lambda_worst_percent * loss_worst
-            if fine_supervision:
-                fine_pred = getattr(model, "aux_fine_pred", None)
-                if fine_pred is None:
-                    raise RuntimeError(
-                        "--fine_supervision requires a model exposing aux_fine_pred"
-                    )
-                fine_hw = fine_pred.shape[-2:]
-                fine_depth = F.interpolate(dep_t, size=fine_hw, mode="nearest")
-                fine_mask = F.interpolate(mask_t, size=fine_hw, mode="nearest")
-                loss_fine = (
-                    normalized_l1(fine_pred, fine_depth, fine_mask)
-                    if loss_mode == "unit_consistent"
-                    else _l1_metres(fine_pred, fine_depth, fine_mask)
-                )
-                loss = loss + fine_loss_weight * loss_fine
-            if middle_supervision:
-                middle_pred = getattr(model, "aux_middle_pred", None)
-                if middle_pred is None:
-                    raise RuntimeError(
-                        "--middle_supervision requires a three-stage model "
-                        "exposing aux_middle_pred"
-                    )
-                middle_hw = middle_pred.shape[-2:]
-                middle_depth = F.interpolate(dep_t, size=middle_hw, mode="nearest")
-                middle_mask = F.interpolate(mask_t, size=middle_hw, mode="nearest")
-                loss_middle = (
-                    normalized_l1(middle_pred, middle_depth, middle_mask)
-                    if loss_mode == "unit_consistent"
-                    else _l1_metres(middle_pred, middle_depth, middle_mask)
-                )
-                loss = loss + middle_loss_weight * loss_middle
-            if coarse_supervision:
-                if l1_loss_only or loss_mode == "mvs_l1":
-                    loss_coarse = _l1_metres(coarse_pred_loss, dep_t, mask_t)
-                    if loss_mode == "mvs_l1" and lambda_smooth > 0:
-                        loss_coarse = loss_coarse + lambda_smooth * depth_range_m * _smoothness_loss(
-                            coarse_pred_loss, imgs[:, 0, :NUM_BINS], mask_t
-                        )
-                else:
-                    loss_coarse, _ = compute_loss(
-                        coarse_pred_loss,
-                        dep_norm,
-                        mask_t,
-                        imgs[:, 0, :NUM_BINS],
-                        K=K[0],
-                        lambda_grad=lambda_grad,
-                        lambda_smooth=lambda_smooth,
-                        lambda_mean=lambda_mean,
-                        lambda_normal=lambda_normal,
-                    )
-                loss = loss + coarse_loss_weight * loss_coarse
             if uncertainty and pred_unc is not None and lambda_confidence > 0:
                 pred_m = pred_loss * (D_MAX - DEPTH_MIN) + DEPTH_MIN
                 with torch.no_grad():
@@ -1921,78 +1802,34 @@ def main() -> None:
                         help="EMA decay used for validation/checkpoints; 0 disables EMA")
     parser.add_argument("--early_stopping_patience", type=int, default=0,
                         help="Stop after this many epochs without validation improvement; 0 disables")
-    parser.add_argument("--freeze_batch_norm", action="store_true",
-                        help="Keep BatchNorm layers in eval mode during training so running stats do not drift")
     parser.add_argument("--lambda_grad", type=float, default=0.5,
                         help="Weight for multi-scale gradient loss term.")
-    parser.add_argument("--lambda_smooth", type=float, default=0.01,
-                        help="Weight for event-aware smoothness loss term.")
-    parser.add_argument("--lambda_mean", type=float, default=0.1,
-                        help="Weight for mean-depth consistency loss term.")
     parser.add_argument("--lambda_normal", type=float, default=0.1,
                         help="Weight for surface-normal loss term.")
     parser.add_argument("--l1_loss_only", action="store_true",
                         help="Train directly with masked metric L1 in metres, ignoring auxiliary loss terms.")
-    parser.add_argument(
-        "--loss_mode",
-        choices=("legacy", "mvs_l1", "unit_consistent"),
-        default="legacy",
-        help=(
-            "legacy preserves the original mixed-unit objective; mvs_l1 uses "
-            "masked L1 in metres at every enabled MVS stage and optionally "
-            "adds metre-scale event smoothness; unit_consistent keeps the "
-            "composite objective but expresses auxiliary and worst-pixel "
-            "depth losses in normalized-depth units."
-        ),
-    )
-    parser.add_argument("--lambda_worst_percent", type=float, default=0.0,
-                        help="Weight for metric L1 over the worst valid prediction pixels")
-    parser.add_argument("--worst_percent", type=float, default=0.10,
-                        help="Fraction of valid pixels used by --lambda_worst_percent")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--base_channels", type=int, default=32)
     parser.add_argument("--feature_channels", type=int, default=0,
                         help="Shared CNN output channels; 0 means base_channels*4")
-    parser.add_argument("--feature_encoder",
-                        choices=("cnn", "cnn_8", "casmvsnet_fpn", "deep_fpn", "resnet18", "resnet18_h4",
-                                 "resnet34", "resnet34_h4", "resnet50", "efficientnet_b0"),
-                        default="cnn",
-                        help="Shared per-view feature encoder; casmvsnet_fpn is available in modern_multiview.py")
-    parser.add_argument(
-        "--decoder_type",
-        choices=("auto", "two_stage_fpn", "three_stage_fpn"),
-        default="auto",
-        help=(
-            "Modern MVS decoder/cascade layout: auto preserves existing "
-            "behavior; two_stage_fpn uses H/4 global then H/2 local geometry "
-            "with casmvsnet_fpn/deep_fpn; three_stage_fpn explicitly selects "
-            "the existing three-stage FPN decoder"
-        ),
-    )
     parser.add_argument("--cost_channels", type=int, default=0,
                         help="3D cost CNN base width; 0 means max(base_channels//2, 8)")
-    parser.add_argument("--correlation_groups", type=int, default=0,
-                        help="Modern MVS only: group-correlation channels; for casmvsnet_fpn "
-                             "this is the per-stage maximum; 0 selects automatically")
-    parser.add_argument("--cost_volume_type", choices=("correlation", "variance"),
-                        default="correlation",
-                        help="Modern MVS only: primary multi-view cost-volume aggregation")
     parser.add_argument("--reference_channels", type=int, default=0,
-                        help="Modern MVS only: compressed reference channels added to each cost volume")
+                        help="Compressed reference channels added to each cost volume")
     parser.add_argument("--coarse_cost_channels", type=int, default=0,
-                        help="Modern MVS only: coarse 3D hourglass base width; 0 uses --cost_channels")
+                        help="Coarse 3D hourglass base width; 0 uses --cost_channels")
     parser.add_argument("--fine_cost_channels", type=int, default=0,
-                        help="Modern MVS only: fine 3D hourglass base width; 0 uses --cost_channels")
+                        help="Fine 3D hourglass base width; 0 uses --cost_channels")
     parser.add_argument("--middle_cost_channels", type=int, default=0,
-                        help="CasMVSNet FPN only: H/4 3D hourglass base width; 0 uses --cost_channels")
+                        help="Middle-stage 3D hourglass base width; 0 uses --cost_channels")
     parser.add_argument("--refiner_channels", type=int, default=0,
-                        help="Modern MVS only: full-resolution 2D refiner width; 0 selects automatically")
+                        help="Full-resolution 2D refiner width; 0 selects automatically")
     parser.add_argument(
         "--refiner_max_residual_m",
         type=float,
         default=None,
         help=(
-            "Modern MVS only: override the symmetric maximum metric-depth "
+            "Override the symmetric maximum metric-depth "
             "correction of the 2-D refiner in metres; omitted uses "
             "min(0.05, fine_window)."
         ),
@@ -2001,7 +1838,7 @@ def main() -> None:
         "--no_refiner_reference_input",
         action="store_true",
         help=(
-            "Modern MVS only: omit the raw full-resolution reference event/prior "
+            "Omit the raw full-resolution reference event/prior "
             "tensor from the 2-D refiner while retaining fine FPN features and depth."
         ),
     )
@@ -2009,70 +1846,39 @@ def main() -> None:
         "--no_2d_refinement",
         action="store_true",
         help=(
-            "Modern MVS only: bypass full-resolution 2-D residual refinement and "
+            "Bypass full-resolution 2-D residual refinement and "
             "use the bilinearly upsampled fine-stage depth directly."
         ),
     )
-    parser.add_argument("--hourglass_levels", type=int, default=2,
-                        help="Modern MVS only: fallback number of 3D hourglass levels for both stages")
-    parser.add_argument("--coarse_hourglass_levels", type=int, default=0,
-                        help="Modern MVS only: coarse hourglass levels; 0 uses --hourglass_levels")
-    parser.add_argument("--fine_hourglass_levels", type=int, default=0,
-                        help="Modern MVS only: fine hourglass levels; 0 uses --hourglass_levels")
-    parser.add_argument("--middle_hourglass_levels", type=int, default=0,
-                        help="CasMVSNet FPN only: H/4 hourglass levels; 0 uses --hourglass_levels")
-    parser.add_argument("--learned_view_weighting", action="store_true",
-                        help="Modern MVS only: learn per-view, per-depth reliability before aggregation")
-    parser.add_argument("--two_mode_fine_candidates", action="store_true",
-                        help="Modern MVS only: sample fine hypotheses around two separated coarse modes")
-    parser.add_argument("--fine_supervision", action="store_true",
-                        help="Modern MVS only: directly supervise the H/2 fine-stage depth")
-    parser.add_argument("--fine_loss_weight", type=float, default=0.3,
-                        help="Weight of direct fine-stage metric L1 supervision")
-    parser.add_argument("--middle_supervision", action="store_true",
-                        help="Three-stage FPN only: directly supervise middle-stage depth")
-    parser.add_argument("--middle_loss_weight", type=float, default=0.3,
-                        help="Weight of direct H/4 middle-stage metric L1 supervision")
+    parser.add_argument("--coarse_hourglass_levels", type=int, default=2,
+                        help="Coarse-stage 3D hourglass levels")
+    parser.add_argument("--fine_hourglass_levels", type=int, default=2,
+                        help="Fine-stage 3D hourglass levels")
+    parser.add_argument("--middle_hourglass_levels", type=int, default=2,
+                        help="Middle-stage 3D hourglass levels")
     parser.add_argument("--middle_feature_channels", type=int, default=0,
                         help="Three-stage FPN only: middle-stage output channels; "
                              "0 uses feature_channels/2")
     parser.add_argument("--fine_feature_channels", type=int, default=0,
                         help="Three-stage FPN only: final-stage output channels; "
                              "0 uses feature_channels/4")
-    parser.add_argument("--fullres_fine_volume", action="store_true",
-                        help="Three-stage FPN only: construct the final cost volume at input "
-                             "resolution and bypass depth upsampling and the 2-D refiner")
-    parser.add_argument("--h4_coarse_volume", action="store_true",
-                        help="Full-resolution FPN mode only: construct the global coarse "
-                             "cost volume at H/4 instead of H/8")
-    parser.add_argument("--variance_channels", type=int, default=0,
-                        help="Modern MVS only: compressed channels for cross-view correlation variance")
-    parser.add_argument("--convex_upsampling", action="store_true",
-                        help="Modern MVS only: use learned RAFT-style convex H/2-to-full upsampling")
-    parser.add_argument("--fullres_geometry", action="store_true",
-                        help="Modern MVS only: run a tiny local full-resolution geometry stage")
-    parser.add_argument("--fullres_depths", type=int, default=3,
-                        help="Modern MVS only: odd number of full-resolution local depth hypotheses")
-    parser.add_argument("--fullres_window", type=float, default=0.01,
-                        help="Modern MVS only: full-resolution local search half-window in metres")
     parser.add_argument("--fpn_dropout", type=float, default=0.0,
-                        help="Modern MVS only: Dropout2d probability on FPN outputs")
+                        help="Dropout2d probability on FPN outputs")
     parser.add_argument("--reference_dropout", type=float, default=0.0,
-                        help="Modern MVS only: Dropout2d probability on reference features")
+                        help="Dropout2d probability on reference features")
     parser.add_argument("--hourglass_dropout", type=float, default=0.0,
-                        help="Modern MVS only: Dropout3d probability at hourglass bottlenecks")
+                        help="Dropout3d probability at hourglass bottlenecks")
     parser.add_argument("--drop_path_rate", type=float, default=0.0,
-                        help="Modern MVS only: stochastic-depth rate on FPN fusion")
+                        help="Stochastic-depth rate on FPN fusion")
     parser.add_argument("--num_views", type=int, default=5)
     parser.add_argument("--view_interval", type=int, default=5)
     parser.add_argument("--pose_view_selection", action="store_true",
                         help="Select balanced before/after source views by camera motion instead of fixed frame offsets")
     parser.add_argument("--pose_move_threshold", type=float, default=0.01,
                         help="Minimum camera-center translation in metres between consecutive selected pose views")
-    parser.add_argument("--num_depths", type=int, default=32,
+    parser.add_argument("--coarse_depths", type=int, default=32,
                         help="Number of global/coarse depth planes between DEPTH_MIN and D_MAX")
-    coarse_candidate_group = parser.add_mutually_exclusive_group()
-    coarse_candidate_group.add_argument(
+    parser.add_argument(
         "--linear_depth_candidates",
         action="store_true",
         help=(
@@ -2080,33 +1886,18 @@ def main() -> None:
             "cost volume instead of the default inverse-depth spacing."
         ),
     )
-    coarse_candidate_group.add_argument(
-        "--gaussian_depth_candidates",
-        action="store_true",
-        help=(
-            "Use quantiles of a midpoint-centred Gaussian truncated to "
-            "[DEPTH_MIN, D_MAX] for the global/coarse cost volume. The "
-            "standard deviation is one sixth of the depth range."
-        ),
-    )
     parser.add_argument("--fine_depths", type=int, default=5,
                         help="Number of fine per-pixel depth hypotheses around the coarse estimate")
     parser.add_argument("--middle_depths", type=int, default=8,
-                        help="CasMVSNet FPN only: H/4 local depth hypotheses")
+                        help="Middle-stage H/4 local depth hypotheses")
     parser.add_argument("--middle_window", type=float, default=0.12,
-                        help="CasMVSNet FPN only: H/4 local search half-window in metres")
+                        help="Middle-stage H/4 local search half-window in metres")
     parser.add_argument("--fine_window", type=float, default=0.08,
                         help="Fine-stage sigma/window in metres before multiplying by offsets")
     parser.add_argument("--fine_offset_radius", type=float, default=2.0,
                         help="Fine offsets span [-radius, radius]; 2 with 5 planes gives [-2,-1,0,1,2]")
     parser.add_argument("--learned_fine_window", action="store_true",
                         help="Predict a per-pixel fine-stage window from target features and coarse depth")
-    parser.add_argument("--masked_warp_aggregation", action="store_true",
-                        help="Ignore out-of-image and behind-camera warped source features when aggregating cost-volume variance")
-    parser.add_argument("--cost_volume_ref_features", action="store_true",
-                        help="Concatenate target/reference features and valid-view ratio over depth with the variance cost volume before the 3D CNN")
-    parser.add_argument("--coarse_supervision", action="store_true",
-                        help="Train with an auxiliary coarse-depth loss: loss_final + 0.3 * loss_coarse")
     parser.add_argument("--uncertainty", action="store_true",
                         help="Train, return, and log learned per-pixel fusion confidence")
     parser.add_argument("--lambda_confidence", type=float, default=0.1,
@@ -2115,13 +1906,9 @@ def main() -> None:
                         help="Absolute safe-to-fuse confidence tolerance in metres")
     parser.add_argument("--confidence_rel_tolerance", type=float, default=0.01,
                         help="Relative safe-to-fuse confidence tolerance as a fraction of GT depth")
-    parser.add_argument("--single_view_fallback", action="store_true",
-                        help="Add a target-only decoder and learn a per-pixel fusion of multi-view and single-view depth")
     parser.add_argument("--out_dir", type=Path,
                         default=_SCRIPT_DIR / "checkpoints" / "multiview")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--no_mask", action="store_true",
-                        help="Ignore spatial mask; dep>0 validity is always applied")
     parser.add_argument("--fill_invalid", action="store_true",
                         help="Fill pixels with no depth measurement using the table-plane prior")
     parser.add_argument("--no_augmentations", action="store_true",
@@ -2179,14 +1966,6 @@ def main() -> None:
         parser.error("--early_stopping_patience must be >= 0")
     if args.lambda_confidence < 0:
         parser.error("--lambda_confidence must be >= 0")
-    if args.lambda_worst_percent < 0:
-        parser.error("--lambda_worst_percent must be >= 0")
-    if args.l1_loss_only and args.loss_mode != "legacy":
-        parser.error("--l1_loss_only cannot be combined with --loss_mode")
-    if not (0 < args.worst_percent <= 1):
-        parser.error("--worst_percent must be in (0, 1]")
-    if args.correlation_groups < 0:
-        parser.error("--correlation_groups must be >= 0")
     if args.reference_channels < 0:
         parser.error("--reference_channels must be >= 0")
     if any(x < 0 for x in (
@@ -2202,7 +1981,7 @@ def main() -> None:
         parser.error("--refiner_max_residual_m must be > 0")
     if (
         args.refiner_max_residual_m is not None
-        and (args.no_2d_refinement or args.fullres_fine_volume)
+        and args.no_2d_refinement
     ):
         parser.error(
             "--refiner_max_residual_m requires the 2-D residual refiner"
@@ -2211,47 +1990,16 @@ def main() -> None:
         parser.error(
             "--no_refiner_reference_input has no effect with --no_2d_refinement"
         )
-    if args.no_2d_refinement and args.fullres_fine_volume:
-        parser.error(
-            "--no_2d_refinement cannot be combined with --fullres_fine_volume"
-        )
-    if args.no_2d_refinement and args.convex_upsampling:
-        parser.error(
-            "--no_2d_refinement uses bilinear upsampling and cannot be combined "
-            "with --convex_upsampling"
-        )
-    if args.no_2d_refinement and args.fullres_geometry:
-        parser.error(
-            "--no_2d_refinement cannot be combined with --fullres_geometry"
-        )
-    if args.no_2d_refinement and args.single_view_fallback:
-        parser.error(
-            "--no_2d_refinement cannot be combined with --single_view_fallback"
-        )
-    if args.no_refiner_reference_input and args.fullres_fine_volume:
-        parser.error(
-            "--no_refiner_reference_input has no effect with --fullres_fine_volume"
-        )
-    if args.hourglass_levels < 1:
-        parser.error("--hourglass_levels must be >= 1")
-    if any(x < 0 for x in (
+    if any(x < 1 for x in (
         args.coarse_hourglass_levels,
         args.middle_hourglass_levels,
         args.fine_hourglass_levels,
     )):
-        parser.error("stage-specific hourglass levels must be >= 0")
+        parser.error("stage-specific hourglass levels must be >= 1")
     if args.middle_depths < 3:
         parser.error("--middle_depths must be >= 3")
     if args.middle_window <= 0:
         parser.error("--middle_window must be > 0")
-    if args.fine_loss_weight < 0:
-        parser.error("--fine_loss_weight must be >= 0")
-    if args.variance_channels < 0:
-        parser.error("--variance_channels must be >= 0")
-    if args.fullres_depths < 3 or args.fullres_depths % 2 != 1:
-        parser.error("--fullres_depths must be an odd integer >= 3")
-    if args.fullres_window <= 0:
-        parser.error("--fullres_window must be > 0")
     for name in ("fpn_dropout", "reference_dropout", "hourglass_dropout", "drop_path_rate"):
         if not (0 <= getattr(args, name) < 1):
             parser.error(f"--{name} must be in [0, 1)")
@@ -2316,10 +2064,8 @@ def main() -> None:
         view_interval=args.view_interval,
         pose_view_selection=args.pose_view_selection,
         pose_move_threshold=args.pose_move_threshold,
-        num_depths=args.num_depths,
+        coarse_depths=args.coarse_depths,
         linear_depth_candidates=args.linear_depth_candidates,
-        gaussian_depth_candidates=args.gaussian_depth_candidates,
-        use_mask=not args.no_mask,
         fill_invalid=args.fill_invalid,
         pose_channels=False,
     )
@@ -2351,14 +2097,12 @@ def main() -> None:
     else:
         print("  Train frame sampling: all frames")
     coarse_candidate_distribution = (
-        "gaussian-depth"
-        if args.gaussian_depth_candidates
-        else ("linear-depth" if args.linear_depth_candidates else "inverse-depth")
+        "linear-depth" if args.linear_depth_candidates else "inverse-depth"
     )
     print(
         f"  Multi-view: views={args.num_views}, interval={args.view_interval}, "
         f"coarse {coarse_candidate_distribution} "
-        f"planes={args.num_depths} [{DEPTH_MIN:.3f}, {D_MAX:.3f}] m"
+        f"planes={args.coarse_depths} [{DEPTH_MIN:.3f}, {D_MAX:.3f}] m"
     )
     if args.pose_view_selection:
         print(
@@ -2373,23 +2117,18 @@ def main() -> None:
         f"learned window={args.learned_fine_window}\n"
     )
     print(
-        f"  Loss weights: grad={args.lambda_grad:g}, smooth={args.lambda_smooth:g}, "
-        f"mean={args.lambda_mean:g}, normal={args.lambda_normal:g}, "
-        f"loss_mode={args.loss_mode}, l1_loss_only={args.l1_loss_only}, "
-        f"worst={args.lambda_worst_percent:g} "
-        f"(top {100.0 * args.worst_percent:g}%), "
+        f"  Loss weights: grad={args.lambda_grad:g}, normal={args.lambda_normal:g}, "
+        f"l1_loss_only={args.l1_loss_only}, "
         f"confidence={args.lambda_confidence:g} "
         f"(abs_tol={args.confidence_abs_tolerance:g} m, "
         f"rel_tol={args.confidence_rel_tolerance:g}), "
-        f"middle={args.middle_loss_weight:g} enabled={args.middle_supervision}, "
-        f"fine={args.fine_loss_weight:g} enabled={args.fine_supervision}\n"
+        "final-stage supervision only\n"
     )
     min_lr = args.min_lr if args.min_lr is not None else args.lr * 1e-2
     print(
         f"  Optimizer: {args.optimizer}, lr={args.lr:g}, weight_decay={args.weight_decay:g}, "
         f"scheduler={args.lr_scheduler}, min_lr={min_lr:g}, "
-        f"warmup_epochs={args.warmup_epochs}, lr_gamma={args.lr_gamma:g}, "
-        f"freeze_batch_norm={args.freeze_batch_norm}\n"
+        f"warmup_epochs={args.warmup_epochs}, lr_gamma={args.lr_gamma:g}\n"
     )
     print(
         "  Train augmentations: "
@@ -2444,7 +2183,7 @@ def main() -> None:
     cost_channels = (
         args.cost_channels if args.cost_channels > 0 else max(base_channels // 2, 8)
     )
-    model = MultiViewDepthNet(
+    model = ModernMVSNet(
         in_ch=in_ch,
         base=base_channels,
         feature_ch=feature_channels,
@@ -2453,11 +2192,6 @@ def main() -> None:
         fine_window=args.fine_window,
         fine_offset_radius=args.fine_offset_radius,
         learned_fine_window=args.learned_fine_window,
-        masked_warp_aggregation=args.masked_warp_aggregation,
-        cost_volume_ref_features=args.cost_volume_ref_features,
-        single_view_fallback=args.single_view_fallback,
-        feature_encoder=args.feature_encoder,
-        correlation_groups=args.correlation_groups,
         reference_channels=args.reference_channels,
         coarse_cost_channels=args.coarse_cost_channels,
         fine_cost_channels=args.fine_cost_channels,
@@ -2465,34 +2199,18 @@ def main() -> None:
         refiner_max_residual_m=args.refiner_max_residual_m,
         refiner_reference_input=not args.no_refiner_reference_input,
         no_2d_refinement=args.no_2d_refinement,
-        hourglass_levels=args.hourglass_levels,
         coarse_hourglass_levels=args.coarse_hourglass_levels,
         fine_hourglass_levels=args.fine_hourglass_levels,
-        learned_view_weighting=args.learned_view_weighting,
-        two_mode_fine_candidates=args.two_mode_fine_candidates,
-        fine_supervision=args.fine_supervision,
-        fine_loss_weight=args.fine_loss_weight,
-        variance_channels=args.variance_channels,
-        convex_upsampling=args.convex_upsampling,
-        fullres_geometry=args.fullres_geometry,
-        fullres_depths=args.fullres_depths,
-        fullres_window=args.fullres_window,
         fpn_dropout=args.fpn_dropout,
         reference_dropout=args.reference_dropout,
         hourglass_dropout=args.hourglass_dropout,
         drop_path_rate=args.drop_path_rate,
-        cost_volume_type=args.cost_volume_type,
         middle_depths=args.middle_depths,
         middle_window=args.middle_window,
         middle_cost_channels=args.middle_cost_channels,
         middle_hourglass_levels=args.middle_hourglass_levels,
         middle_feature_channels=args.middle_feature_channels,
         fine_feature_channels=args.fine_feature_channels,
-        middle_supervision=args.middle_supervision,
-        middle_loss_weight=args.middle_loss_weight,
-        fullres_fine_volume=args.fullres_fine_volume,
-        h4_coarse_volume=args.h4_coarse_volume,
-        decoder_type=args.decoder_type,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -2500,15 +2218,11 @@ def main() -> None:
     print(
         f"{model_arch}  in_ch={in_ch}  "
         f"base={base_channels}  feature={feature_channels}  "
-        f"feature_encoder={args.feature_encoder}  cost={cost_channels}  "
-        f"coarse_depths={args.num_depths}  middle_depths={args.middle_depths}  "
+        f"feature_encoder=deep_fpn  cost={cost_channels}  "
+        f"coarse_depths={args.coarse_depths}  middle_depths={args.middle_depths}  "
         f"fine_depths={args.fine_depths}  "
-        f"masked_warp_aggregation={args.masked_warp_aggregation}  "
-        f"cost_volume_type={args.cost_volume_type}  "
-        f"cost_volume_ref_features={args.cost_volume_ref_features}  "
-        f"coarse_supervision={args.coarse_supervision}  "
+        f"cost_volume=variance  "
         f"uncertainty={args.uncertainty}  "
-        f"single_view_fallback={args.single_view_fallback}  "
         f"parameters: {n_params:,}"
     )
     if hasattr(model, "capacity_summary"):
@@ -2526,8 +2240,8 @@ def main() -> None:
     writer = SummaryWriter(log_dir=str(tb_log_dir))
     print(f"TensorBoard: {tb_log_dir}")
 
-    viz_train = VizLogger(writer, n_samples=4, tag="viz/train", show_mask=not args.no_mask)
-    viz_val = VizLogger(writer, n_samples=4, tag="viz/val", show_mask=not args.no_mask)
+    viz_train = VizLogger(writer, n_samples=4, tag="viz/train")
+    viz_val = VizLogger(writer, n_samples=4, tag="viz/val")
     activity_train = EventActivityAccuracyLogger(writer, tag="event_activity_accuracy/train")
     activity_val = EventActivityAccuracyLogger(writer, tag="event_activity_accuracy/val")
     error_train = ErrorDistributionSpatialLogger(
@@ -2572,24 +2286,13 @@ def main() -> None:
             error_diag=error_train,
             uncertainty_diag=uncertainty_train,
             lambda_grad=args.lambda_grad,
-            lambda_smooth=args.lambda_smooth,
-            lambda_mean=args.lambda_mean,
             lambda_normal=args.lambda_normal,
             l1_loss_only=args.l1_loss_only,
-            loss_mode=args.loss_mode,
-            coarse_supervision=args.coarse_supervision,
             uncertainty=args.uncertainty,
             lambda_confidence=args.lambda_confidence,
             confidence_abs_tolerance=args.confidence_abs_tolerance,
             confidence_rel_tolerance=args.confidence_rel_tolerance,
-            fine_supervision=args.fine_supervision,
-            fine_loss_weight=args.fine_loss_weight,
-            middle_supervision=args.middle_supervision,
-            middle_loss_weight=args.middle_loss_weight,
-            lambda_worst_percent=args.lambda_worst_percent,
-            worst_percent=args.worst_percent,
             ema_model=ema,
-            freeze_batch_norm=args.freeze_batch_norm,
         )
         validation_model = ema.model if ema is not None else model
         va_loss, va_l1, va_p95, va_worst10 = run_epoch(
@@ -2599,22 +2302,12 @@ def main() -> None:
             error_diag=error_val,
             uncertainty_diag=uncertainty_val,
             lambda_grad=args.lambda_grad,
-            lambda_smooth=args.lambda_smooth,
-            lambda_mean=args.lambda_mean,
             lambda_normal=args.lambda_normal,
             l1_loss_only=args.l1_loss_only,
-            loss_mode=args.loss_mode,
-            coarse_supervision=args.coarse_supervision,
             uncertainty=args.uncertainty,
             lambda_confidence=args.lambda_confidence,
             confidence_abs_tolerance=args.confidence_abs_tolerance,
             confidence_rel_tolerance=args.confidence_rel_tolerance,
-            fine_supervision=args.fine_supervision,
-            fine_loss_weight=args.fine_loss_weight,
-            middle_supervision=args.middle_supervision,
-            middle_loss_weight=args.middle_loss_weight,
-            lambda_worst_percent=args.lambda_worst_percent,
-            worst_percent=args.worst_percent,
         )
         if scheduler is not None and epoch > args.warmup_epochs:
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -2671,11 +2364,7 @@ def main() -> None:
             "base": base_channels,
             "base_channels_arg": args.base_channels,
             "feature_channels": feature_channels,
-            "feature_encoder": args.feature_encoder,
-            "decoder_type": args.decoder_type,
             "cost_channels": cost_channels,
-            "correlation_groups": args.correlation_groups,
-            "cost_volume_type": args.cost_volume_type,
             "reference_channels": args.reference_channels,
             "coarse_cost_channels": args.coarse_cost_channels,
             "middle_cost_channels": args.middle_cost_channels,
@@ -2684,51 +2373,31 @@ def main() -> None:
             "refiner_max_residual_m": args.refiner_max_residual_m,
             "no_refiner_reference_input": args.no_refiner_reference_input,
             "no_2d_refinement": args.no_2d_refinement,
-            "hourglass_levels": args.hourglass_levels,
             "coarse_hourglass_levels": args.coarse_hourglass_levels,
             "middle_hourglass_levels": args.middle_hourglass_levels,
             "fine_hourglass_levels": args.fine_hourglass_levels,
-            "learned_view_weighting": args.learned_view_weighting,
-            "two_mode_fine_candidates": args.two_mode_fine_candidates,
-            "fine_supervision": args.fine_supervision,
-            "fine_loss_weight": args.fine_loss_weight,
-            "middle_supervision": args.middle_supervision,
-            "middle_loss_weight": args.middle_loss_weight,
             "middle_feature_channels": args.middle_feature_channels,
             "fine_feature_channels": args.fine_feature_channels,
-            "fullres_fine_volume": args.fullres_fine_volume,
-            "h4_coarse_volume": args.h4_coarse_volume,
-            "variance_channels": args.variance_channels,
-            "convex_upsampling": args.convex_upsampling,
-            "fullres_geometry": args.fullres_geometry,
-            "fullres_depths": args.fullres_depths,
-            "fullres_window": args.fullres_window,
             "fpn_dropout": args.fpn_dropout,
             "reference_dropout": args.reference_dropout,
             "hourglass_dropout": args.hourglass_dropout,
             "drop_path_rate": args.drop_path_rate,
             "ema_decay": args.ema_decay,
             "early_stopping_patience": args.early_stopping_patience,
-            "freeze_batch_norm": args.freeze_batch_norm,
             "in_ch": in_ch,
             "num_views": args.num_views,
             "view_interval": args.view_interval,
             "pose_view_selection": args.pose_view_selection,
             "pose_move_threshold": args.pose_move_threshold,
-            "num_depths": args.num_depths,
+            "coarse_depths": args.coarse_depths,
             "linear_depth_candidates": args.linear_depth_candidates,
-            "gaussian_depth_candidates": args.gaussian_depth_candidates,
             "middle_depths": args.middle_depths,
             "middle_window": args.middle_window,
             "fine_depths": args.fine_depths,
             "fine_window": args.fine_window,
             "fine_offset_radius": args.fine_offset_radius,
             "learned_fine_window": args.learned_fine_window,
-            "masked_warp_aggregation": args.masked_warp_aggregation,
-            "cost_volume_ref_features": args.cost_volume_ref_features,
-            "coarse_supervision": args.coarse_supervision,
             "uncertainty": args.uncertainty,
-            "single_view_fallback": args.single_view_fallback,
             "optimizer": args.optimizer,
             "lr": args.lr,
             "weight_decay": args.weight_decay,
@@ -2740,14 +2409,11 @@ def main() -> None:
             "lr_gamma": args.lr_gamma,
             "lr_plateau_patience": args.lr_plateau_patience,
             "lambda_grad": args.lambda_grad,
-            "lambda_smooth": args.lambda_smooth,
-            "lambda_mean": args.lambda_mean,
             "lambda_normal": args.lambda_normal,
             "lambda_confidence": args.lambda_confidence,
             "confidence_abs_tolerance": args.confidence_abs_tolerance,
             "confidence_rel_tolerance": args.confidence_rel_tolerance,
             "l1_loss_only": args.l1_loss_only,
-            "loss_mode": args.loss_mode,
             "augmentation": {
                 "enabled": train_aug.enabled,
                 "source_view_dropout": train_aug.source_view_dropout,
@@ -2764,8 +2430,6 @@ def main() -> None:
                 "occlusion_max_rects": train_aug.occlusion_max_rects,
                 "occlusion_frac_range": train_aug.occlusion_frac_range,
             },
-            "lambda_worst_percent": args.lambda_worst_percent,
-            "worst_percent": args.worst_percent,
             "depth_min": DEPTH_MIN,
             "depth_max": D_MAX,
         }

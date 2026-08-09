@@ -9,8 +9,8 @@ Per-recording workflow:
   4. Open event-camera file logging in sync with the "start" signal.
   5. Capture RealSense depth + colour frames; collect robot poses from ZMQ PUB/SUB.
   6. Stop when the agent publishes an "agent_complete" event.
-  7. Align event frames to depth timestamps via elapsed-time, interpolate poses per
-     frame, write HDF5.
+  7. Align event frames to depth frames using hardware-trigger timestamps,
+     interpolate poses per frame, and write HDF5.
   8. Send "done" to my_main.py, then loop for the next object.
 
 Run this script first, then start my_main.py with --sync-recording flag.
@@ -38,7 +38,6 @@ from config import (
     BIAS_DIFF_ON, BIAS_DIFF_OFF, BIAS_FO, BIAS_HPF, BIAS_REFR,
     ZMQ_SYNC_ADDR, ZMQ_POSE_ADDR, DATA_ROOT,
     POSE_TIME_OFFSET_MS,
-    DEPTH_EVENT_ALIGN_OFFSET_FRAMES,
     DEPTH_VIZ_MIN, DEPTH_VIZ_MAX,
 )
 
@@ -294,36 +293,22 @@ def event_drain_process(
     ready_event,
     event0_path: str,
     flush_seconds: float = 0.5,
-    clock_sync_queue: Optional[Queue] = None,
-    start_logging_event=None,
     logging_start_queue: Optional[Queue] = None,
-    hw_sync: bool = False,
 ) -> None:
     """
     Subprocess entry point for single event camera acquisition.
 
-    Normal-mode lifecycle:
-      1. Open device, apply biases.
-      2. Start raw streaming; signal ready_event; push device_open_ns to
-         clock_sync_queue so the main process can map event µs → system ns.
-      3. Drain events without storing until start_logging_event is set.
-      4. Call log_raw_data(); push the precise start timestamp to
-         logging_start_queue for downstream clock alignment.
-      5. Drain events until stop_acquire_event is set (robot finished).
-      6. Flush for flush_seconds; stop.
-
-    HW-sync mode lifecycle (hw_sync=True):
-      1. Open device, apply biases, enable trigger input channel MAIN.
-      2. Call log_raw_data() immediately; alignment is done via hardware
+    Lifecycle:
+      1. Open the device, apply biases, and enable trigger input channel MAIN.
+      2. Start raw logging immediately; alignment is done via hardware
          trigger timestamps so the preamble before the first trigger is
          automatically discarded.
-      3. Signal ready_event; push device_open_ns to clock_sync_queue.
+      3. Signal ready_event.
       4. Drain events until stop_acquire_event is set.
       5. Flush for flush_seconds; stop.
     """
     devices = DeviceDiscovery.list()
     device0 = DeviceDiscovery.open(devices[0])
-    device_open_ns = time.time_ns()
 
     biases = device0.get_i_ll_biases()
     biases.set("bias_diff_on", BIAS_DIFF_ON)
@@ -332,14 +317,16 @@ def event_drain_process(
     biases.set("bias_hpf", BIAS_HPF)
     biases.set("bias_refr", BIAS_REFR)
 
-    if hw_sync:
-        try:
-            from metavision_hal import I_TriggerIn
-            trig_in = device0.get_i_trigger_in()
-            trig_in.enable(I_TriggerIn.Channel.MAIN)
-            print("[EventDrain] HW trigger input channel MAIN enabled")
-        except Exception as e:
-            print(f"[EventDrain] WARNING: could not enable HW trigger input: {e}")
+    try:
+        from metavision_hal import I_TriggerIn
+        trig_in = device0.get_i_trigger_in()
+        trig_in.enable(I_TriggerIn.Channel.MAIN)
+        print("[EventDrain] HW trigger input channel MAIN enabled")
+    except Exception as e:
+        print(f"[EventDrain] ERROR: could not enable hardware trigger input: {e}")
+        ready_event.set()
+        done_event.set()
+        return
 
     raw0 = device0.get_i_events_stream()
     raw0.start()
@@ -348,48 +335,19 @@ def event_drain_process(
 
     logging_active = False
     try:
-        if hw_sync:
-            # Start logging immediately — pre-trigger frames are discarded
-            # automatically during trigger-based alignment.
-            log_start_ns = time.time_ns()
-            raw0.log_raw_data(event0_path)
-            logging_active = True
-            if logging_start_queue is not None:
-                logging_start_queue.put(log_start_ns)
-            if clock_sync_queue is not None:
-                clock_sync_queue.put(device_open_ns)
-            ready_event.set()
+        log_start_ns = time.time_ns()
+        raw0.log_raw_data(event0_path)
+        logging_active = True
+        if logging_start_queue is not None:
+            logging_start_queue.put(log_start_ns)
+        ready_event.set()
 
-            while not stop_acquire_event.is_set():
-                next(it0)
+        while not stop_acquire_event.is_set():
+            next(it0)
 
-            flush_start = time.time()
-            while time.time() - flush_start < flush_seconds:
-                next(it0)
-
-        else:
-            ready_event.set()
-            if clock_sync_queue is not None:
-                clock_sync_queue.put(device_open_ns)
-
-            # Drain events without writing until recording starts
-            if start_logging_event is not None:
-                while not start_logging_event.is_set() and not stop_acquire_event.is_set():
-                    next(it0)
-
-            if not stop_acquire_event.is_set():
-                log_start_ns = time.time_ns()
-                raw0.log_raw_data(event0_path)
-                logging_active = True
-                if logging_start_queue is not None:
-                    logging_start_queue.put(log_start_ns)
-
-                while not stop_acquire_event.is_set():
-                    next(it0)
-
-                flush_start = time.time()
-                while time.time() - flush_start < flush_seconds:
-                    next(it0)
+        flush_start = time.time()
+        while time.time() - flush_start < flush_seconds:
+            next(it0)
 
     finally:
         if logging_active:
@@ -455,86 +413,6 @@ def generate_event_video(
     print(f"[EventH5] cam0: {idx} frames decoded")
 
 
-def align_event_frames_to_depth(
-    hdf5_dir: Path,
-    depth_times_ns: np.ndarray,
-    event_logging_start_ns: int,
-    depth_frame_offset: int = 0,
-) -> None:
-    """
-    Align event camera HDF5 frames to depth frame timestamps via elapsed time.
-
-    Both event and depth recordings start at approximately the same system
-    time (event_logging_start_ns). We align by elapsed time from that common
-    origin so the result is independent of whether the raw-file timestamps are
-    absolute camera-internal values or rebased to zero.
-
-    The unaligned events_cam0.h5 (M frames) is replaced with an aligned
-    version (N frames) where N = len(depth_times_ns), so that
-    events[i] corresponds to depth[i] and poses[i].
-    """
-    N = len(depth_times_ns)
-    if N == 0:
-        return
-
-    h5_path = hdf5_dir / "events_cam0.h5"
-    if not h5_path.exists():
-        print(f"[Align] events_cam0.h5 not found, skipping")
-        return
-
-    with h5py.File(h5_path, "r") as f:
-        ev_frames = f["events/frames"][:]
-        ev_t_end_us = f["events/t_ev_end_us"][:]
-        ev_t_start_us = f["events/t_ev_start_us"][:]
-        attrs = dict(f["events"].attrs)
-
-    M = len(ev_t_end_us)
-    if M == 0:
-        print(f"[Align] cam0: no event frames, skipping")
-        return
-
-    ev_t_center_us = (ev_t_start_us.astype(np.int64) + ev_t_end_us.astype(np.int64)) // 2
-    ev_elapsed_ns = (ev_t_center_us - ev_t_center_us[0]) * 1000
-    depth_elapsed_ns = (depth_times_ns - event_logging_start_ns).astype(np.int64)
-
-    if depth_frame_offset != 0:
-        frame_duration_ns = int(round(1e9 / FPS))
-        depth_elapsed_ns = depth_elapsed_ns - depth_frame_offset * frame_duration_ns
-        print(f"[Align] cam0: applying depth_frame_offset={depth_frame_offset:+d} "
-              f"({-depth_frame_offset * frame_duration_ns / 1e6:+.1f} ms shift on depth_elapsed)")
-
-    indices = np.searchsorted(ev_elapsed_ns, depth_elapsed_ns, side="left")
-    indices = np.clip(indices, 0, M - 1)
-
-    left = np.clip(indices - 1, 0, M - 1)
-    d_right = np.abs(ev_elapsed_ns[indices] - depth_elapsed_ns)
-    d_left = np.abs(ev_elapsed_ns[left] - depth_elapsed_ns)
-    use_left = d_left < d_right
-    indices[use_left] = left[use_left]
-
-    offset_ms = (ev_elapsed_ns[indices] - depth_elapsed_ns).astype(np.float64) / 1e6
-
-    aligned_frames = ev_frames[indices]
-    aligned_t_start = ev_t_start_us[indices]
-    aligned_t_end = ev_t_end_us[indices]
-
-    with h5py.File(h5_path, "w") as f:
-        grp = f.create_group("events")
-        grp.create_dataset("frames", data=aligned_frames)
-        grp.create_dataset("t_ev_start_us", data=aligned_t_start)
-        grp.create_dataset("t_ev_end_us", data=aligned_t_end)
-        grp.create_dataset("alignment_offset_ms", data=offset_ms)
-        for k, v in attrs.items():
-            grp.attrs[k] = v
-
-    print(
-        f"[Align] cam0: {M} → {N} frames, "
-        f"median signed offset {np.median(offset_ms):.1f} ms, "
-        f"mean {np.mean(offset_ms):.1f} ms, "
-        f"max abs {np.max(np.abs(offset_ms)):.1f} ms"
-    )
-
-
 def extract_hw_triggers(raw_file: Path) -> np.ndarray:
     """
     Extract rising-edge hardware trigger timestamps (µs) from a .raw event file.
@@ -598,21 +476,18 @@ def align_event_frames_to_depth_hw(
     frame per depth frame).  The trigger timestamps and per-frame alignment
     offsets (in µs) are stored alongside the frames.
     """
-    N = min(len(trigger_times_us), n_depth_frames)
-    if N == 0:
-        print("[AlignHW] No trigger-to-frame pairs available, skipping alignment")
-        return
-
+    if n_depth_frames == 0:
+        raise RuntimeError("Cannot align events: no depth frames were recorded")
     if len(trigger_times_us) != n_depth_frames:
-        print(
-            f"[AlignHW] WARNING: {len(trigger_times_us)} triggers vs "
-            f"{n_depth_frames} depth frames — using first {N} pairs"
+        raise RuntimeError(
+            f"Hardware-trigger count mismatch: {len(trigger_times_us)} triggers "
+            f"for {n_depth_frames} depth frames"
         )
+    N = n_depth_frames
 
     h5_path = hdf5_dir / "events_cam0.h5"
     if not h5_path.exists():
-        print("[AlignHW] events_cam0.h5 not found, skipping")
-        return
+        raise FileNotFoundError(f"Event HDF5 not found: {h5_path}")
 
     with h5py.File(h5_path, "r") as f:
         ev_frames = f["events/frames"][:]
@@ -622,8 +497,7 @@ def align_event_frames_to_depth_hw(
 
     M = len(ev_t_end_us)
     if M == 0:
-        print("[AlignHW] No event frames found, skipping")
-        return
+        raise RuntimeError("Cannot align events: decoded event HDF5 has no frames")
 
     trig_us = trigger_times_us[:N]
     ev_t_center_us = (ev_t_start_us.astype(np.int64) + ev_t_end_us.astype(np.int64)) // 2
@@ -697,17 +571,14 @@ def record_single_object(
     sync_client: "ZMQSyncClient",
     data_root: Path = DATA_ROOT,
     transport_delay_ns: int = 0,
-    hw_sync: bool = False,
     depth_sensor=None,
 ) -> bool:
     """
     Record a single object. Returns True if successful, False if should abort.
 
-    With hw_sync=True the event camera starts logging before the RealSense
-    recording loop begins.  The RealSense GPIO trigger output is enabled for
-    the duration of the loop so that each captured depth frame fires an
-    EventExtTrigger pulse into the event stream, enabling sample-accurate
-    frame alignment via align_event_frames_to_depth_hw().
+    The event camera starts logging before the RealSense recording loop. The
+    RealSense GPIO trigger output is enabled for the duration of the loop so
+    every captured depth frame produces an EventExtTrigger pulse.
     """
     object_dir = data_root / object_name
     object_video_dir = object_dir / "videos"
@@ -733,28 +604,22 @@ def record_single_object(
     stop_acquire_event = MPEvent()
     event_done_event = MPEvent()
     event_ready_event = MPEvent()
-    start_logging_event = MPEvent()
-    clock_sync_queue = Queue()
     logging_start_queue = Queue()
 
     event_proc = Process(
         target=event_drain_process,
         args=(stop_acquire_event, event_done_event, event_ready_event, str(event0_raw_file)),
-        kwargs={
-            "clock_sync_queue": clock_sync_queue,
-            "start_logging_event": start_logging_event,
-            "logging_start_queue": logging_start_queue,
-            "hw_sync": hw_sync,
-        },
+        kwargs={"logging_start_queue": logging_start_queue},
     )
     event_proc.start()
 
     print("[Recording] Waiting for event camera...")
     event_ready_event.wait()
-    try:
-        event_device_open_ns = clock_sync_queue.get(timeout=5.0)
-    except Exception:
-        event_device_open_ns = 0
+    if event_done_event.is_set() or not event_proc.is_alive():
+        event_proc.join()
+        print("[Recording] ERROR: event camera hardware-trigger initialization failed")
+        return False
+    event_logging_start_ns = logging_start_queue.get(timeout=5.0)
     print("[Recording] Event camera ready")
 
     # Reset pose receiver and start it before the sync handshake to avoid
@@ -771,33 +636,23 @@ def record_single_object(
         event_proc.join()
         return False
 
-    if hw_sync:
-        # Flush any RS frames buffered during the ZMQ handshake so the first
-        # frame captured in the recording loop is the one that fires the first
-        # trigger pulse into the event stream.
-        if depth_sensor is not None and depth_sensor.supports(rs.option.output_trigger_enabled):
-            depth_sensor.set_option(rs.option.output_trigger_enabled, 0)
-        print("[HWSync] Flushing stale RS frames before enabling triggers...")
-        flushed = 0
-        flush_deadline = time.time() + 0.5  # drain at most ~0.5 s of buffered frames
-        while time.time() < flush_deadline:
-            try:
-                pipeline.wait_for_frames(timeout_ms=50)
-                flushed += 1
-            except RuntimeError:
-                break
-        print(f"[HWSync] Flushed {flushed} stale RS frames")
-        if depth_sensor is not None and depth_sensor.supports(rs.option.output_trigger_enabled):
-            depth_sensor.set_option(rs.option.output_trigger_enabled, 1)
-            print("[HWSync] RS trigger output enabled — recording loop starting")
-        else:
-            print("[HWSync] WARNING: depth_sensor does not support output_trigger_enabled")
-        event_logging_start_ns = time.time_ns()
-    else:
-        # Normal mode: signal event camera to start logging
-        start_logging_event.set()
-        event_logging_start_ns = time.time_ns()
-        print("[Recording] Event camera: started logging")
+    # Drain frames buffered during the handshake so the first retained frame
+    # produces the first trigger pulse used for alignment.
+    if depth_sensor is None or not depth_sensor.supports(rs.option.output_trigger_enabled):
+        raise RuntimeError("RealSense depth sensor does not support hardware trigger output")
+    depth_sensor.set_option(rs.option.output_trigger_enabled, 0)
+    print("[HWSync] Flushing stale RS frames before enabling triggers...")
+    flushed = 0
+    flush_deadline = time.time() + 0.5
+    while time.time() < flush_deadline:
+        try:
+            pipeline.wait_for_frames(timeout_ms=50)
+            flushed += 1
+        except RuntimeError:
+            break
+    print(f"[HWSync] Flushed {flushed} stale RS frames")
+    depth_sensor.set_option(rs.option.output_trigger_enabled, 1)
+    print("[HWSync] RS trigger output enabled — recording loop starting")
 
     # Initialize video writers and HDF5
     rs_video = cv2.VideoWriter(
@@ -915,22 +770,15 @@ def record_single_object(
             accumulated_poses.extend(pose_receiver.get_all_poses())
 
     finally:
-        if hw_sync and depth_sensor is not None:
-            if depth_sensor.supports(rs.option.output_trigger_enabled):
-                try:
-                    depth_sensor.set_option(rs.option.output_trigger_enabled, 0)
-                    print("[HWSync] RS trigger output disabled")
-                except Exception as e:
-                    print(f"[HWSync] Warning: could not disable trigger output: {e}")
+        if depth_sensor is not None and depth_sensor.supports(rs.option.output_trigger_enabled):
+            try:
+                depth_sensor.set_option(rs.option.output_trigger_enabled, 0)
+                print("[HWSync] RS trigger output disabled")
+            except Exception as e:
+                print(f"[HWSync] Warning: could not disable trigger output: {e}")
         stop_acquire_event.set()
         event_done_event.wait()
         event_proc.join()
-
-        # Refine event_logging_start_ns using the exact time captured in the subprocess
-        try:
-            event_logging_start_ns = logging_start_queue.get_nowait()
-        except Exception:
-            pass
 
         pose_receiver.stop()
         accumulated_poses.extend(pose_receiver.get_all_poses())
@@ -983,14 +831,15 @@ def record_single_object(
             mf.attrs["recording_start_ns"] = recording_start_ns
             mf.attrs["recording_end_ns"] = recording_end_ns
             mf.attrs["fps"] = FPS
-            mf.attrs["event_device_open_ns"] = event_device_open_ns
+            # Kept for the temporal-check diagnostic; event/depth alignment itself
+            # uses only hardware-trigger timestamps.
             mf.attrs["event_logging_start_ns"] = event_logging_start_ns
             mf.attrs["rs_timestamp_domain"] = rs_timestamp_domain
             mf.attrs["depth_frames_recorded"] = rs_idx
             mf.attrs["raw_poses_received"] = raw_poses_received
             mf.attrs["transport_delay_ns"] = transport_delay_ns
             mf.attrs["pose_time_offset_ms"] = float(POSE_TIME_OFFSET_MS)
-            mf.attrs["hw_sync"] = hw_sync
+            mf.attrs["alignment_mode"] = "hw_trigger"
 
         sync_client.send_done()
 
@@ -1002,17 +851,10 @@ def record_single_object(
     print("[Recording] Decoding raw event data to HDF5...")
     generate_event_video(object_raw_dir, object_hdf5_dir)
 
-    if hw_sync:
-        print("[Recording] Extracting hardware trigger timestamps from raw event file...")
-        triggers_us = extract_hw_triggers(event0_raw_file)
-        print("[Recording] Aligning event frames to depth frames using hardware triggers...")
-        align_event_frames_to_depth_hw(object_hdf5_dir, triggers_us, rs_idx)
-    else:
-        print("[Recording] Aligning event frames to depth timestamps (using global timestamps)...")
-        align_event_frames_to_depth(
-            object_hdf5_dir, frame_times_ns, event_logging_start_ns,
-            depth_frame_offset=DEPTH_EVENT_ALIGN_OFFSET_FRAMES,
-        )
+    print("[Recording] Extracting hardware trigger timestamps from raw event file...")
+    triggers_us = extract_hw_triggers(event0_raw_file)
+    print("[Recording] Aligning event frames to depth frames using hardware triggers...")
+    align_event_frames_to_depth_hw(object_hdf5_dir, triggers_us, rs_idx)
 
     print("[Recording] Regenerating event video from aligned frames...")
     write_event_video_from_h5(object_hdf5_dir, object_video_dir)
@@ -1023,7 +865,6 @@ def record_single_object(
 def main(
     zmq_sync_addr: str = ZMQ_SYNC_ADDR,
     zmq_pose_addr: str = ZMQ_POSE_ADDR,
-    hw_sync: bool = False,
 ) -> None:
     """
     Main recording loop with multi-object support.
@@ -1034,9 +875,8 @@ def main(
     4. Send "done", ask for next object name
     5. Repeat until user quits
 
-    With hw_sync=True the event camera's trigger input is enabled and the
-    RealSense GPIO trigger output drives per-frame alignment via hardware
-    EventExtTrigger pulses.
+    The event-camera trigger input and RealSense GPIO trigger output are always
+    enabled; per-frame event/depth alignment uses EventExtTrigger pulses.
     """
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -1121,7 +961,6 @@ def main(
                 sync_client=sync_client,
                 data_root=DATA_ROOT,
                 transport_delay_ns=transport_delay_ns,
-                hw_sync=hw_sync,
                 depth_sensor=depth_sensor,
             )
 
@@ -1175,22 +1014,9 @@ if __name__ == "__main__":
         default=ZMQ_POSE_ADDR,
         help=f"ZMQ pose subscription address (default: {ZMQ_POSE_ADDR})"
     )
-    parser.add_argument(
-        "--hw-sync",
-        action="store_true",
-        default=False,
-        help=(
-            "Use RealSense hardware trigger output (output_trigger_enabled) for "
-            "event camera frame alignment. The event camera starts logging first, "
-            "then the RealSense sends a GPIO pulse per depth frame that is recorded "
-            "as an EventExtTrigger in the .raw file."
-        ),
-    )
-
     args = parser.parse_args()
 
     main(
         zmq_sync_addr=args.zmq_sync_addr,
         zmq_pose_addr=args.zmq_pose_addr,
-        hw_sync=args.hw_sync,
     )

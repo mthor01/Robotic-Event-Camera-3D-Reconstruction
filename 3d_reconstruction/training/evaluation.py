@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate U-Net, basic, legacy, and modern MVS checkpoints.
+"""Evaluate U-Net and multiview checkpoints.
 
 Example:
     python3 evaluation.py \
@@ -34,7 +34,7 @@ from multiview import (
     D_MAX,
     NUM_BINS,
     MultiViewAugConfig,
-    MultiViewDepthNet,
+    ModernMVSNet,
     MultiViewTableDataset,
     _find_sequences,
     _load_event_calibration,
@@ -45,6 +45,7 @@ from config import (
     SPATIAL_TARGET_Y,
     SPATIAL_TARGET_Z,
 )
+from spatial_mask import depth_cube_mask, depth_cube_masks_for_bottom_offsets
 
 
 DEPTH_METRIC_NAMES = (
@@ -280,75 +281,6 @@ class FramePrediction:
     K: np.ndarray
 
 
-def _cube_depth_mask(
-    depth_m: np.ndarray,
-    T_cam_from_world: np.ndarray,
-    K: np.ndarray,
-    cube_center: np.ndarray,
-    cube_half_side: float,
-) -> np.ndarray:
-    """Return pixels whose measured 3-D point lies inside the world-frame cube."""
-    depth = np.asarray(depth_m, dtype=np.float64)
-    height, width = depth.shape
-    valid = np.isfinite(depth) & (depth > 0.0)
-    ys, xs = np.nonzero(valid)
-    if xs.size == 0:
-        return np.zeros((height, width), dtype=bool)
-
-    z = depth[ys, xs]
-    x = (xs.astype(np.float64) - K[0, 2]) * z / K[0, 0]
-    y = (ys.astype(np.float64) - K[1, 2]) * z / K[1, 1]
-    points_cam = np.stack([x, y, z, np.ones_like(z)], axis=0)
-    T_world_from_cam = np.linalg.inv(T_cam_from_world.astype(np.float64))
-    points_world = (T_world_from_cam @ points_cam)[:3].T
-    inside = np.all(
-        np.abs(points_world - cube_center[None, :]) <= cube_half_side,
-        axis=1,
-    )
-
-    mask = np.zeros((height, width), dtype=bool)
-    mask[ys[inside], xs[inside]] = True
-    return mask
-
-
-def _cube_depth_masks_for_z_offsets(
-    depth_m: np.ndarray,
-    T_cam_from_world: np.ndarray,
-    K: np.ndarray,
-    target_x: float,
-    target_y: float,
-    cube_half_side: float,
-    z_offsets_m: np.ndarray,
-) -> list[np.ndarray]:
-    """Recompute hard spatial masks with each offset as the cube-bottom Z."""
-    depth = np.asarray(depth_m, dtype=np.float64)
-    height, width = depth.shape
-    measured = np.isfinite(depth) & (depth > 0.0)
-    ys, xs = np.nonzero(measured)
-    masks = [np.zeros((height, width), dtype=bool) for _ in z_offsets_m]
-    if xs.size == 0:
-        return masks
-
-    z = depth[ys, xs]
-    x = (xs.astype(np.float64) - K[0, 2]) * z / K[0, 0]
-    y = (ys.astype(np.float64) - K[1, 2]) * z / K[1, 1]
-    points_cam = np.stack([x, y, z, np.ones_like(z)], axis=0)
-    points_world = (
-        np.linalg.inv(T_cam_from_world.astype(np.float64)) @ points_cam
-    )[:3].T
-    inside_xy = (
-        (np.abs(points_world[:, 0] - target_x) <= cube_half_side)
-        & (np.abs(points_world[:, 1] - target_y) <= cube_half_side)
-    )
-    for mask, z_offset_m in zip(masks, z_offsets_m):
-        center_z = float(z_offset_m + cube_half_side)
-        inside = inside_xy & (
-            np.abs(points_world[:, 2] - center_z) <= cube_half_side
-        )
-        mask[ys[inside], xs[inside]] = True
-    return masks
-
-
 def _activity_error_summary(
     rows: list[dict[str, Any]],
     n_bins: int = 8,
@@ -531,20 +463,12 @@ def _build_model(
     device: torch.device,
 ) -> torch.nn.Module:
     base = int(_required_metadata(metadata, "base"))
-    model_arch = str(metadata.get("model_arch", "MultiViewDepthNet"))
-    model_cls = MultiViewDepthNet
+    model_arch = str(metadata.get("model_arch", "ModernMVSNet"))
+    model_cls = ModernMVSNet
     if model_arch == "ModernMVSNet":
-        from modern_multiview import ModernMVSNet, upgrade_legacy_modern_state_dict
-
-        model_cls = ModernMVSNet
-        state = upgrade_legacy_modern_state_dict(state)
-    elif model_arch == "BasicMVSNet":
-        from basic_multiview import BasicMVSNet
-
-        model_cls = BasicMVSNet
+        pass
     elif model_arch in ("UNet", "UNet+uncertainty", "RecurrentUNet") or "predict_uncertainty" in metadata:
-        from train_unet import UNet
-        from train_unet_table import RecurrentUNet, UncertaintyUNet
+        from train_unet import RecurrentUNet, UNet, UncertaintyUNet
 
         predicts_uncertainty = bool(metadata.get("predict_uncertainty", False))
         recurrent = bool(metadata.get("recurrent", False)) or model_arch == "RecurrentUNet"
@@ -584,7 +508,7 @@ def _build_model(
                 return output[0] if isinstance(output, tuple) else output
 
         return EarlyFusionUNetEvaluationAdapter(unet).to(device).eval()
-    elif model_arch not in ("MultiViewDepthNet", "legacy_multiview"):
+    else:
         raise ValueError(f"Unsupported multiview checkpoint architecture: {model_arch}")
 
     model = model_cls(
@@ -596,18 +520,6 @@ def _build_model(
         fine_window=float(_required_metadata(metadata, "fine_window", 0.08)),
         fine_offset_radius=float(_required_metadata(metadata, "fine_offset_radius", 2.0)),
         learned_fine_window=bool(_required_metadata(metadata, "learned_fine_window", False)),
-        masked_warp_aggregation=bool(
-            _required_metadata(metadata, "masked_warp_aggregation", False)
-        ),
-        cost_volume_ref_features=bool(
-            _required_metadata(metadata, "cost_volume_ref_features", False)
-        ),
-        single_view_fallback=bool(
-            _required_metadata(metadata, "single_view_fallback", False)
-        ),
-        feature_encoder=str(_required_metadata(metadata, "feature_encoder", "cnn")),
-        decoder_type=str(metadata.get("decoder_type", "auto")),
-        correlation_groups=int(metadata.get("correlation_groups", 0)),
         reference_channels=int(metadata.get("reference_channels", 0)),
         coarse_cost_channels=int(metadata.get("coarse_cost_channels", 0)),
         fine_cost_channels=int(metadata.get("fine_cost_channels", 0)),
@@ -617,33 +529,18 @@ def _build_model(
             metadata.get("no_refiner_reference_input", False)
         ),
         no_2d_refinement=bool(metadata.get("no_2d_refinement", False)),
-        hourglass_levels=int(metadata.get("hourglass_levels", 2)),
-        coarse_hourglass_levels=int(metadata.get("coarse_hourglass_levels", 0)),
-        fine_hourglass_levels=int(metadata.get("fine_hourglass_levels", 0)),
-        learned_view_weighting=bool(metadata.get("learned_view_weighting", False)),
-        two_mode_fine_candidates=bool(metadata.get("two_mode_fine_candidates", False)),
-        fine_supervision=bool(metadata.get("fine_supervision", False)),
-        fine_loss_weight=float(metadata.get("fine_loss_weight", 0.3)),
-        variance_channels=int(metadata.get("variance_channels", 0)),
-        convex_upsampling=bool(metadata.get("convex_upsampling", False)),
-        fullres_geometry=bool(metadata.get("fullres_geometry", False)),
-        fullres_depths=int(metadata.get("fullres_depths", 3)),
-        fullres_window=float(metadata.get("fullres_window", 0.01)),
+        coarse_hourglass_levels=int(metadata.get("coarse_hourglass_levels", 2)),
+        fine_hourglass_levels=int(metadata.get("fine_hourglass_levels", 2)),
         fpn_dropout=float(metadata.get("fpn_dropout", 0.0)),
         reference_dropout=float(metadata.get("reference_dropout", 0.0)),
         hourglass_dropout=float(metadata.get("hourglass_dropout", 0.0)),
         drop_path_rate=float(metadata.get("drop_path_rate", 0.0)),
-        cost_volume_type=str(metadata.get("cost_volume_type", "correlation")),
         middle_depths=int(metadata.get("middle_depths", 8)),
         middle_window=float(metadata.get("middle_window", 0.12)),
         middle_cost_channels=int(metadata.get("middle_cost_channels", 0)),
-        middle_hourglass_levels=int(metadata.get("middle_hourglass_levels", 0)),
+        middle_hourglass_levels=int(metadata.get("middle_hourglass_levels", 2)),
         middle_feature_channels=int(metadata.get("middle_feature_channels", 0)),
         fine_feature_channels=int(metadata.get("fine_feature_channels", 0)),
-        middle_supervision=bool(metadata.get("middle_supervision", False)),
-        middle_loss_weight=float(metadata.get("middle_loss_weight", 0.3)),
-        fullres_fine_volume=bool(metadata.get("fullres_fine_volume", False)),
-        h4_coarse_volume=bool(metadata.get("h4_coarse_volume", False)),
     )
     incompatible = model.load_state_dict(state, strict=False)
     missing_non_confidence = [
@@ -2198,7 +2095,7 @@ def _evaluate_checkpoint(
     state, metadata = _checkpoint_state(checkpoint)
     model = _build_model(metadata, state, device)
 
-    model_arch = str(metadata.get("model_arch", "MultiViewDepthNet"))
+    model_arch = str(metadata.get("model_arch", "ModernMVSNet"))
     unet_model = (
         model_arch in ("UNet", "UNet+uncertainty", "RecurrentUNet")
         or "predict_uncertainty" in metadata
@@ -2214,12 +2111,9 @@ def _evaluate_checkpoint(
     pose_move_threshold = float(
         _required_metadata(metadata, "pose_move_threshold", 0.01)
     )
-    num_depths = int(_required_metadata(metadata, "num_depths", 32))
+    coarse_depths = int(_required_metadata(metadata, "coarse_depths", 32))
     linear_depth_candidates = bool(
         _required_metadata(metadata, "linear_depth_candidates", False)
-    )
-    gaussian_depth_candidates = bool(
-        _required_metadata(metadata, "gaussian_depth_candidates", False)
     )
 
     evaluation_root = args.data_dir
@@ -2297,10 +2191,8 @@ def _evaluate_checkpoint(
             view_interval=view_interval,
             pose_view_selection=pose_view_selection,
             pose_move_threshold=pose_move_threshold,
-            num_depths=num_depths,
+            coarse_depths=coarse_depths,
             linear_depth_candidates=linear_depth_candidates,
-            gaussian_depth_candidates=gaussian_depth_candidates,
-            use_mask=not args.no_mask,
             fill_invalid=args.fill_invalid,
             pose_channels=pose_channels,
             recurrent=recurrent_model,
@@ -2419,7 +2311,7 @@ def _evaluate_checkpoint(
                     gt_np = gt_t.numpy()
                     valid_np = valid_t.numpy()
 
-                    computed_offset_masks = _cube_depth_masks_for_z_offsets(
+                    computed_offset_masks = depth_cube_masks_for_bottom_offsets(
                         gt_np,
                         cam_batch[index_in_batch],
                         K_batch[index_in_batch],
@@ -2462,7 +2354,7 @@ def _evaluate_checkpoint(
                     frame_worst10_mae = _worst_fraction_l1(
                         absolute_error[valid_np]
                     )
-                    cube_mask = _cube_depth_mask(
+                    cube_mask = depth_cube_mask(
                         gt_np,
                         cam_batch[index_in_batch],
                         K_batch[index_in_batch],
@@ -2476,11 +2368,8 @@ def _evaluate_checkpoint(
                     )
                     event_activity_image = np.abs(target_events).sum(axis=0)
                     cube_event_activity = float(event_activity_image[cube_mask].sum())
-                    # Do not use valid_np here: when spatial masking is enabled,
-                    # valid_np already contains the precomputed inside-cube mask.
-                    # Intersecting it with ~cube_mask therefore measures only
-                    # disagreement around the cube boundary, not outside-cube
-                    # activity. Use every pixel with measured GT depth instead.
+                    # Outside-cube activity is defined over every pixel with a
+                    # measured GT depth, independently of the main metric mask.
                     gt_depth_valid = np.isfinite(gt_np) & (gt_np > 0.0)
                     outside_cube_mask = gt_depth_valid & ~cube_mask
                     outside_cube_event_activity = float(
@@ -2782,21 +2671,17 @@ def _evaluate_checkpoint(
             "view_interval": view_interval,
             "pose_view_selection": pose_view_selection,
             "pose_move_threshold_m": pose_move_threshold,
-            "num_depths": num_depths,
+            "coarse_depths": coarse_depths,
             "linear_depth_candidates": linear_depth_candidates,
-            "gaussian_depth_candidates": gaussian_depth_candidates,
             "fine_depths": metadata.get("fine_depths"),
-            "feature_encoder": metadata.get("feature_encoder"),
-            "decoder_type": metadata.get("decoder_type", "auto"),
         },
         "evaluation_configuration": {
-            "use_spatial_mask": not args.no_mask,
             "fill_invalid": args.fill_invalid,
             "intrinsics_transform": "resize_center_crop",
             "frame_step": args.fast_mode,
             "boundary_definition": (
                 "inside pixel adjacent (4-connected) to undefined GT or "
-                "outside the spatial mask"
+                "outside valid measured depth"
             ),
             "boundary_dilation_px": args.boundary_dilation,
             "boundary_spatial_mask_offset_m": (
@@ -2892,7 +2777,7 @@ def _evaluate_checkpoint(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate U-Net-table, basic, legacy, or modern MVS checkpoints."
+        description="Evaluate U-Net-table or multiview checkpoints."
     )
     parser.add_argument(
         "--checkpoint",
@@ -2933,11 +2818,6 @@ def _parse_args() -> argparse.Namespace:
         choices=("auto", "cuda", "cpu"),
         default="auto",
         help="Inference device.",
-    )
-    parser.add_argument(
-        "--no_mask",
-        action="store_true",
-        help="Ignore spatial_mask.h5; pixels with GT depth <= 0 remain invalid.",
     )
     parser.add_argument(
         "--fill_invalid",

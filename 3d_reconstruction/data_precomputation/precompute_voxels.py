@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-Precompute voxel grids from raw events for faster training.
+Precompute frame-aligned voxel grids from raw events.
 
-This script converts raw event data (events.npy) into per-frame voxel grids,
-which dramatically reduces memory usage and speeds up training.
+Raw event-camera recordings are split by the RealSense hardware-trigger
+timestamps and accumulated into temporal bins. Trigger data are read from the
+RAW recording, with the event HDF5 copy used as a fallback. Each grid receives
+the same resize and centred crop used by depth projection and model inference.
+The resulting ``hdf5/voxels.h5`` can be loaded directly during training.
 
 Usage:
-    python precompute_voxels.py --data_root data/synthetic_data
-    python precompute_voxels.py --data_dir data/synthetic_data/bottle data/synthetic_data/cube_medium
+    python3 data_precomputation/precompute_voxels.py --data_root data/new/train
+    python3 data_precomputation/precompute_voxels.py --data_dir data/new/train/1 data/new/train/2
+
+Hardware-trigger alignment is required; recordings without trigger timestamps
+are rejected instead of falling back to cross-clock elapsed-time estimates.
 """
 
 import argparse
@@ -174,22 +180,18 @@ def process_sequence(
     as_float16: bool = False,
     crop_hw: Optional[Tuple[int, int]] = None,
     show_progress: bool = True,
-    hw_trigger: bool = False,
     normalize: bool = True,
 ) -> dict:
     """
     Process a single sequence directory.
 
-    Reads depth timestamps from hdf5/realsense.h5 and raw events from
-    raw/event_cam*.raw.  For each depth frame i the events in the half-open
-    interval [t_depth[i], t_depth[i+1]) are accumulated into a voxel grid
-    with `num_bins` temporal bins.  If `output_hw` is given the voxel is
-    downsampled to that resolution before saving (dramatically reduces storage
-    when the training pipeline already downscales).  Use `as_float16` to halve
-    storage with negligible precision loss on normalised event data.
+    Reads the frame count from hdf5/realsense.h5 and raw events from
+    raw_event_data/events_cam*.raw. For every hardware trigger, events in a
+    trigger-centred window are accumulated into ``num_bins`` temporal bins.
+    If ``output_hw`` is given, each voxel is resized before saving. Use
+    ``as_float16`` to reduce storage for normalized event data.
 
-    When ``hw_trigger=True`` the per-frame window is centred on the hardware
-    trigger timestamp (stored in events_cam{k}.h5 as ``hw_trigger_times_us``):
+    Each per-frame window is centred on its hardware-trigger timestamp:
         window = [trigger[i] - half_period, trigger[i] + half_period)
     so the middle temporal bin of the voxel grid falls exactly on the trigger.
 
@@ -278,47 +280,41 @@ def process_sequence(
             # Read per-frame time windows from the aligned HDF5
             aligned_h5 = sequence_dir / "hdf5" / f"events_cam{cam_idx}.h5"
             if not aligned_h5.exists():
-                print(f"  [cam{cam_idx}] aligned HDF5 not found: {aligned_h5}")
-                continue
+                result["error"] = f"cam{cam_idx}: aligned HDF5 not found: {aligned_h5}"
+                return result
             with h5py.File(aligned_h5, 'r') as f:
                 ev_t_start_us = f['events/t_ev_start_us'][:]  # (N,) int64
                 ev_t_end_us   = f['events/t_ev_end_us'][:]    # (N,) int64
 
-            # HW trigger timestamps: read directly from the .raw file (primary source,
-            # always present if the recording used --hw-trigger-sync, regardless of
-            # which alignment path was used).  Fall back to the HDF5 copy if the raw
-            # file's triggers are unavailable.
+            # Read triggers from RAW first, then use the HDF5 copy as fallback.
             hw_trig_us = None
-            if hw_trigger:
-                try:
-                    from metavision_core.event_io import RawReader as _RR
-                    _rr = _RR(str(raw_path))
-                    while not _rr.is_done():
-                        _rr.load_delta_t(100_000)
-                    _trig = _rr.get_ext_trigger_events()
-                    if _trig is not None and len(_trig) > 0:
-                        _rising = _trig[_trig["p"] == 1]
-                        if len(_rising) > 0:
-                            hw_trig_us = _rising["t"].astype(np.int64)
-                            print(f"  [cam{cam_idx}] HW triggers: {len(hw_trig_us)} rising edges "
-                                  f"from raw file (need {n_frames})")
-                        else:
-                            print(f"  [cam{cam_idx}] WARNING: no rising-edge trigger events in raw file")
-                    else:
-                        print(f"  [cam{cam_idx}] WARNING: no trigger events in raw file")
-                except Exception as _e:
-                    print(f"  [cam{cam_idx}] WARNING: could not read triggers from raw file: {_e}")
+            try:
+                from metavision_core.event_io import RawReader as _RR
+                _rr = _RR(str(raw_path))
+                while not _rr.is_done():
+                    _rr.load_delta_t(100_000)
+                _trig = _rr.get_ext_trigger_events()
+                if _trig is not None and len(_trig) > 0:
+                    _rising = _trig[_trig["p"] == 1]
+                    if len(_rising) > 0:
+                        hw_trig_us = _rising["t"].astype(np.int64)
+                        print(f"  [cam{cam_idx}] HW triggers: {len(hw_trig_us)} rising edges "
+                              f"from raw file (need {n_frames})")
+            except Exception as _e:
+                print(f"  [cam{cam_idx}] WARNING: could not read triggers from raw file: {_e}")
 
-                # Fallback: try the HDF5 copy (written by generate_event_frames_hw_triggered)
-                if hw_trig_us is None:
-                    with h5py.File(aligned_h5, 'r') as f:
-                        if 'events/hw_trigger_times_us' in f:
-                            hw_trig_us = f['events/hw_trigger_times_us'][:].astype(np.int64)
-                            print(f"  [cam{cam_idx}] HW triggers: {len(hw_trig_us)} from HDF5 fallback")
+            if hw_trig_us is None:
+                with h5py.File(aligned_h5, 'r') as f:
+                    if 'events/hw_trigger_times_us' in f:
+                        hw_trig_us = f['events/hw_trigger_times_us'][:].astype(np.int64)
+                        print(f"  [cam{cam_idx}] HW triggers: {len(hw_trig_us)} from HDF5 fallback")
 
-                if hw_trig_us is None:
-                    print(f"  [cam{cam_idx}] WARNING: --hw_trigger requested but no trigger timestamps "
-                          f"found in raw file or HDF5; falling back to standard windows")
+            if hw_trig_us is None or len(hw_trig_us) < n_frames:
+                result["error"] = (
+                    f"cam{cam_idx}: need {n_frames} rising-edge hardware triggers, "
+                    f"found {0 if hw_trig_us is None else len(hw_trig_us)}"
+                )
+                return result
 
             if len(ev_t_start_us) != n_frames:
                 print(f"  [cam{cam_idx}] WARNING: HDF5 has {len(ev_t_start_us)} frames "
@@ -365,18 +361,13 @@ def process_sequence(
                 ds.attrs["crop_h"] = out_H
                 ds.attrs["crop_w"] = out_W
                 ds.attrs["normalized"] = bool(normalize)
-                if hw_trig_us is not None:
-                    vf.create_dataset("hw_trigger_times_us", data=hw_trig_us[:n_frames])
-                    # Compute trigger-centred windows
-                    trig = hw_trig_us[:n_frames]
-                    periods = np.diff(trig).astype(np.int64)
-                    mean_period = int(np.mean(periods)) if len(periods) > 0 else int(1e6 // 30)
-                    half = mean_period // 2
-                    win_starts = trig - half
-                    win_ends   = trig + half
-                else:
-                    win_starts = ev_t_start_us[:n_frames].astype(np.int64)
-                    win_ends   = ev_t_end_us[:n_frames].astype(np.int64)
+                vf.create_dataset("hw_trigger_times_us", data=hw_trig_us[:n_frames])
+                trig = hw_trig_us[:n_frames]
+                periods = np.diff(trig).astype(np.int64)
+                mean_period = int(np.mean(periods)) if len(periods) > 0 else int(1e6 // 30)
+                half = mean_period // 2
+                win_starts = trig - half
+                win_ends   = trig + half
 
                 for frame_idx in tqdm(range(n_frames), desc=f"  cam{cam_idx}", leave=False, position=1, disable=not show_progress):
                     t_start = int(win_starts[frame_idx])
@@ -459,12 +450,6 @@ def main():
                        help="Store voxels as float16 instead of float32 (2x extra space saving).")
     parser.add_argument("--no_normalize", "--no-normalize", action="store_true",
                        help="Store raw accumulated voxel event counts without mean/std normalization.")
-    parser.add_argument("--no-hw-trigger", action="store_true", dest="no_hw_trigger",
-                       help="Disable hardware-trigger-based voxel alignment (enabled by default). "
-                            "By default each voxel window is centred on the hardware trigger timestamp "
-                            "(stored as hw_trigger_times_us in events_camK.h5) so the middle temporal "
-                            "bin coincides with the RealSense trigger pulse. "
-                            "Pass this flag to fall back to elapsed-time estimation.")
 
     args = parser.parse_args()
 
@@ -525,11 +510,7 @@ def main():
     normalize = not args.no_normalize
     print(f"Voxel normalization: {'ON' if normalize else 'OFF'}")
     print(f"Overwrite: {args.overwrite}")
-    hw_trigger = not args.no_hw_trigger
-    if hw_trigger:
-        print("HW trigger: ON — voxel windows centred on trigger timestamps")
-    else:
-        print("HW trigger: OFF — using elapsed-time estimation")
+    print("HW trigger: required — voxel windows centred on trigger timestamps")
     print()
 
     # Process sequences
@@ -542,7 +523,7 @@ def main():
         for seq_dir in tqdm(dirs, desc="Processing", position=0, leave=True):
             result = process_sequence(
                 seq_dir, args.num_bins, args.overwrite, output_hw, args.float16, crop_hw,
-                show_progress=show_prog, hw_trigger=hw_trigger, normalize=normalize,
+                show_progress=show_prog, normalize=normalize,
             )
             results.append(result)
             if result["success"]:
@@ -562,7 +543,7 @@ def main():
                 futures = {
                     executor.submit(
                         process_sequence, seq_dir, args.num_bins, args.overwrite,
-                        output_hw, args.float16, crop_hw, False, hw_trigger, normalize
+                        output_hw, args.float16, crop_hw, False, normalize
                     ): seq_dir
                     for seq_dir in sequence_dirs
                 }

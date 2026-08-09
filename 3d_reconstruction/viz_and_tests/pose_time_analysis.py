@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unified pose temporal alignment analysis script.
+Pose timing diagnostics for recorded sequences.
 
 Merges:
   frame_level  – Frame-level temporal alignment (rotation speed vs event activity)
@@ -10,17 +10,21 @@ Merges:
 
 Output images are saved to  <data_dir>/pose_plots/  by default.
 
-NOTE: The TemporalAlignmentAgent rotates the EE in place about the Z axis
+The ``frame_level`` and ``voxel_level`` modes target legacy recordings from
+the TemporalAlignmentAgent. Current event/depth alignment comes from hardware
+triggers; the ``verify`` mode remains useful for checking pose interpolation.
+
+The TemporalAlignmentAgent rotates the EE in place about the Z axis
 (±45° oscillation at a fixed position).  All analyses in this script
 extract Z-rotation via atan2(R[1,0], R[0,0]) and compare rotation speed
 against event activity — they are fully adapted for the rotate-in-place
 motion pattern and do NOT depend on any translational movement.
 
 Usage examples:
-    python pose_time_analysis.py frame_level  --data_dir data/real/temporal_check
-    python pose_time_analysis.py voxel_level  --data_dir data/real/temporal_check
+    python pose_time_analysis.py frame_level  --data_dir data/temporal_check
+    python pose_time_analysis.py voxel_level  --data_dir data/temporal_check
     python pose_time_analysis.py verify       --data_dir data/real/1
-    python pose_time_analysis.py all          --data_dir data/real/temporal_check
+    python pose_time_analysis.py all          --data_dir data/temporal_check
 """
 
 from __future__ import annotations

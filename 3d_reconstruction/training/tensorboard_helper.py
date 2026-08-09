@@ -2,24 +2,24 @@
 """
 TensorBoard path and image-visualization helpers.
 
-Each logged panel contains up to `n_samples` rows, one row per sample.
-Each row has six sub-images (left to right):
+``VizLogger`` writes up to ``n_samples`` rows, one per sampled frame. Each row
+contains:
 
   events | gt depth | mask | pred depth | error | overlay (events + pred depth)
 
-Usage in train_unet.py
-----------------------
-    from tensorboard_helper import UNetVizLogger
+The module also contains loggers for event-activity/error correlation,
+uncertainty calibration, and spatial/error distributions. Both training entry
+points use these helpers; they do not define models or affect optimization.
 
-    viz_train = UNetVizLogger(writer, n_samples=4, tag="viz/train")
-    viz_val   = UNetVizLogger(writer, n_samples=4, tag="viz/val")
+Minimal usage::
 
-    # Inside run_epoch (or the training loop):
+    from tensorboard_helper import VizLogger
+
+    viz_train = VizLogger(writer, n_samples=4, tag="viz/train")
+
     viz_train.add_batch(voxels, depth, mask, pred)
 
-    # At the end of each epoch:
     viz_train.flush(step=epoch)
-    viz_val.flush(step=epoch)
 """
 
 from __future__ import annotations
