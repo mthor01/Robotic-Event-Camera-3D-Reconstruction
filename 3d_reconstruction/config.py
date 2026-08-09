@@ -11,6 +11,15 @@ Import what you need:
 from pathlib import Path
 
 # ═══════════════════════════════════════════════════════════════════
+#  Default paths
+# ═══════════════════════════════════════════════════════════════════
+CALIB_DIR = Path("camera_data")
+DATA_ROOT = Path("data/real")
+TEMPORAL_CHECK_ROOT = Path("data/temporal_check")
+LIGHT_CHECK_ROOT = Path("data/light_check")
+DEFAULT_OUT_DIR = Path("checkpoints_e2depth")
+
+# ═══════════════════════════════════════════════════════════════════
 #  Recording / frame rate
 # ═══════════════════════════════════════════════════════════════════
 FPS = 30
@@ -23,7 +32,7 @@ DELTA_T_US = int(1e6 / FPS)  # microseconds per frame
 DEPTH_EVENT_ALIGN_OFFSET_FRAMES: int = 0
 
 # ═══════════════════════════════════════════════════════════════════
-#  RealSense camera
+#  RealSense camera resolution
 # ═══════════════════════════════════════════════════════════════════
 RS_WIDTH = 640
 RS_HEIGHT = 480
@@ -43,10 +52,9 @@ BIAS_REFR = 120
 NUM_BINS = 5  # number of temporal bins for voxel grid
 
 # ═══════════════════════════════════════════════════════════════════
-#  Depth parameters — E2Depth training (tabletop scene)
+#  Depth parameters for training
 # ═══════════════════════════════════════════════════════════════════
 D_MAX = 0.7    # maximum depth in metres (tabletop range)
-ALPHA = 2.5    # log depth parameter: ln(D_MAX / D_MIN) ≈ ln(0.6/0.05)
 DEPTH_MIN = 0.05  # minimum depth in metres (5 cm)
 
 # ═══════════════════════════════════════════════════════════════════
@@ -63,10 +71,6 @@ TSDF_SDF_TRUNC_FACTOR = 4.0
 TSDF_DEPTH_MIN = 0.05          # metres (same as training DEPTH_MIN)
 TSDF_DEPTH_MAX = 0.8           # metres (larger range for 3-D reconstruction)
 
-# ═══════════════════════════════════════════════════════════════════
-#  White-pixel masking
-# ═══════════════════════════════════════════════════════════════════
-WHITE_THRESH = 100  # RGB channel threshold for white detection
 
 # ═══════════════════════════════════════════════════════════════════
 #  Spatial masking (cube around target position)
@@ -86,30 +90,21 @@ SPATIAL_TARGET_Z = SPATIAL_CUBE_CENTER_Z          # metres
 TABLE_Z_OFFSET = 0.01   # metres
 
 # ═══════════════════════════════════════════════════════════════════
-#  Depth visualization (percentile normalization)
+#  Depth visualization
 # ═══════════════════════════════════════════════════════════════════
 DEPTH_VIZ_P_LOW = 2
 DEPTH_VIZ_P_HIGH = 98
 # Fixed colour range for depth images/videos (independent of training range)
 DEPTH_VIZ_MIN = 0.05   # metres — maps to bottom of TURBO colourmap
-DEPTH_VIZ_MAX = 1.0    # metres — maps to top of TURBO colourmap
+DEPTH_VIZ_MAX = 0.7    # metres — maps to top of TURBO colourmap
 
 # ═══════════════════════════════════════════════════════════════════
-#  Training image resolution
+#  Resizing and Cropping resolutions
 # ═══════════════════════════════════════════════════════════════════
 TRAIN_RESIZE_HW = (288, 384)  # (H, W) resize before crop during training
 TRAIN_CROP_HW   = (240, 320)  # (H, W) center crop after resize during training
-TRAIN_BATCH_SIZE = 10         # default batch size for E2Depth training
-TRAIN_SEQ_LEN    = 10         # default sequence length for recurrent training
 
-# ═══════════════════════════════════════════════════════════════════
-#  Default paths
-# ═══════════════════════════════════════════════════════════════════
-CALIB_DIR = Path("camera_data")
-DATA_ROOT = Path("data/real")
-TEMPORAL_CHECK_ROOT = Path("data/temporal_check")
-LIGHT_CHECK_ROOT = Path("data/light_check")
-DEFAULT_OUT_DIR = Path("checkpoints_e2depth")
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  ChArUco board (calibration)
@@ -129,9 +124,9 @@ ZMQ_POSE_ADDR = "tcp://localhost:6000"
 #  Pose timestamp correction
 # ═══════════════════════════════════════════════════════════════════
 # Manual offset added to pose timestamps before frame assignment.
-# Positive values shift poses forward in time (use when events appear
-# to lead the robot motion); negative values shift them backward.
-# Applied on top of the automatically measured ZMQ transport delay.
+# It was measured and approximated.
+# Positive values shift poses forward in time, negative values shift them backward.
+
 POSE_TIME_OFFSET_MS: float = -20.0
 
 # ═══════════════════════════════════════════════════════════════════

@@ -22,16 +22,17 @@ Scope: sampler position constraints only; IK/collision feasibility is not tested
 
 Recorded sequences: 50
   eval/20: 1257 poses
+  eval/25: 1325 poses
   eval/30: 1590 poses
-  eval/40: 989 poses
   eval/50: 922 poses
-  eval/60: 999 poses
+  eval/65: 927 poses
   eval/70: 938 poses
+  special/40: 989 poses
+  special/60: 999 poses
   train/21: 1143 poses
   train/22: 1375 poses
   train/23: 1323 poses
   train/24: 1571 poses
-  train/25: 1325 poses
   train/26: 1278 poses
   train/27: 1279 poses
   train/28: 1302 poses
@@ -66,7 +67,6 @@ Recorded sequences: 50
   train/62: 903 poses
   train/63: 930 poses
   train/64: 988 poses
-  train/65: 927 poses
   train/66: 909 poses
   train/67: 865 poses
   train/68: 1312 poses

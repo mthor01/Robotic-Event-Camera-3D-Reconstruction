@@ -396,7 +396,6 @@ def create_plot(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import seaborn as sns
-    from matplotlib.lines import Line2D
     from matplotlib.patches import Circle
     from matplotlib.ticker import FuncFormatter
 
@@ -488,12 +487,6 @@ def create_plot(
         color=colors["boundary"], linewidth=1.6, alpha=0.95,
         label="Outer EE Hemisphere",
     )
-    axis_side.plot(
-        config.center[1] + config.inner_radius * np.cos(arc_angle),
-        config.center[2] + config.inner_radius * np.sin(arc_angle),
-        color=colors["boundary"], linewidth=1.6, linestyle="--", alpha=0.95,
-        label="Inner EE Hemisphere",
-    )
     side_y_low = min(displayed_points[:, 1].min(),
                      config.center[1] - config.outer_radius)
     side_y_high = max(displayed_points[:, 1].max(),
@@ -552,14 +545,6 @@ def create_plot(
             label="Outer EE Hemisphere Projection",
         )
     )
-    axis_xy.add_patch(
-        Circle(
-            config.center[:2], config.inner_radius, fill=False,
-            linewidth=1.6, linestyle="--", alpha=0.95,
-            color=colors["boundary"],
-            label="Inner EE Hemisphere Projection",
-        )
-    )
     axis_xy.set_title("Top view", pad=16, fontweight="semibold")
     axis_xy.set_xlabel("X [cm]")
     axis_xy.set_ylabel("Y [cm]")
@@ -569,42 +554,10 @@ def create_plot(
     axis_xy.grid(True, linestyle="--", linewidth=0.8, alpha=0.55)
     sns.despine(ax=axis_xy, offset=4)
 
-    # One shared legend in the side view describes artists from both panels.
-    side_handles, side_labels = axis_side.get_legend_handles_labels()
-    top_handles, top_labels = axis_xy.get_legend_handles_labels()
-    automatic_top_legend = axis_xy.get_legend()
-    if automatic_top_legend is not None:
-        automatic_top_legend.remove()
-    combined_entries = {}
-    for handle, label in zip(
-        side_handles + top_handles,
-        side_labels + top_labels,
-    ):
-        combined_entries.setdefault(label, handle)
-    combined_entries["Target"] = Line2D(
-        [0], [0],
-        linestyle="None",
-        marker="*",
-        markersize=9,
-        markerfacecolor=colors["target"],
-        markeredgecolor="white",
-        markeredgewidth=0.8,
-    )
-    axis_side.legend(
-        list(combined_entries.values()),
-        list(combined_entries.keys()),
-        loc="upper left",
-        bbox_to_anchor=(0.015, 0.985),
-        fontsize=9.5,
-        markerscale=1.1,
-        ncol=2,
-        frameon=True,
-        framealpha=0.96,
-        edgecolor="#D5DAE0",
-        borderpad=0.65,
-        labelspacing=0.5,
-        columnspacing=0.8,
-    )
+    for plot_axis in (axis_side, axis_xy):
+        automatic_legend = plot_axis.get_legend()
+        if automatic_legend is not None:
+            automatic_legend.remove()
 
     figure.suptitle(
         "Random-Hemisphere Pose Coverage",
