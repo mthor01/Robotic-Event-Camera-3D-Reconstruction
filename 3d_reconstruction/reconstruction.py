@@ -2,11 +2,10 @@
 """
 Depth-map / point-cloud reconstruction for table-prior checkpoints.
 
-Supports the single-frame unet_table checkpoints and recurrent EReFormer
-checkpoints, plus legacy and modern multi-view table checkpoints trained with
-training/multiview.py or training/modern_multiview.py.
+Supports single- and multi-view early-fusion unet_table checkpoints, recurrent
+U-Net checkpoints, and legacy or modern geometric multiview checkpoints trained
+with training/multiview.py or training/modern_multiview.py.
 Uses the precomputed table-plane channel stored in hdf5/table_plane.h5
-(or hdf5/fixed_table_plane.h5 when -fix_transform is enabled)
 (produced by data_precomputation/precompute_table_plane.py) instead of
 computing it on-the-fly.
 
@@ -69,8 +68,13 @@ from config import (
 )
 from train_unet import UNet
 from train_unet_table import RecurrentUNet
-from train_ere import EReFormer
-from multiview import MultiViewDepthNet, _inverse_depth_candidates
+#from train_ere import EReFormer
+from multiview import (
+    MultiViewDepthNet,
+    _gaussian_depth_candidates,
+    _inverse_depth_candidates,
+    _linear_depth_candidates,
+)
 
 CALIB_DIR = _HERE / _CALIB_DIR
 
@@ -270,6 +274,11 @@ def load_model(ckpt_path: Path, device: torch.device):
             coarse_cost_channels=ckpt.get("coarse_cost_channels", 0),
             fine_cost_channels=ckpt.get("fine_cost_channels", 0),
             refiner_channels=ckpt.get("refiner_channels", 0),
+            refiner_max_residual_m=ckpt.get("refiner_max_residual_m"),
+            refiner_reference_input=not ckpt.get(
+                "no_refiner_reference_input", False
+            ),
+            no_2d_refinement=ckpt.get("no_2d_refinement", False),
             hourglass_levels=ckpt.get("hourglass_levels", 2),
             coarse_hourglass_levels=ckpt.get("coarse_hourglass_levels", 0),
             fine_hourglass_levels=ckpt.get("fine_hourglass_levels", 0),
@@ -465,6 +474,71 @@ def _infer(
     return pred[0, 0].cpu().numpy(), states
 
 
+@torch.no_grad()
+def _infer_early_fusion_unet(
+    model: torch.nn.Module,
+    frame_idx: int,
+    vox_ds,
+    tbl_ds,
+    T_cam_from_world: Optional[np.ndarray],
+    ckpt: dict,
+    device: torch.device,
+    resize_hw: Optional[Tuple[int, int]],
+    crop_hw: Optional[Tuple[int, int]],
+    centers_world: Optional[np.ndarray],
+) -> np.ndarray:
+    """Run a checkpoint-configured early-fusion U-Net forward pass.
+
+    The target/source ordering, temporal offsets, pose-based view selection,
+    table-prior channels, and optional pose channels match TablePriorDataset.
+    """
+    num_views = int(ckpt.get("num_views", 1))
+    n_frames = min(len(vox_ds), len(tbl_ds))
+    if T_cam_from_world is not None:
+        n_frames = min(n_frames, len(T_cam_from_world))
+    view_ids = _multiview_view_ids(
+        frame_idx,
+        n_frames,
+        ckpt,
+        centers_world,
+    )
+
+    use_pose_channels = bool(ckpt.get("pose_channels", False))
+    if use_pose_channels and T_cam_from_world is None:
+        raise RuntimeError(
+            "This U-Net checkpoint uses pose channels, but camera poses are unavailable."
+        )
+
+    view_inputs = []
+    for view_idx in view_ids:
+        vox_np = _preprocess_voxels(
+            vox_ds[view_idx].astype(np.float32), resize_hw, crop_hw
+        )
+        tbl_np = tbl_ds[view_idx].astype(np.float32)
+        pose_values = None
+        if use_pose_channels:
+            T_base_from_event = np.linalg.inv(T_cam_from_world[view_idx]).astype(
+                np.float32
+            )
+            pose_values = _pose_channels_from_base_event(T_base_from_event)
+        view_inputs.append(
+            _unet_input_np(vox_np, tbl_np, pose_values=pose_values)
+        )
+
+    inp_np = np.concatenate(view_inputs, axis=0)
+    expected_channels = int(ckpt.get("in_ch", inp_np.shape[0]))
+    if inp_np.shape[0] != expected_channels:
+        raise RuntimeError(
+            "Early-fusion U-Net input-channel mismatch: constructed "
+            f"{inp_np.shape[0]} channels from {num_views} view(s), but the "
+            f"checkpoint expects {expected_channels}."
+        )
+    inp = torch.from_numpy(inp_np).unsqueeze(0).to(device)
+    out = model(inp)
+    pred = out[0] if isinstance(out, tuple) else out
+    return pred[0, 0].cpu().numpy()
+
+
 def _infer_recurrent_unet(
     model: torch.nn.Module,
     frame_idx: int,
@@ -608,8 +682,17 @@ def _infer_multiview(
     ], dim=0).unsqueeze(0).to(device)
     cam_mats = torch.from_numpy(np.stack([T_cam_from_world[i] for i in view_ids])).unsqueeze(0).to(device)
     K_t = torch.from_numpy(K.astype(np.float32)).unsqueeze(0).to(device)
+    candidate_fn = (
+        _gaussian_depth_candidates
+        if ckpt.get("gaussian_depth_candidates", False)
+        else (
+            _linear_depth_candidates
+            if ckpt.get("linear_depth_candidates", False)
+            else _inverse_depth_candidates
+        )
+    )
     depth_values = torch.from_numpy(
-        _inverse_depth_candidates(
+        candidate_fn(
             int(ckpt.get("num_depths", 32)),
             float(ckpt.get("depth_min", DEPTH_MIN)),
             float(ckpt.get("depth_max", D_MAX)),
@@ -2050,16 +2133,12 @@ def table_workspace_mask(
 #  Main
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _table_plane_filename(fix_transform: bool) -> str:
-    return "fixed_table_plane.h5" if fix_transform else "table_plane.h5"
-
-
-def _is_reconstruction_sequence(path: Path, fix_transform: bool = False) -> bool:
+def _is_reconstruction_sequence(path: Path) -> bool:
     """Return whether path contains the inputs required for reconstruction."""
     return (
         (path / "hdf5" / "depth_in_event_frame.h5").is_file()
         and (path / "events" / "voxels_cam0.h5").is_file()
-        and (path / "hdf5" / _table_plane_filename(fix_transform)).is_file()
+        and (path / "hdf5" / "table_plane.h5").is_file()
     )
 
 
@@ -2084,7 +2163,7 @@ def _set_cli_option(argv: list[str], option: str, value: str) -> list[str]:
 def _run_sequence_directory(args: argparse.Namespace) -> bool:
     """Run one child process per sequence when --data_dir is a parent folder."""
     data_root = Path(args.data_dir)
-    if _is_reconstruction_sequence(data_root, fix_transform=args.fix_transform):
+    if _is_reconstruction_sequence(data_root):
         return False
     if not data_root.is_dir():
         raise FileNotFoundError(f"Data directory does not exist: {data_root}")
@@ -2092,7 +2171,7 @@ def _run_sequence_directory(args: argparse.Namespace) -> bool:
     sequence_dirs = sorted(
         child
         for child in data_root.iterdir()
-        if child.is_dir() and _is_reconstruction_sequence(child, fix_transform=args.fix_transform)
+        if child.is_dir() and _is_reconstruction_sequence(child)
     )
     if not sequence_dirs:
         raise FileNotFoundError(
@@ -2207,9 +2286,6 @@ def main() -> None:
     parser.add_argument("--resize_w", type=int, default=TRAIN_RESIZE_HW[1])
     parser.add_argument("--crop_h",   type=int, default=TRAIN_CROP_HW[0])
     parser.add_argument("--crop_w",   type=int, default=TRAIN_CROP_HW[1])
-    parser.add_argument("-fix_transform", "--fix_transform", action="store_true",
-                        help="Use hdf5/fixed_table_plane.h5 instead of hdf5/table_plane.h5 "
-                             "for models trained with -fix_transform.")
     parser.add_argument("--voxel_size",        type=float, default=TSDF_VOXEL_SIZE)
     parser.add_argument("--sdf_trunc_factor",  type=float, default=TSDF_SDF_TRUNC_FACTOR)
     parser.add_argument(
@@ -2420,7 +2496,7 @@ def main() -> None:
     rgb_h5_path        = data_dir / "hdf5" / "rgb_in_event_frame.h5"
     voxels_h5_path     = data_dir / "events" / "voxels_cam0.h5"
     poses_h5_path      = data_dir / "hdf5" / "poses.h5"
-    table_plane_h5_path = data_dir / "hdf5" / _table_plane_filename(args.fix_transform)
+    table_plane_h5_path = data_dir / "hdf5" / "table_plane.h5"
 
     for p, hint in [
         (depth_h5_path,       "Run data_precomputation/project_realsense_to_event.py first."),
@@ -2429,6 +2505,17 @@ def main() -> None:
     ]:
         if not p.exists():
             raise FileNotFoundError(f"Missing: {p}\n{hint}")
+    with h5py.File(table_plane_h5_path, "r") as table_file:
+        transform = table_file.attrs.get("intrinsics_transform", "")
+        if isinstance(transform, bytes):
+            transform = transform.decode("utf-8", errors="replace")
+        corrected_table_transform = transform == "resize_center_crop"
+    if not corrected_table_transform:
+        raise RuntimeError(
+            f"{table_plane_h5_path} uses obsolete direct-scaling geometry. "
+            "Regenerate it with data_precomputation/precompute_table_plane.py "
+            "--overwrite."
+        )
     if args.save_original_depth_mesh and not realsense_h5_path.exists():
         raise FileNotFoundError(
             f"Missing: {realsense_h5_path}\n"
@@ -2491,6 +2578,11 @@ def main() -> None:
         print(f"  pose selection : {ckpt.get('pose_view_selection', False)}")
         print(f"  feature encoder: {_infer_multiview_feature_encoder(ckpt)}")
         print(f"  uncertainty    : {bool(ckpt.get('uncertainty', False))}")
+    if ckpt_type == "unet_table":
+        print(f"  num_views      : {ckpt.get('num_views', 1)}")
+        print(f"  view_interval  : {ckpt.get('view_interval', 5)}")
+        print(f"  pose selection : {bool(ckpt.get('pose_view_selection', False))}")
+        print(f"  pose channels  : {bool(ckpt.get('pose_channels', False))}")
     table_z_msg = (
         f"{table_z} m"
         if table_z is not None
@@ -2520,10 +2612,16 @@ def main() -> None:
         T_ee_from_event = None
         use_poses       = False
         print("WARNING: poses.h5 not found — TSDF mesh will be in camera frame only")
-    if ckpt_type == "multiview" and not use_poses:
+    needs_model_poses = (
+        ckpt_type == "multiview"
+        or bool(ckpt.get("pose_channels", False))
+        or bool(ckpt.get("pose_view_selection", False))
+    )
+    if needs_model_poses and not use_poses:
         raise FileNotFoundError(
             f"Missing: {poses_h5_path}\n"
-            "multiview.py checkpoints require camera poses for source-view warping."
+            "This checkpoint requires camera poses for view selection, pose "
+            "channels, or geometric source-view warping."
         )
     if args.save_original_depth_mesh and not use_poses:
         raise FileNotFoundError(
@@ -2533,7 +2631,7 @@ def main() -> None:
 
     T_cam_from_world = None
     cam_centers_world = None
-    if ckpt_type == "multiview":
+    if use_poses:
         T_event_from_ee = np.linalg.inv(T_ee_from_event).astype(np.float32)
         T_ee_inv = np.linalg.inv(ee_T_all.astype(np.float32))
         T_cam_from_world = np.einsum("ij,njk->nik", T_event_from_ee, T_ee_inv).astype(np.float32)
@@ -2559,7 +2657,7 @@ def main() -> None:
         n_total = min(n_total, n_rs)
 
     n_total = min(n_total, n_vox, n_tbl, n_rgb)   # don't go past what's precomputed
-    if ckpt_type == "multiview":
+    if T_cam_from_world is not None:
         n_total = min(n_total, len(T_cam_from_world))
     if args.start_idx >= n_total:
         parser.error(
@@ -2751,7 +2849,13 @@ def main() -> None:
                     return_uncertainty=use_learned_uncertainty,
                 )
                 recurrent_states = None
-            elif bool(ckpt.get("recurrent", False)) or ckpt.get("model_arch") == "RecurrentUNet":
+            elif (
+                ckpt_type == "unet_table"
+                and (
+                    bool(ckpt.get("recurrent", False))
+                    or ckpt.get("model_arch") == "RecurrentUNet"
+                )
+            ):
                 pred_norm = _infer_recurrent_unet(
                     model,
                     frame_idx,
@@ -2765,25 +2869,24 @@ def main() -> None:
                 )
                 recurrent_states = None
                 uncertainty_map = None
-            else:
-                pose_values = None
-                if bool(ckpt.get("pose_channels", False)):
-                    if ckpt.get("num_views", 1) != 1:
-                        raise ValueError(
-                            "reconstruction.py only supports pose_channels for "
-                            "single-view U-Net checkpoints. Use evaluation.py for "
-                            "multi-index U-Net evaluation."
-                        )
-                    pose_values = _pose_channels_from_base_event(
-                        np.linalg.inv(T_cam_from_world[frame_idx]).astype(np.float32)
-                    )
-                pred_norm, recurrent_states = _infer(
+            elif ckpt_type == "unet_table":
+                pred_norm = _infer_early_fusion_unet(
                     model,
-                    vox_np,
-                    tbl_np,
+                    frame_idx,
+                    voxels_f["voxels"],
+                    table_f["table_plane"],
+                    T_cam_from_world,
+                    ckpt,
                     device,
-                    recurrent_states,
-                    pose_values=pose_values,
+                    resize_hw,
+                    crop_hw,
+                    cam_centers_world,
+                )
+                recurrent_states = None
+                uncertainty_map = None
+            else:
+                pred_norm, recurrent_states = _infer(
+                    model, vox_np, tbl_np, device, recurrent_states
                 )
                 uncertainty_map = None
             pred_m    = depth_min + pred_norm * (depth_max - depth_min)

@@ -30,7 +30,7 @@ from tensorboard_helper import VizLogger
 # Constants (from 3d_reconstruction/config.py)
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config import DEPTH_MIN, D_MAX, NUM_BINS
+from config import DEPTH_MIN, D_MAX, NUM_BINS, TRAIN_CROP_HW, TRAIN_RESIZE_HW
 
 # Default data root relative to this file's parent directory
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -581,14 +581,19 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model  = UNet(in_ch=NUM_BINS, base=args.base_channels).to(device)
 
-    # Load event camera intrinsics and scale K to the voxel crop resolution
+    # Transform event intrinsics through the same resize + centred crop used
+    # to generate the voxel tensors.
     _cam_data = np.load(_SCRIPT_DIR.parent / "camera_data" / "event_intrinsics.npz")
     _K_full   = _cam_data["camera_matrix"].astype(np.float32)
-    _H_full, _W_full = 720, 1280   # original event-camera resolution
-    _H_crop, _W_crop = 240, 320    # TRAIN_CROP_HW (voxel resolution)
+    _W_full = int(_cam_data["image_size"][0])
+    _H_full = int(_cam_data["image_size"][1])
+    _H_resize, _W_resize = TRAIN_RESIZE_HW
+    _H_crop, _W_crop = TRAIN_CROP_HW
     _K_scaled = _K_full.copy()
-    _K_scaled[0, :] *= _W_crop / _W_full   # scale fx and cx
-    _K_scaled[1, :] *= _H_crop / _H_full   # scale fy and cy
+    _K_scaled[0, :] *= _W_resize / _W_full
+    _K_scaled[1, :] *= _H_resize / _H_full
+    _K_scaled[0, 2] -= (_W_resize - _W_crop) / 2.0
+    _K_scaled[1, 2] -= (_H_resize - _H_crop) / 2.0
     K = torch.from_numpy(_K_scaled).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -657,6 +662,7 @@ def main() -> None:
                 "val_l1":    val_l1,
                 "base":      args.base_channels,
                 "ema_decay": args.ema_decay,
+                "intrinsics_transform": "resize_center_crop",
             }, ckpt_path)
             print(f"  → new best checkpoint saved (val L1 = {val_l1:.4f} m)")
 
@@ -667,6 +673,7 @@ def main() -> None:
         "val_l1": val_l1,
         "base":   args.base_channels,
         "ema_decay": args.ema_decay,
+        "intrinsics_transform": "resize_center_crop",
     }, args.out_dir / "last.pth")
 
     writer.close()

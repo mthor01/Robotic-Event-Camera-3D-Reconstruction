@@ -612,6 +612,11 @@ def _build_model(
         coarse_cost_channels=int(metadata.get("coarse_cost_channels", 0)),
         fine_cost_channels=int(metadata.get("fine_cost_channels", 0)),
         refiner_channels=int(metadata.get("refiner_channels", 0)),
+        refiner_max_residual_m=metadata.get("refiner_max_residual_m"),
+        refiner_reference_input=not bool(
+            metadata.get("no_refiner_reference_input", False)
+        ),
+        no_2d_refinement=bool(metadata.get("no_2d_refinement", False)),
         hourglass_levels=int(metadata.get("hourglass_levels", 2)),
         coarse_hourglass_levels=int(metadata.get("coarse_hourglass_levels", 0)),
         fine_hourglass_levels=int(metadata.get("fine_hourglass_levels", 0)),
@@ -687,35 +692,34 @@ def _worst_fraction_l1(errors: np.ndarray, fraction: float = 0.10) -> float:
 
 
 def _boundary_masks(
-    gt: torch.Tensor,
-    valid: torch.Tensor,
-    threshold_m: float,
+    domain: torch.Tensor,
+    evaluation_valid: torch.Tensor,
     dilation_px: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return valid boundary and non-boundary masks for a single depth map."""
-    depth = gt[None, None]
-    mask = valid[None, None].bool()
-    edge = torch.zeros_like(mask)
+    """Split evaluated pixels by proximity to the edge of a valid domain.
 
-    horizontal_valid = mask[:, :, :, 1:] & mask[:, :, :, :-1]
-    horizontal_edge = (
-        torch.abs(depth[:, :, :, 1:] - depth[:, :, :, :-1]) >= threshold_m
-    ) & horizontal_valid
-    edge[:, :, :, 1:] |= horizontal_edge
-    edge[:, :, :, :-1] |= horizontal_edge
+    A boundary starts on the inside of ``domain`` wherever a four-connected
+    neighbour is outside it.  For spatially masked evaluation, ``domain`` is
+    defined GT intersected with the spatial mask; consequently undefined GT
+    and pixels outside the spatial mask both produce a boundary.
+    """
+    domain = domain[None, None].bool()
+    evaluation_mask = evaluation_valid[None, None].bool()
+    edge = torch.zeros_like(domain)
 
-    vertical_valid = mask[:, :, 1:, :] & mask[:, :, :-1, :]
-    vertical_edge = (
-        torch.abs(depth[:, :, 1:, :] - depth[:, :, :-1, :]) >= threshold_m
-    ) & vertical_valid
-    edge[:, :, 1:, :] |= vertical_edge
-    edge[:, :, :-1, :] |= vertical_edge
+    horizontal_transition = domain[:, :, :, 1:] != domain[:, :, :, :-1]
+    edge[:, :, :, 1:] |= horizontal_transition & domain[:, :, :, 1:]
+    edge[:, :, :, :-1] |= horizontal_transition & domain[:, :, :, :-1]
+
+    vertical_transition = domain[:, :, 1:, :] != domain[:, :, :-1, :]
+    edge[:, :, 1:, :] |= vertical_transition & domain[:, :, 1:, :]
+    edge[:, :, :-1, :] |= vertical_transition & domain[:, :, :-1, :]
 
     if dilation_px > 0:
         kernel = 2 * dilation_px + 1
         edge = F.max_pool2d(edge.float(), kernel, stride=1, padding=dilation_px) > 0
-    boundary = edge & mask
-    non_boundary = (~edge) & mask
+    boundary = edge & evaluation_mask
+    non_boundary = (~edge) & evaluation_mask
     return boundary[0, 0], non_boundary[0, 0]
 
 
@@ -2211,6 +2215,12 @@ def _evaluate_checkpoint(
         _required_metadata(metadata, "pose_move_threshold", 0.01)
     )
     num_depths = int(_required_metadata(metadata, "num_depths", 32))
+    linear_depth_candidates = bool(
+        _required_metadata(metadata, "linear_depth_candidates", False)
+    )
+    gaussian_depth_candidates = bool(
+        _required_metadata(metadata, "gaussian_depth_candidates", False)
+    )
 
     evaluation_root = args.data_dir
     sequence_dirs = _find_sequences(evaluation_root)
@@ -2288,9 +2298,10 @@ def _evaluate_checkpoint(
             pose_view_selection=pose_view_selection,
             pose_move_threshold=pose_move_threshold,
             num_depths=num_depths,
+            linear_depth_candidates=linear_depth_candidates,
+            gaussian_depth_candidates=gaussian_depth_candidates,
             use_mask=not args.no_mask,
             fill_invalid=args.fill_invalid,
-            fix_transform=args.fix_transform,
             pose_channels=pose_channels,
             recurrent=recurrent_model,
             recurrent_enrollment_range=recurrent_enrollment_range,
@@ -2499,10 +2510,10 @@ def _evaluate_checkpoint(
                             "valid": valid_np.copy(),
                         }
 
+                    gt_defined_t = torch.isfinite(gt_t) & (gt_t > 0.0)
                     boundary_mask, non_boundary_mask = _boundary_masks(
-                        gt_t,
+                        gt_defined_t,
                         valid_t,
-                        threshold_m=args.boundary_threshold,
                         dilation_px=args.boundary_dilation,
                     )
                     error_np = np.abs(pred_np - gt_np)
@@ -2516,10 +2527,13 @@ def _evaluate_checkpoint(
                     masked_valid_t = torch.from_numpy(
                         measured_prediction_valid & boundary_spatial_mask
                     )
+                    masked_domain_t = torch.from_numpy(
+                        (np.isfinite(gt_np) & (gt_np > 0.0))
+                        & boundary_spatial_mask
+                    )
                     masked_boundary_mask, masked_non_boundary_mask = _boundary_masks(
-                        gt_t,
+                        masked_domain_t,
                         masked_valid_t,
-                        threshold_m=args.boundary_threshold,
                         dilation_px=args.boundary_dilation,
                     )
                     masked_boundary_np = masked_boundary_mask.numpy()
@@ -2769,6 +2783,8 @@ def _evaluate_checkpoint(
             "pose_view_selection": pose_view_selection,
             "pose_move_threshold_m": pose_move_threshold,
             "num_depths": num_depths,
+            "linear_depth_candidates": linear_depth_candidates,
+            "gaussian_depth_candidates": gaussian_depth_candidates,
             "fine_depths": metadata.get("fine_depths"),
             "feature_encoder": metadata.get("feature_encoder"),
             "decoder_type": metadata.get("decoder_type", "auto"),
@@ -2776,8 +2792,12 @@ def _evaluate_checkpoint(
         "evaluation_configuration": {
             "use_spatial_mask": not args.no_mask,
             "fill_invalid": args.fill_invalid,
+            "intrinsics_transform": "resize_center_crop",
             "frame_step": args.fast_mode,
-            "boundary_threshold_m": args.boundary_threshold,
+            "boundary_definition": (
+                "inside pixel adjacent (4-connected) to undefined GT or "
+                "outside the spatial mask"
+            ),
             "boundary_dilation_px": args.boundary_dilation,
             "boundary_spatial_mask_offset_m": (
                 BOUNDARY_SPATIAL_MASK_OFFSET_M
@@ -2925,20 +2945,13 @@ def _parse_args() -> argparse.Namespace:
         help="Fill invalid GT pixels using the table-plane prior before evaluation.",
     )
     parser.add_argument(
-        "-fix_transform",
-        "--fix_transform",
-        action="store_true",
-        help=(
-            "Opt-in geometry fix for MVS checkpoints: scale event intrinsics "
-            "through the stored resize + centred crop transform. Use this when "
-            "evaluating models trained with -fix_transform."
-        ),
-    )
-    parser.add_argument(
         "--boundary_threshold",
         type=float,
         default=0.02,
-        help="Minimum neighbouring GT depth jump in metres defining a boundary.",
+        help=(
+            "Deprecated compatibility option; boundary detection now uses "
+            "defined/undefined and inside/outside spatial-mask transitions."
+        ),
     )
     parser.add_argument(
         "--boundary_dilation",
@@ -3013,8 +3026,6 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--workers must be >= 0")
     if args.fast_mode <= 0:
         parser.error("--fast_mode must be > 0")
-    if args.boundary_threshold <= 0:
-        parser.error("--boundary_threshold must be > 0")
     if args.boundary_dilation < 0:
         parser.error("--boundary_dilation must be >= 0")
     if args.mvc_frame_offset <= 0:

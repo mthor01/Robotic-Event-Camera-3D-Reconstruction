@@ -4,19 +4,19 @@ Pose source: 52490 recorded poses (new)
 
 Target XYZ [m]: [0.35, 0.0, 0.12]
 Hemisphere center XYZ [m]: [0.35, 0.0, 0.12]
-Inner/outer radius [m]: 0.2 / 0.37
-Allowed base XY radius [m]: 0.4 / 0.55
-Minimum Z [m]: 0.15
+Inner/outer radius [m]: 0.22 / 0.33
+Allowed base XY radius [m]: 0.38 / 0.52
+Minimum Z [m]: 0.23
 Configured poses per run: 30
 Displayed position type: event-camera
 
 Loaded/generated positions: 52490
-Positions inside sampler region: 50088
-Fraction inside sampler region: 95.424%
-Valid EE XYZ minimum [m]: [0.2672194678913815, -0.3355228161721129, 0.21022261759139174]
-Valid EE XYZ maximum [m]: [0.549883349737503, 0.328999682567278, 0.37704960290113715]
-Displayed XYZ minimum [m]: [0.2430399242853243, -0.40917840489965007, 0.14187508214984246]
-Displayed XYZ maximum [m]: [0.6444664956738274, 0.39998547930152495, 0.3828211869252553]
+Positions inside sampler region: 40963
+Fraction inside sampler region: 78.040%
+Valid EE XYZ minimum [m]: [0.26017605714580044, -0.308558807192061, 0.23000142682508062]
+Valid EE XYZ maximum [m]: [0.5199199931827404, 0.3071398830671499, 0.37704960290113715]
+Displayed XYZ minimum [m]: [0.23973000224923538, -0.3802122935675464, 0.1638911013795783]
+Displayed XYZ maximum [m]: [0.6145817394147502, 0.38156212749406776, 0.3828211869252553]
 
 Scope: sampler position constraints only; IK/collision feasibility is not tested.
 

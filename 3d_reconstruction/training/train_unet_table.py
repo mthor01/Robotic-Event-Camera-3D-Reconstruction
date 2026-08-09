@@ -47,6 +47,7 @@ from train_unet import (
     DEPTH_MIN, D_MAX, NUM_BINS, _SCRIPT_DIR, DATA_ROOT,
     UNet, compute_loss, _l1_metres, _worst_percent_l1_metres,
 )
+from config import TRAIN_CROP_HW, TRAIN_RESIZE_HW
 from tensorboard_helper import (
     DEFAULT_TB_ROOT,
     ErrorDistributionSpatialLogger,
@@ -114,10 +115,13 @@ def _compute_table_plane_channel(
     how GT depth is normalised during training.
     Pixels whose rays are parallel to the plane, or face away from it, get 0.
     """
-    # Scale K from native resolution to voxel grid resolution
+    # Transform K through the same resize + centred crop as the voxel grid.
+    resize_H, resize_W = TRAIN_RESIZE_HW
     K = K_native.copy().astype(np.float64)
-    K[0, :] *= vox_W / native_W
-    K[1, :] *= vox_H / native_H
+    K[0, :] *= resize_W / native_W
+    K[1, :] *= resize_H / native_H
+    K[0, 2] -= (resize_W - vox_W) / 2.0
+    K[1, 2] -= (resize_H - vox_H) / 2.0
     fx, fy = K[0, 0], K[1, 1]
     cx, cy = K[0, 2], K[1, 2]
 
@@ -223,7 +227,19 @@ class TablePriorDataset(Dataset):
         import h5py
         with h5py.File(self.depth_path,       "r") as f: n_d = f["depth"].shape[0]
         with h5py.File(self.voxels_path,      "r") as f: n_v = f["voxels"].shape[0]
-        with h5py.File(self.table_plane_path, "r") as f: n_t = f["table_plane"].shape[0]
+        with h5py.File(self.table_plane_path, "r") as f:
+            n_t = f["table_plane"].shape[0]
+            transform = f.attrs.get("intrinsics_transform", "")
+            if isinstance(transform, bytes):
+                transform = transform.decode("utf-8", errors="replace")
+            corrected_table_transform = transform == "resize_center_crop"
+        if not corrected_table_transform:
+            raise RuntimeError(
+                f"{self.table_plane_path} uses obsolete direct-scaling geometry. "
+                "Regenerate it with: python3 "
+                "data_precomputation/precompute_table_plane.py --overwrite "
+                f"--data_dir {self.seq_dir}"
+            )
         needs_poses = self.pose_channels or self.pose_view_selection
         if needs_poses:
             if not self.poses_path.exists():
@@ -548,6 +564,10 @@ def run_epoch(
     uncertainty_diag=None,
     uncertainty_weight: float = 1.0,
     depth_aux_weight: float = 0.0,
+    lambda_grad: float = 0.5,
+    lambda_smooth: float = 0.01,
+    lambda_mean: float = 0.1,
+    lambda_normal: float = 0.1,
     ema_model: ModelEMA | None = None,
 ) -> tuple:
     """Return mean loss, L1, p95 absolute error, and worst-10% L1."""
@@ -583,11 +603,21 @@ def run_epoch(
                 )
                 if depth_aux_weight > 0.0:
                     depth_aux_loss, _ = compute_loss(
-                        pred, dep_norm, mask_t, event_for_loss, K=K
+                        pred, dep_norm, mask_t, event_for_loss, K=K,
+                        lambda_grad=lambda_grad,
+                        lambda_smooth=lambda_smooth,
+                        lambda_mean=lambda_mean,
+                        lambda_normal=lambda_normal,
                     )
                     loss = loss + depth_aux_weight * depth_aux_loss
             else:
-                loss, _ = compute_loss(pred, dep_norm, mask_t, event_for_loss, K=K)
+                loss, _ = compute_loss(
+                    pred, dep_norm, mask_t, event_for_loss, K=K,
+                    lambda_grad=lambda_grad,
+                    lambda_smooth=lambda_smooth,
+                    lambda_mean=lambda_mean,
+                    lambda_normal=lambda_normal,
+                )
 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
@@ -733,6 +763,14 @@ def main() -> None:
                         help="Weight for the primary uncertainty negative-log-likelihood term.")
     parser.add_argument("--depth_aux_weight", type=float, default=0.0,
                         help="Optional auxiliary weight for the original depth loss when uncertainty is enabled.")
+    parser.add_argument("--lambda_grad", type=float, default=0.5,
+                        help="Weight for the multi-scale gradient loss.")
+    parser.add_argument("--lambda_smooth", type=float, default=0.01,
+                        help="Weight for the event-aware smoothness loss.")
+    parser.add_argument("--lambda_mean", type=float, default=0.1,
+                        help="Weight for the mean-depth consistency loss.")
+    parser.add_argument("--lambda_normal", type=float, default=0.1,
+                        help="Weight for the surface-normal loss.")
     parser.add_argument("--ema_decay", type=float, default=0.0,
                         help="EMA decay used for validation/checkpoints; 0 disables EMA")
     parser.add_argument("--name",          type=str, default=None,
@@ -757,6 +795,9 @@ def main() -> None:
         parser.error("--recurrent cannot be combined with --pose_view_selection")
     if args.recurrent and args.predict_uncertainty:
         parser.error("--recurrent currently supports the depth head only, not --predict_uncertainty")
+    for loss_flag in ("lambda_grad", "lambda_smooth", "lambda_mean", "lambda_normal"):
+        if getattr(args, loss_flag) < 0:
+            parser.error(f"--{loss_flag} must be >= 0")
     if args.recurrent_enrollment_range < 0:
         parser.error("--recurrent_enrollment_range must be >= 0")
     if args.ema_decay < 0 or args.ema_decay >= 1:
@@ -881,10 +922,14 @@ def main() -> None:
     else:
         model = UNet(in_ch=in_ch, base=base_channels).to(device)
 
-    # K for loss: scale native K to a representative crop resolution
+    # K for loss: use the canonical resize + centred-crop transform.
+    resize_H, resize_W = TRAIN_RESIZE_HW
+    crop_H, crop_W = TRAIN_CROP_HW
     K_loss = K_native.copy()
-    K_loss[0, :] *= 320 / native_W
-    K_loss[1, :] *= 240 / native_H
+    K_loss[0, :] *= resize_W / native_W
+    K_loss[1, :] *= resize_H / native_H
+    K_loss[0, 2] -= (resize_W - crop_W) / 2.0
+    K_loss[1, 2] -= (resize_H - crop_H) / 2.0
     K_tensor = torch.from_numpy(K_loss).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -909,6 +954,11 @@ def main() -> None:
     if args.predict_uncertainty:
         print(f"  Uncertainty head enabled; primary NLL weight = {args.uncertainty_weight:g}")
         print(f"  Auxiliary depth-loss weight = {args.depth_aux_weight:g}")
+    print(
+        f"  Depth-loss weights: gradient={args.lambda_grad:g}, "
+        f"smoothness={args.lambda_smooth:g}, mean={args.lambda_mean:g}, "
+        f"normal={args.lambda_normal:g}"
+    )
     if args.recurrent:
         print(
             f"  Recurrent mode: ConvGRU bottleneck, enrollment_range="
@@ -969,6 +1019,10 @@ def main() -> None:
                                     uncertainty_diag=uncertainty_train,
                                     uncertainty_weight=args.uncertainty_weight,
                                     depth_aux_weight=args.depth_aux_weight,
+                                    lambda_grad=args.lambda_grad,
+                                    lambda_smooth=args.lambda_smooth,
+                                    lambda_mean=args.lambda_mean,
+                                    lambda_normal=args.lambda_normal,
                                     ema_model=ema)
         validation_model = ema.model if ema is not None else model
         va_loss, va_l1, va_p95, va_worst10 = run_epoch(validation_model, val_loader, None, device,
@@ -977,7 +1031,11 @@ def main() -> None:
                                     error_diag=error_val,
                                     uncertainty_diag=uncertainty_val,
                                     uncertainty_weight=args.uncertainty_weight,
-                                    depth_aux_weight=args.depth_aux_weight)
+                                    depth_aux_weight=args.depth_aux_weight,
+                                    lambda_grad=args.lambda_grad,
+                                    lambda_smooth=args.lambda_smooth,
+                                    lambda_mean=args.lambda_mean,
+                                    lambda_normal=args.lambda_normal)
         scheduler.step()
 
         viz_train.flush(step=epoch)
@@ -1033,10 +1091,15 @@ def main() -> None:
             "recurrent": args.recurrent,
             "recurrent_enrollment_range": args.recurrent_enrollment_range,
             "early_fusion_views": True,
+            "intrinsics_transform": "resize_center_crop",
             "table_z": table_z_ckpt,
             "predict_uncertainty": args.predict_uncertainty,
             "uncertainty_weight": args.uncertainty_weight,
             "depth_aux_weight": args.depth_aux_weight,
+            "lambda_grad": args.lambda_grad,
+            "lambda_smooth": args.lambda_smooth,
+            "lambda_mean": args.lambda_mean,
+            "lambda_normal": args.lambda_normal,
             "ema_decay": args.ema_decay,
         }
         if va_l1 < best_val_l1:

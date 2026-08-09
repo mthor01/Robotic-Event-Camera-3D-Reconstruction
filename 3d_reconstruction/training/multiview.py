@@ -24,7 +24,7 @@ Usage:
     python3 training/multiview.py --pose_view_selection --pose_move_threshold 0.01 --num_views 5
     python3 training/multiview.py --masked_warp_aggregation
     python3 training/multiview.py --cost_volume_ref_features
-    python3 training/multiview.py --model_scale 1.5
+    python3 training/multiview.py --base_channels 64 --feature_channels 256 --cost_channels 32
     python3 training/multiview.py --feature_encoder resnet18_h4
 """
 
@@ -36,6 +36,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import NormalDist
 
 import numpy as np
 import torch
@@ -46,7 +47,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from train_unet import (
     DEPTH_MIN, D_MAX, NUM_BINS, _SCRIPT_DIR, DATA_ROOT,
-    compute_loss, _l1_metres, _worst_percent_l1_metres,
+    compute_loss, _l1_metres, _smoothness_loss, _worst_percent_l1_metres,
 )
 from tensorboard_helper import (
     DEFAULT_TB_ROOT,
@@ -69,14 +70,14 @@ class MultiViewAugConfig:
     event_noise_per_view: bool = True
     cross_view_event_dropout: bool = True
     occlusion_view_masking: bool = True
-    source_view_dropout_prob: float = 0.25
-    pose_translation_std: float = 0.002
-    pose_rotation_std_deg: float = 0.35
-    event_noise_std: float = 0.03
-    cross_view_event_dropout_prob: float = 0.04
-    occlusion_prob: float = 0.45
-    occlusion_max_rects: int = 2
-    occlusion_frac_range: tuple[float, float] = (0.08, 0.28)
+    source_view_dropout_prob: float = 0.10
+    pose_translation_std: float = 0.001
+    pose_rotation_std_deg: float = 0.15
+    event_noise_std: float = 0.01
+    cross_view_event_dropout_prob: float = 0.02
+    occlusion_prob: float = 0.20
+    occlusion_max_rects: int = 1
+    occlusion_frac_range: tuple[float, float] = (0.05, 0.15)
 
 
 # ---------------------------------------------------------------------------
@@ -101,15 +102,6 @@ def _load_event_calibration() -> dict:
     }
 
 
-def _scale_K(K: np.ndarray, native_hw: tuple[int, int], target_hw: tuple[int, int]) -> np.ndarray:
-    native_h, native_w = native_hw
-    target_h, target_w = target_hw
-    K_scaled = K.copy()
-    K_scaled[0, :] *= target_w / native_w
-    K_scaled[1, :] *= target_h / native_h
-    return K_scaled.astype(np.float32)
-
-
 def _scale_K_resize_crop(
     K: np.ndarray,
     native_hw: tuple[int, int],
@@ -119,8 +111,7 @@ def _scale_K_resize_crop(
     """Scale event intrinsics through resize + centred crop.
 
     This matches the preprocessing used by project_realsense_to_event.py and
-    precompute_voxels.py. The historical direct native->tensor scaling remains
-    unchanged unless --fix_transform is enabled.
+    precompute_voxels.py.
     """
     native_h, native_w = native_hw
     resize_h, resize_w = resize_hw
@@ -140,8 +131,45 @@ def _inverse_depth_candidates(num_depths: int, depth_min: float, depth_max: floa
     return (1.0 / inv).astype(np.float32)
 
 
-def _table_plane_filename(fix_transform: bool) -> str:
-    return "fixed_table_plane.h5" if fix_transform else "table_plane.h5"
+def _linear_depth_candidates(num_depths: int, depth_min: float, depth_max: float) -> np.ndarray:
+    """Return uniformly spaced metric-depth hypotheses."""
+    if num_depths < 2:
+        raise ValueError(f"--num_depths must be >= 2, got {num_depths}")
+    return np.linspace(depth_min, depth_max, num_depths, dtype=np.float32)
+
+
+def _gaussian_depth_candidates(
+    num_depths: int,
+    depth_min: float,
+    depth_max: float,
+) -> np.ndarray:
+    """Return quantiles of a midpoint-centred Gaussian truncated to the range.
+
+    The standard deviation is one sixth of the depth range, placing the range
+    boundaries at mean +/- three standard deviations. Sampling evenly in the
+    truncated CDF concentrates hypotheses near the middle while retaining the
+    exact minimum and maximum depths.
+    """
+    if num_depths < 2:
+        raise ValueError(f"--num_depths must be >= 2, got {num_depths}")
+    if depth_max <= depth_min:
+        raise ValueError(
+            f"depth_max must be greater than depth_min, got {depth_min} and {depth_max}"
+        )
+
+    mean = 0.5 * (depth_min + depth_max)
+    std = (depth_max - depth_min) / 6.0
+    distribution = NormalDist(mu=mean, sigma=std)
+    cdf_min = distribution.cdf(depth_min)
+    cdf_max = distribution.cdf(depth_max)
+    quantiles = np.linspace(cdf_min, cdf_max, num_depths, dtype=np.float64)
+    candidates = np.asarray(
+        [distribution.inv_cdf(float(q)) for q in quantiles],
+        dtype=np.float32,
+    )
+    candidates[0] = np.float32(depth_min)
+    candidates[-1] = np.float32(depth_max)
+    return candidates
 
 
 def _pose_channels_from_base_event(T_base_from_event: np.ndarray) -> np.ndarray:
@@ -278,9 +306,10 @@ class MultiViewTableDataset(Dataset):
         pose_view_selection: bool = False,
         pose_move_threshold: float = 0.01,
         num_depths: int = 32,
+        linear_depth_candidates: bool = False,
+        gaussian_depth_candidates: bool = False,
         use_mask: bool = True,
         fill_invalid: bool = False,
-        fix_transform: bool = False,
         pose_channels: bool = False,
         recurrent: bool = False,
         recurrent_enrollment_range: int = 0,
@@ -319,7 +348,7 @@ class MultiViewTableDataset(Dataset):
         self.depth_path = self.seq_dir / "hdf5" / "depth_in_event_frame.h5"
         self.mask_path = self.seq_dir / "hdf5" / "spatial_mask.h5"
         self.poses_path = self.seq_dir / "hdf5" / "poses.h5"
-        self.table_plane_path = self.seq_dir / "hdf5" / _table_plane_filename(fix_transform)
+        self.table_plane_path = self.seq_dir / "hdf5" / "table_plane.h5"
 
         for p in (self.voxels_path, self.depth_path, self.poses_path, self.table_plane_path):
             if not p.exists():
@@ -334,34 +363,52 @@ class MultiViewTableDataset(Dataset):
             vox_attrs = dict(f["voxels"].attrs)
         with h5py.File(self.table_plane_path, "r") as f:
             n_t = f["table_plane"].shape[0]
-            table_fix_transform = bool(f.attrs.get("fix_transform", False))
+            transform = f.attrs.get("intrinsics_transform", "")
+            if isinstance(transform, bytes):
+                transform = transform.decode("utf-8", errors="replace")
+            corrected_table_transform = transform == "resize_center_crop"
         with h5py.File(self.poses_path, "r") as f:
             ee_T = f["ee_T"][:].astype(np.float32)
 
         self.n_frames = min(n_d, n_v, n_t, len(ee_T))
         self.has_mask = use_mask and self.mask_path.exists()
-        if fix_transform and not table_fix_transform:
-            print(
-                f"  [{self.seq_dir.name}] WARNING: -fix_transform is active for MVS K, "
-                f"but hdf5/{self.table_plane_path.name} was not marked as fixed. Re-run "
-                "data_precomputation/precompute_table_plane.py -fix_transform for a "
-                "fully consistent table prior."
+        if not corrected_table_transform:
+            raise RuntimeError(
+                f"{self.table_plane_path} uses obsolete direct-scaling geometry. "
+                "Regenerate it with: python3 "
+                "data_precomputation/precompute_table_plane.py --overwrite "
+                f"--data_dir {self.seq_dir}"
             )
-        if fix_transform:
-            native_h, native_w = calib["native_hw"]
-            resize_h = int(vox_attrs.get("resize_h", vox_h))
-            resize_w = int(vox_attrs.get("resize_w", vox_w))
-            crop_h = int(vox_attrs.get("crop_h", vox_h))
-            crop_w = int(vox_attrs.get("crop_w", vox_w))
-            self.K = _scale_K_resize_crop(
-                calib["K_native"],
-                (native_h, native_w),
-                (resize_h, resize_w),
-                (crop_h, crop_w),
+        native_h, native_w = calib["native_hw"]
+        resize_h = int(vox_attrs.get("resize_h", vox_h))
+        resize_w = int(vox_attrs.get("resize_w", vox_w))
+        crop_h = int(vox_attrs.get("crop_h", vox_h))
+        crop_w = int(vox_attrs.get("crop_w", vox_w))
+        self.K = _scale_K_resize_crop(
+            calib["K_native"],
+            (native_h, native_w),
+            (resize_h, resize_w),
+            (crop_h, crop_w),
+        )
+        self.linear_depth_candidates = bool(linear_depth_candidates)
+        self.gaussian_depth_candidates = bool(gaussian_depth_candidates)
+        if self.linear_depth_candidates and self.gaussian_depth_candidates:
+            raise ValueError(
+                "--linear_depth_candidates and --gaussian_depth_candidates "
+                "are mutually exclusive"
+            )
+        if self.gaussian_depth_candidates:
+            self.depth_values = _gaussian_depth_candidates(
+                num_depths, DEPTH_MIN, D_MAX
+            )
+        elif self.linear_depth_candidates:
+            self.depth_values = _linear_depth_candidates(
+                num_depths, DEPTH_MIN, D_MAX
             )
         else:
-            self.K = _scale_K(calib["K_native"], calib["native_hw"], (vox_h, vox_w))
-        self.depth_values = _inverse_depth_candidates(num_depths, DEPTH_MIN, D_MAX)
+            self.depth_values = _inverse_depth_candidates(
+                num_depths, DEPTH_MIN, D_MAX
+            )
 
         ee_T = ee_T[:self.n_frames]
         T_ee_inv = np.linalg.inv(ee_T)
@@ -527,7 +574,10 @@ class MultiViewTableDataset(Dataset):
         drop = torch.rand(imgs.shape[0] - 1) < p
         if len(drop) > 1 and drop.all():
             drop[torch.randint(0, len(drop), (1,)).item()] = False
-        imgs[1:][drop] = 0.0
+        # Drop only source event measurements.  The table-plane channel is a
+        # deterministic geometric input and should not disappear with events.
+        source_events = imgs[1:, :NUM_BINS]
+        source_events[drop] = 0.0
         return imgs
 
     def _apply_pose_noise(self, cam_mats: torch.Tensor) -> torch.Tensor:
@@ -535,17 +585,21 @@ class MultiViewTableDataset(Dataset):
         rot_std = np.deg2rad(self.aug.pose_rotation_std_deg)
         for v in range(1, cam_mats.shape[0]):
             delta = torch.eye(4, dtype=cam_mats.dtype)
+            axis = torch.randn(3, dtype=cam_mats.dtype)
+            axis = axis / torch.linalg.norm(axis).clamp_min(1e-12)
+            angle = torch.randn((), dtype=cam_mats.dtype) * rot_std
             delta[:3, :3] = self._axis_angle_to_matrix(
-                torch.randn(3, dtype=cam_mats.dtype) * rot_std
+                axis * angle
             )
             delta[:3, 3] = torch.randn(3, dtype=cam_mats.dtype) * trans_std
             cam_mats[v] = delta @ cam_mats[v]
         return cam_mats
 
     def _apply_event_noise_per_view(self, imgs: torch.Tensor) -> torch.Tensor:
-        imgs[:, :NUM_BINS] = imgs[:, :NUM_BINS] + (
-            torch.randn_like(imgs[:, :NUM_BINS]) * self.aug.event_noise_std
-        )
+        events = imgs[:, :NUM_BINS]
+        # Perturb recorded activity without inventing events in empty voxels.
+        active = events != 0
+        events.add_(torch.randn_like(events) * self.aug.event_noise_std * active)
         return imgs
 
     def _apply_cross_view_event_dropout(self, imgs: torch.Tensor) -> torch.Tensor:
@@ -568,7 +622,9 @@ class MultiViewTableDataset(Dataset):
                 rect_w = max(1, int(round(float(torch.empty(()).uniform_(lo, hi)) * w)))
                 y0 = int(torch.randint(0, max(h - rect_h + 1, 1), (1,)).item())
                 x0 = int(torch.randint(0, max(w - rect_w + 1, 1), (1,)).item())
-                imgs[v, :, y0:y0 + rect_h, x0:x0 + rect_w] = 0.0
+                # Occlusion represents missing event measurements, not missing
+                # deterministic table geometry.
+                imgs[v, :NUM_BINS, y0:y0 + rect_h, x0:x0 + rect_w] = 0.0
         return imgs
 
     def _apply_augmentations(
@@ -595,10 +651,12 @@ class MultiViewTableDataset(Dataset):
     def __getitem__(self, item: int):
         self._open()
         idx = int(self.valid_indices[item])
-        if self.pose_view_selection:
-            view_ids = self.pose_view_ids[idx]
-        elif self.recurrent:
+        if self.recurrent:
             view_ids = list(range(idx - self.recurrent_enrollment_range, idx + 1))
+        elif self.num_views == 1:
+            view_ids = [idx]
+        elif self.pose_view_selection:
+            view_ids = self.pose_view_ids[idx]
         else:
             view_ids = [idx] + [idx + o for o in self.src_offsets]
 
@@ -957,6 +1015,7 @@ class MultiViewDepthNet(nn.Module):
         coarse_cost_channels: int = 0,
         fine_cost_channels: int = 0,
         refiner_channels: int = 0,
+        refiner_max_residual_m: float | None = None,
         hourglass_levels: int = 2,
         coarse_hourglass_levels: int = 0,
         fine_hourglass_levels: int = 0,
@@ -985,6 +1044,8 @@ class MultiViewDepthNet(nn.Module):
         fullres_fine_volume: bool = False,
         h4_coarse_volume: bool = False,
         decoder_type: str = "auto",
+        refiner_reference_input: bool = True,
+        no_2d_refinement: bool = False,
     ):
         super().__init__()
         del (
@@ -993,6 +1054,7 @@ class MultiViewDepthNet(nn.Module):
             coarse_cost_channels,
             fine_cost_channels,
             refiner_channels,
+            refiner_max_residual_m,
             hourglass_levels,
             coarse_hourglass_levels,
             fine_hourglass_levels,
@@ -1021,6 +1083,8 @@ class MultiViewDepthNet(nn.Module):
             fullres_fine_volume,
             h4_coarse_volume,
             decoder_type,
+            refiner_reference_input,
+            no_2d_refinement,
         )
         if fine_depths < 3:
             raise ValueError(f"fine_depths must be >= 3, got {fine_depths}")
@@ -1299,6 +1363,7 @@ def run_epoch(
     lambda_mean: float = 0.1,
     lambda_normal: float = 0.1,
     l1_loss_only: bool = False,
+    loss_mode: str = "legacy",
     coarse_supervision: bool = False,
     coarse_loss_weight: float = 0.3,
     uncertainty: bool = False,
@@ -1329,6 +1394,23 @@ def run_epoch(
     t_last = t_phase_start
     batches_at_last_log = 0
     use_cuda = device.type == "cuda" and torch.cuda.is_available()
+    depth_range_m = D_MAX - DEPTH_MIN
+
+    def normalized_l1(prediction: torch.Tensor, target: torch.Tensor,
+                      valid: torch.Tensor) -> torch.Tensor:
+        target_norm = ((target - DEPTH_MIN) / depth_range_m).clamp(0.0, 1.0)
+        return (
+            torch.abs(prediction - target_norm) * valid
+        ).sum() / valid.sum().clamp_min(1.0)
+
+    def normalized_worst_l1(prediction: torch.Tensor, target: torch.Tensor,
+                            valid: torch.Tensor) -> torch.Tensor:
+        target_norm = ((target - DEPTH_MIN) / depth_range_m).clamp(0.0, 1.0)
+        errors = torch.abs(prediction - target_norm)[valid > 0.5]
+        if errors.numel() == 0:
+            return prediction.sum() * 0.0
+        count = max(1, int(np.ceil(errors.numel() * worst_percent)))
+        return torch.topk(errors, k=min(count, errors.numel())).values.mean()
     if use_cuda:
         torch.cuda.reset_peak_memory_stats(device)
 
@@ -1366,8 +1448,12 @@ def run_epoch(
             coarse_pred_loss = None
             if coarse_supervision:
                 coarse_pred_loss = coarse_pred
-            if l1_loss_only:
+            if l1_loss_only or loss_mode == "mvs_l1":
                 loss_final = _l1_metres(pred_loss, dep_t, mask_t)
+                if loss_mode == "mvs_l1" and lambda_smooth > 0:
+                    loss_final = loss_final + lambda_smooth * depth_range_m * _smoothness_loss(
+                        pred_loss, imgs[:, 0, :NUM_BINS], mask_t
+                    )
             else:
                 loss_final, _ = compute_loss(
                     pred_loss,
@@ -1382,12 +1468,15 @@ def run_epoch(
                 )
             loss = loss_final
             if lambda_worst_percent > 0:
-                loss_worst = _worst_percent_l1_metres(
-                    pred_loss,
-                    dep_t,
-                    mask_t,
-                    percent=worst_percent,
-                )
+                if loss_mode == "unit_consistent":
+                    loss_worst = normalized_worst_l1(pred_loss, dep_t, mask_t)
+                else:
+                    loss_worst = _worst_percent_l1_metres(
+                        pred_loss,
+                        dep_t,
+                        mask_t,
+                        percent=worst_percent,
+                    )
                 loss = loss + lambda_worst_percent * loss_worst
             if fine_supervision:
                 fine_pred = getattr(model, "aux_fine_pred", None)
@@ -1398,7 +1487,11 @@ def run_epoch(
                 fine_hw = fine_pred.shape[-2:]
                 fine_depth = F.interpolate(dep_t, size=fine_hw, mode="nearest")
                 fine_mask = F.interpolate(mask_t, size=fine_hw, mode="nearest")
-                loss_fine = _l1_metres(fine_pred, fine_depth, fine_mask)
+                loss_fine = (
+                    normalized_l1(fine_pred, fine_depth, fine_mask)
+                    if loss_mode == "unit_consistent"
+                    else _l1_metres(fine_pred, fine_depth, fine_mask)
+                )
                 loss = loss + fine_loss_weight * loss_fine
             if middle_supervision:
                 middle_pred = getattr(model, "aux_middle_pred", None)
@@ -1410,13 +1503,19 @@ def run_epoch(
                 middle_hw = middle_pred.shape[-2:]
                 middle_depth = F.interpolate(dep_t, size=middle_hw, mode="nearest")
                 middle_mask = F.interpolate(mask_t, size=middle_hw, mode="nearest")
-                loss_middle = _l1_metres(
-                    middle_pred, middle_depth, middle_mask
+                loss_middle = (
+                    normalized_l1(middle_pred, middle_depth, middle_mask)
+                    if loss_mode == "unit_consistent"
+                    else _l1_metres(middle_pred, middle_depth, middle_mask)
                 )
                 loss = loss + middle_loss_weight * loss_middle
             if coarse_supervision:
-                if l1_loss_only:
+                if l1_loss_only or loss_mode == "mvs_l1":
                     loss_coarse = _l1_metres(coarse_pred_loss, dep_t, mask_t)
+                    if loss_mode == "mvs_l1" and lambda_smooth > 0:
+                        loss_coarse = loss_coarse + lambda_smooth * depth_range_m * _smoothness_loss(
+                            coarse_pred_loss, imgs[:, 0, :NUM_BINS], mask_t
+                        )
                 else:
                     loss_coarse, _ = compute_loss(
                         coarse_pred_loss,
@@ -1680,24 +1779,24 @@ def debug_multiview_samples(
 # Main
 # ---------------------------------------------------------------------------
 
-def _is_sequence(p: Path, fix_transform: bool = False) -> bool:
+def _is_sequence(p: Path) -> bool:
     return (
         (p / "events" / "voxels_cam0.h5").exists()
         and (p / "hdf5" / "depth_in_event_frame.h5").exists()
         and (p / "hdf5" / "poses.h5").exists()
-        and (p / "hdf5" / _table_plane_filename(fix_transform)).exists()
+        and (p / "hdf5" / "table_plane.h5").exists()
     )
 
 
-def _find_sequences(root: Path, fix_transform: bool = False) -> list[Path]:
+def _find_sequences(root: Path) -> list[Path]:
     """Return a sequence at root, or all valid immediate child sequences."""
-    if _is_sequence(root, fix_transform=fix_transform):
+    if _is_sequence(root):
         return [root]
     if not root.is_dir():
         return []
     return sorted(
         d for d in root.iterdir()
-        if d.is_dir() and _is_sequence(d, fix_transform=fix_transform)
+        if d.is_dir() and _is_sequence(d)
     )
 
 
@@ -1834,6 +1933,18 @@ def main() -> None:
                         help="Weight for surface-normal loss term.")
     parser.add_argument("--l1_loss_only", action="store_true",
                         help="Train directly with masked metric L1 in metres, ignoring auxiliary loss terms.")
+    parser.add_argument(
+        "--loss_mode",
+        choices=("legacy", "mvs_l1", "unit_consistent"),
+        default="legacy",
+        help=(
+            "legacy preserves the original mixed-unit objective; mvs_l1 uses "
+            "masked L1 in metres at every enabled MVS stage and optionally "
+            "adds metre-scale event smoothness; unit_consistent keeps the "
+            "composite objective but expresses auxiliary and worst-pixel "
+            "depth losses in normalized-depth units."
+        ),
+    )
     parser.add_argument("--lambda_worst_percent", type=float, default=0.0,
                         help="Weight for metric L1 over the worst valid prediction pixels")
     parser.add_argument("--worst_percent", type=float, default=0.10,
@@ -1876,6 +1987,32 @@ def main() -> None:
                         help="CasMVSNet FPN only: H/4 3D hourglass base width; 0 uses --cost_channels")
     parser.add_argument("--refiner_channels", type=int, default=0,
                         help="Modern MVS only: full-resolution 2D refiner width; 0 selects automatically")
+    parser.add_argument(
+        "--refiner_max_residual_m",
+        type=float,
+        default=None,
+        help=(
+            "Modern MVS only: override the symmetric maximum metric-depth "
+            "correction of the 2-D refiner in metres; omitted uses "
+            "min(0.05, fine_window)."
+        ),
+    )
+    parser.add_argument(
+        "--no_refiner_reference_input",
+        action="store_true",
+        help=(
+            "Modern MVS only: omit the raw full-resolution reference event/prior "
+            "tensor from the 2-D refiner while retaining fine FPN features and depth."
+        ),
+    )
+    parser.add_argument(
+        "--no_2d_refinement",
+        action="store_true",
+        help=(
+            "Modern MVS only: bypass full-resolution 2-D residual refinement and "
+            "use the bilinearly upsampled fine-stage depth directly."
+        ),
+    )
     parser.add_argument("--hourglass_levels", type=int, default=2,
                         help="Modern MVS only: fallback number of 3D hourglass levels for both stages")
     parser.add_argument("--coarse_hourglass_levels", type=int, default=0,
@@ -1926,8 +2063,6 @@ def main() -> None:
                         help="Modern MVS only: Dropout3d probability at hourglass bottlenecks")
     parser.add_argument("--drop_path_rate", type=float, default=0.0,
                         help="Modern MVS only: stochastic-depth rate on FPN fusion")
-    parser.add_argument("--model_scale", type=float, default=1.0,
-                        help="Width multiplier for base_channels and derived feature/cost channels; explicit feature/cost overrides still win")
     parser.add_argument("--num_views", type=int, default=5)
     parser.add_argument("--view_interval", type=int, default=5)
     parser.add_argument("--pose_view_selection", action="store_true",
@@ -1935,7 +2070,25 @@ def main() -> None:
     parser.add_argument("--pose_move_threshold", type=float, default=0.01,
                         help="Minimum camera-center translation in metres between consecutive selected pose views")
     parser.add_argument("--num_depths", type=int, default=32,
-                        help="Number of coarse inverse-depth planes between DEPTH_MIN and D_MAX")
+                        help="Number of global/coarse depth planes between DEPTH_MIN and D_MAX")
+    coarse_candidate_group = parser.add_mutually_exclusive_group()
+    coarse_candidate_group.add_argument(
+        "--linear_depth_candidates",
+        action="store_true",
+        help=(
+            "Use uniformly spaced metric-depth hypotheses for the global/coarse "
+            "cost volume instead of the default inverse-depth spacing."
+        ),
+    )
+    coarse_candidate_group.add_argument(
+        "--gaussian_depth_candidates",
+        action="store_true",
+        help=(
+            "Use quantiles of a midpoint-centred Gaussian truncated to "
+            "[DEPTH_MIN, D_MAX] for the global/coarse cost volume. The "
+            "standard deviation is one sixth of the depth range."
+        ),
+    )
     parser.add_argument("--fine_depths", type=int, default=5,
                         help="Number of fine per-pixel depth hypotheses around the coarse estimate")
     parser.add_argument("--middle_depths", type=int, default=8,
@@ -1971,10 +2124,6 @@ def main() -> None:
                         help="Ignore spatial mask; dep>0 validity is always applied")
     parser.add_argument("--fill_invalid", action="store_true",
                         help="Fill pixels with no depth measurement using the table-plane prior")
-    parser.add_argument("-fix_transform", "--fix_transform", action="store_true",
-                        help="Opt-in geometry fix: scale event intrinsics through the stored "
-                             "resize + centred crop transform instead of the historical direct "
-                             "native-resolution -> tensor-resolution scaling")
     parser.add_argument("--no_augmentations", action="store_true",
                         help="Disable all training-time multi-view data augmentations")
     parser.add_argument("--no_source_view_dropout", action="store_true",
@@ -2002,8 +2151,8 @@ def main() -> None:
 
     if args.pose_view_selection and args.num_views % 2 != 1:
         parser.error("--pose_view_selection requires odd --num_views for balanced before/after sources")
-    if args.model_scale <= 0:
-        parser.error("--model_scale must be > 0")
+    if args.base_channels <= 0:
+        parser.error("--base_channels must be > 0")
     if args.train_sequence_count < 0:
         parser.error("--train_sequence_count must be >= 0")
     if not (0 < args.train_frame_fraction <= 1):
@@ -2032,6 +2181,8 @@ def main() -> None:
         parser.error("--lambda_confidence must be >= 0")
     if args.lambda_worst_percent < 0:
         parser.error("--lambda_worst_percent must be >= 0")
+    if args.l1_loss_only and args.loss_mode != "legacy":
+        parser.error("--l1_loss_only cannot be combined with --loss_mode")
     if not (0 < args.worst_percent <= 1):
         parser.error("--worst_percent must be in (0, 1]")
     if args.correlation_groups < 0:
@@ -2044,6 +2195,43 @@ def main() -> None:
         parser.error("stage-specific cost channel counts must be >= 0")
     if args.refiner_channels < 0:
         parser.error("--refiner_channels must be >= 0")
+    if (
+        args.refiner_max_residual_m is not None
+        and args.refiner_max_residual_m <= 0
+    ):
+        parser.error("--refiner_max_residual_m must be > 0")
+    if (
+        args.refiner_max_residual_m is not None
+        and (args.no_2d_refinement or args.fullres_fine_volume)
+    ):
+        parser.error(
+            "--refiner_max_residual_m requires the 2-D residual refiner"
+        )
+    if args.no_2d_refinement and args.no_refiner_reference_input:
+        parser.error(
+            "--no_refiner_reference_input has no effect with --no_2d_refinement"
+        )
+    if args.no_2d_refinement and args.fullres_fine_volume:
+        parser.error(
+            "--no_2d_refinement cannot be combined with --fullres_fine_volume"
+        )
+    if args.no_2d_refinement and args.convex_upsampling:
+        parser.error(
+            "--no_2d_refinement uses bilinear upsampling and cannot be combined "
+            "with --convex_upsampling"
+        )
+    if args.no_2d_refinement and args.fullres_geometry:
+        parser.error(
+            "--no_2d_refinement cannot be combined with --fullres_geometry"
+        )
+    if args.no_2d_refinement and args.single_view_fallback:
+        parser.error(
+            "--no_2d_refinement cannot be combined with --single_view_fallback"
+        )
+    if args.no_refiner_reference_input and args.fullres_fine_volume:
+        parser.error(
+            "--no_refiner_reference_input has no effect with --fullres_fine_volume"
+        )
     if args.hourglass_levels < 1:
         parser.error("--hourglass_levels must be >= 1")
     if any(x < 0 for x in (
@@ -2071,7 +2259,6 @@ def main() -> None:
         parser.error("--confidence_abs_tolerance must be >= 0")
     if args.confidence_rel_tolerance < 0:
         parser.error("--confidence_rel_tolerance must be >= 0")
-
     if args.name is None and not args.debug_views:
         args.name = input("Enter a run name for the checkpoints: ").strip()
         if not args.name:
@@ -2084,8 +2271,8 @@ def main() -> None:
 
     train_root = args.data_dir / "train"
     eval_root = args.data_dir / "eval"
-    train_seqs = _find_sequences(train_root, fix_transform=args.fix_transform)
-    val_seqs = _find_sequences(eval_root, fix_transform=args.fix_transform)
+    train_seqs = _find_sequences(train_root)
+    val_seqs = _find_sequences(eval_root)
 
     if not train_seqs or not val_seqs:
         missing = []
@@ -2096,7 +2283,7 @@ def main() -> None:
         sys.exit(
             f"[ERROR] No valid sequences found in: {', '.join(missing)}\n"
             "        --data_dir must contain train/ and eval/, each holding one or more\n"
-            f"        valid sequences with voxels, depth, poses.h5, and {_table_plane_filename(args.fix_transform)}.\n"
+            "        valid sequences with voxels, depth, poses.h5, and table_plane.h5.\n"
             "        Run: python3 data_precomputation/precompute_table_plane.py"
         )
 
@@ -2130,9 +2317,10 @@ def main() -> None:
         pose_view_selection=args.pose_view_selection,
         pose_move_threshold=args.pose_move_threshold,
         num_depths=args.num_depths,
+        linear_depth_candidates=args.linear_depth_candidates,
+        gaussian_depth_candidates=args.gaussian_depth_candidates,
         use_mask=not args.no_mask,
         fill_invalid=args.fill_invalid,
-        fix_transform=args.fix_transform,
         pose_channels=False,
     )
     train_aug = MultiViewAugConfig(
@@ -2162,9 +2350,15 @@ def main() -> None:
         )
     else:
         print("  Train frame sampling: all frames")
+    coarse_candidate_distribution = (
+        "gaussian-depth"
+        if args.gaussian_depth_candidates
+        else ("linear-depth" if args.linear_depth_candidates else "inverse-depth")
+    )
     print(
         f"  Multi-view: views={args.num_views}, interval={args.view_interval}, "
-        f"coarse inverse-depth planes={args.num_depths} [{DEPTH_MIN:.3f}, {D_MAX:.3f}] m"
+        f"coarse {coarse_candidate_distribution} "
+        f"planes={args.num_depths} [{DEPTH_MIN:.3f}, {D_MAX:.3f}] m"
     )
     if args.pose_view_selection:
         print(
@@ -2181,7 +2375,7 @@ def main() -> None:
     print(
         f"  Loss weights: grad={args.lambda_grad:g}, smooth={args.lambda_smooth:g}, "
         f"mean={args.lambda_mean:g}, normal={args.lambda_normal:g}, "
-        f"l1_loss_only={args.l1_loss_only}, "
+        f"loss_mode={args.loss_mode}, l1_loss_only={args.l1_loss_only}, "
         f"worst={args.lambda_worst_percent:g} "
         f"(top {100.0 * args.worst_percent:g}%), "
         f"confidence={args.lambda_confidence:g} "
@@ -2201,10 +2395,17 @@ def main() -> None:
         "  Train augmentations: "
         f"enabled={train_aug.enabled}, "
         f"source_view_dropout={train_aug.source_view_dropout}, "
+        f"p={train_aug.source_view_dropout_prob:g}; "
         f"pose_noise={train_aug.pose_noise}, "
+        f"std={train_aug.pose_translation_std:g}m/"
+        f"{train_aug.pose_rotation_std_deg:g}deg; "
         f"event_noise_per_view={train_aug.event_noise_per_view}, "
+        f"std={train_aug.event_noise_std:g}; "
         f"cross_view_event_dropout={train_aug.cross_view_event_dropout}, "
-        f"occlusion_view_masking={train_aug.occlusion_view_masking}\n"
+        f"p={train_aug.cross_view_event_dropout_prob:g}; "
+        f"occlusion_view_masking={train_aug.occlusion_view_masking}, "
+        f"p={train_aug.occlusion_prob:g}, rects<= {train_aug.occlusion_max_rects}, "
+        f"fraction={train_aug.occlusion_frac_range}\n"
     )
 
     if args.debug_views:
@@ -2236,7 +2437,7 @@ def main() -> None:
 
     in_ch = NUM_BINS + 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    base_channels = max(1, int(round(args.base_channels * args.model_scale)))
+    base_channels = args.base_channels
     feature_channels = (
         args.feature_channels if args.feature_channels > 0 else base_channels * 4
     )
@@ -2261,6 +2462,9 @@ def main() -> None:
         coarse_cost_channels=args.coarse_cost_channels,
         fine_cost_channels=args.fine_cost_channels,
         refiner_channels=args.refiner_channels,
+        refiner_max_residual_m=args.refiner_max_residual_m,
+        refiner_reference_input=not args.no_refiner_reference_input,
+        no_2d_refinement=args.no_2d_refinement,
         hourglass_levels=args.hourglass_levels,
         coarse_hourglass_levels=args.coarse_hourglass_levels,
         fine_hourglass_levels=args.fine_hourglass_levels,
@@ -2294,7 +2498,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     model_arch = getattr(model, "architecture_name", model.__class__.__name__)
     print(
-        f"{model_arch}  in_ch={in_ch}  model_scale={args.model_scale:g}  "
+        f"{model_arch}  in_ch={in_ch}  "
         f"base={base_channels}  feature={feature_channels}  "
         f"feature_encoder={args.feature_encoder}  cost={cost_channels}  "
         f"coarse_depths={args.num_depths}  middle_depths={args.middle_depths}  "
@@ -2372,6 +2576,7 @@ def main() -> None:
             lambda_mean=args.lambda_mean,
             lambda_normal=args.lambda_normal,
             l1_loss_only=args.l1_loss_only,
+            loss_mode=args.loss_mode,
             coarse_supervision=args.coarse_supervision,
             uncertainty=args.uncertainty,
             lambda_confidence=args.lambda_confidence,
@@ -2398,6 +2603,7 @@ def main() -> None:
             lambda_mean=args.lambda_mean,
             lambda_normal=args.lambda_normal,
             l1_loss_only=args.l1_loss_only,
+            loss_mode=args.loss_mode,
             coarse_supervision=args.coarse_supervision,
             uncertainty=args.uncertainty,
             lambda_confidence=args.lambda_confidence,
@@ -2454,6 +2660,7 @@ def main() -> None:
             "epoch": epoch,
             "model": validation_model.state_dict(),
             "model_arch": model_arch,
+            "intrinsics_transform": "resize_center_crop",
             "val_l1": va_l1,
             "val_p95": va_p95,
             "val_l1_worst10": va_worst10,
@@ -2474,6 +2681,9 @@ def main() -> None:
             "middle_cost_channels": args.middle_cost_channels,
             "fine_cost_channels": args.fine_cost_channels,
             "refiner_channels": args.refiner_channels,
+            "refiner_max_residual_m": args.refiner_max_residual_m,
+            "no_refiner_reference_input": args.no_refiner_reference_input,
+            "no_2d_refinement": args.no_2d_refinement,
             "hourglass_levels": args.hourglass_levels,
             "coarse_hourglass_levels": args.coarse_hourglass_levels,
             "middle_hourglass_levels": args.middle_hourglass_levels,
@@ -2500,13 +2710,14 @@ def main() -> None:
             "ema_decay": args.ema_decay,
             "early_stopping_patience": args.early_stopping_patience,
             "freeze_batch_norm": args.freeze_batch_norm,
-            "model_scale": args.model_scale,
             "in_ch": in_ch,
             "num_views": args.num_views,
             "view_interval": args.view_interval,
             "pose_view_selection": args.pose_view_selection,
             "pose_move_threshold": args.pose_move_threshold,
             "num_depths": args.num_depths,
+            "linear_depth_candidates": args.linear_depth_candidates,
+            "gaussian_depth_candidates": args.gaussian_depth_candidates,
             "middle_depths": args.middle_depths,
             "middle_window": args.middle_window,
             "fine_depths": args.fine_depths,
@@ -2536,6 +2747,23 @@ def main() -> None:
             "confidence_abs_tolerance": args.confidence_abs_tolerance,
             "confidence_rel_tolerance": args.confidence_rel_tolerance,
             "l1_loss_only": args.l1_loss_only,
+            "loss_mode": args.loss_mode,
+            "augmentation": {
+                "enabled": train_aug.enabled,
+                "source_view_dropout": train_aug.source_view_dropout,
+                "source_view_dropout_prob": train_aug.source_view_dropout_prob,
+                "pose_noise": train_aug.pose_noise,
+                "pose_translation_std_m": train_aug.pose_translation_std,
+                "pose_rotation_std_deg": train_aug.pose_rotation_std_deg,
+                "event_noise_per_view": train_aug.event_noise_per_view,
+                "event_noise_std": train_aug.event_noise_std,
+                "cross_view_event_dropout": train_aug.cross_view_event_dropout,
+                "cross_view_event_dropout_prob": train_aug.cross_view_event_dropout_prob,
+                "occlusion_view_masking": train_aug.occlusion_view_masking,
+                "occlusion_prob": train_aug.occlusion_prob,
+                "occlusion_max_rects": train_aug.occlusion_max_rects,
+                "occlusion_frac_range": train_aug.occlusion_frac_range,
+            },
             "lambda_worst_percent": args.lambda_worst_percent,
             "worst_percent": args.worst_percent,
             "depth_min": DEPTH_MIN,

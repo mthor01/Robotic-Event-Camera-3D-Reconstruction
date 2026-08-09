@@ -419,12 +419,21 @@ class CostHourglass3D(nn.Module):
 
 
 class FullResolutionRefiner(nn.Module):
-    def __init__(self, in_ch: int, fine_ch: int, width: int, max_residual_m: float):
+    def __init__(
+        self,
+        in_ch: int,
+        fine_ch: int,
+        width: int,
+        max_residual_m: float,
+        use_reference_input: bool = True,
+    ):
         super().__init__()
         self.max_residual_m = float(max_residual_m)
+        self.use_reference_input = bool(use_reference_input)
         width = max(16, width)
+        body_in_ch = fine_ch + 1 + (in_ch if self.use_reference_input else 0)
         self.body = nn.Sequential(
-            nn.Conv2d(in_ch + fine_ch + 1, width, 3, padding=1, bias=False),
+            nn.Conv2d(body_in_ch, width, 3, padding=1, bias=False),
             nn.BatchNorm2d(width),
             nn.ReLU(inplace=True),
             nn.Conv2d(width, width, 3, padding=1, bias=False),
@@ -444,9 +453,12 @@ class FullResolutionRefiner(nn.Module):
         depth_m: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         fine_full = F.interpolate(
-            fine_feat, size=target.shape[-2:], mode="bilinear", align_corners=False
+            fine_feat, size=depth_m.shape[-2:], mode="bilinear", align_corners=False
         )
-        features = self.body(torch.cat([target, fine_full, depth_m], dim=1))
+        refiner_inputs = [fine_full, depth_m]
+        if self.use_reference_input:
+            refiner_inputs.insert(0, target)
+        features = self.body(torch.cat(refiner_inputs, dim=1))
         residual = torch.tanh(self.residual(features)) * self.max_residual_m
         return (depth_m + residual).clamp(DEPTH_MIN, D_MAX), features
 
@@ -499,6 +511,7 @@ class ModernMVSNet(nn.Module):
         coarse_cost_channels: int = 0,
         fine_cost_channels: int = 0,
         refiner_channels: int = 0,
+        refiner_max_residual_m: float | None = None,
         hourglass_levels: int = 2,
         coarse_hourglass_levels: int = 0,
         fine_hourglass_levels: int = 0,
@@ -527,6 +540,8 @@ class ModernMVSNet(nn.Module):
         fullres_fine_volume: bool = False,
         h4_coarse_volume: bool = False,
         decoder_type: str = "auto",
+        refiner_reference_input: bool = True,
+        no_2d_refinement: bool = False,
     ):
         super().__init__()
         del cost_volume_ref_features  # legacy-only: never repeat ref features over depth
@@ -547,6 +562,14 @@ class ModernMVSNet(nn.Module):
         self.middle_depths = int(middle_depths)
         self.middle_window = float(middle_window)
         self.fine_window = float(fine_window)
+        self.refiner_max_residual_override = refiner_max_residual_m is not None
+        if refiner_max_residual_m is not None and refiner_max_residual_m <= 0:
+            raise ValueError("--refiner_max_residual_m must be > 0")
+        self.refiner_max_residual_m = (
+            float(refiner_max_residual_m)
+            if refiner_max_residual_m is not None
+            else min(0.05, self.fine_window)
+        )
         self.fine_offset_radius = float(fine_offset_radius)
         self.learned_fine_window = bool(learned_fine_window)
         self.masked_warp_aggregation = bool(masked_warp_aggregation)
@@ -563,6 +586,8 @@ class ModernMVSNet(nn.Module):
         self.middle_loss_weight = float(middle_loss_weight)
         self.fullres_fine_volume = bool(fullres_fine_volume)
         self.h4_coarse_volume = bool(h4_coarse_volume)
+        self.refiner_reference_input = bool(refiner_reference_input)
+        self.no_2d_refinement = bool(no_2d_refinement)
         self.variance_channels = int(variance_channels)
         self.convex_upsampling = bool(convex_upsampling)
         self.fullres_geometry = bool(fullres_geometry)
@@ -622,6 +647,41 @@ class ModernMVSNet(nn.Module):
             raise ValueError(
                 "--single_view_fallback currently requires the 2-D refiner and "
                 "cannot be combined with --fullres_fine_volume"
+            )
+        if self.no_2d_refinement and self.fullres_fine_volume:
+            raise ValueError(
+                "--no_2d_refinement cannot be combined with --fullres_fine_volume"
+            )
+        if self.no_2d_refinement and self.convex_upsampling:
+            raise ValueError(
+                "--no_2d_refinement uses bilinear upsampling and cannot be "
+                "combined with --convex_upsampling"
+            )
+        if self.no_2d_refinement and self.fullres_geometry:
+            raise ValueError(
+                "--no_2d_refinement cannot be combined with --fullres_geometry"
+            )
+        if self.no_2d_refinement and self.single_view_fallback:
+            raise ValueError(
+                "--single_view_fallback requires refinement features and cannot "
+                "be combined with --no_2d_refinement"
+            )
+        if self.no_2d_refinement and not self.refiner_reference_input:
+            raise ValueError(
+                "--no_refiner_reference_input has no effect when "
+                "--no_2d_refinement is active"
+            )
+        if self.fullres_fine_volume and not self.refiner_reference_input:
+            raise ValueError(
+                "--no_refiner_reference_input has no effect with "
+                "--fullres_fine_volume"
+            )
+        if (
+            self.refiner_max_residual_override
+            and (self.fullres_fine_volume or self.no_2d_refinement)
+        ):
+            raise ValueError(
+                "--refiner_max_residual_m requires the 2-D residual refiner"
             )
         requested_groups = correlation_groups if self.cost_volume_type == "correlation" else 0
         self.coarse_groups = self._resolve_groups(feature_ch, requested_groups)
@@ -744,6 +804,19 @@ class ModernMVSNet(nn.Module):
             if self.cost_volume_type == "correlation"
             else "n/a"
         )
+        refiner_summary = (
+            "none (full-resolution volume)"
+            if self.fullres_fine_volume
+            else (
+                "none (bilinear only)"
+                if self.no_2d_refinement
+                else (
+                    f"{refiner_channels or max(32, min(base // 2, 128))}"
+                    f"/raw_reference={self.refiner_reference_input}"
+                    f"/max_residual={self.refiner_max_residual_m:g}m"
+                )
+            )
+        )
         self.capacity_summary = (
             f"decoder={self.decoder_type}  "
             f"cascade_stages={3 if self.three_stage_cascade else 2}  "
@@ -757,7 +830,7 @@ class ModernMVSNet(nn.Module):
             f"/{middle_cost_base if self.three_stage_cascade else '-'}"
             f"/{fine_cost_base}  "
             f"geometry_scales={geometry_scales}  "
-            f"refiner={'none' if self.fullres_fine_volume else (refiner_channels or max(32, min(base // 2, 128)))}  "
+            f"refiner={refiner_summary}  "
             f"hourglass_levels={self.coarse_hourglass_levels}"
             f"/{self.middle_hourglass_levels if self.three_stage_cascade else '-'}"
             f"/{self.fine_hourglass_levels}  "
@@ -780,17 +853,18 @@ class ModernMVSNet(nn.Module):
         refine_width = refiner_channels or max(32, min(base // 2, 128))
         self.refiner = (
             None
-            if self.fullres_fine_volume
+            if self.fullres_fine_volume or self.no_2d_refinement
             else FullResolutionRefiner(
                 in_ch,
                 self.feature.fine_ch,
                 refine_width,
-                max_residual_m=min(0.05, self.fine_window),
+                max_residual_m=self.refiner_max_residual_m,
+                use_reference_input=self.refiner_reference_input,
             )
         )
         refinement_feature_channels = (
             self.feature.fine_ch
-            if self.fullres_fine_volume
+            if self.fullres_fine_volume or self.no_2d_refinement
             else self.refiner.feature_channels
         )
         self.convex_upsampler = (
@@ -1235,6 +1309,11 @@ class ModernMVSNet(nn.Module):
         if self.fullres_fine_volume:
             refined_m = depth_full
             refinement_features = fine[:, 0]
+        elif self.no_2d_refinement:
+            refined_m = depth_full.clamp(DEPTH_MIN, D_MAX)
+            refinement_features = F.interpolate(
+                fine[:, 0], size=(H, W), mode="bilinear", align_corners=False
+            )
         else:
             assert self.refiner is not None
             refined_m, refinement_features = self.refiner(

@@ -9,9 +9,9 @@ resulting camera-space depth, normalised to [0, 1] using the training range
 an extra input channel during training (train_unet_table.py).
 
 Output (per recording):
-    hdf5/table_plane.h5         — dataset "table_plane"  (N, H, W) float32 in [0, 1]
-    hdf5/fixed_table_plane.h5   — same, when -fix_transform/--fix_transform is enabled
-                                — attrs: table_z_m, depth_min, depth_max, description
+    hdf5/table_plane.h5 — dataset "table_plane" (N, H, W) float32 in [0, 1]
+                         using intrinsics transformed through resize + centred crop
+                         — attrs: table_z_m, depth_min, depth_max, description
 
 Optional debug image:
     debug/table_plane_debug.png  — GT depth | table-plane depth side-by-side
@@ -206,9 +206,8 @@ def process_sequence(
     table_z:   float,
     overwrite: bool = False,
     debug:     bool = False,
-    fix_transform: bool = False,
 ) -> dict:
-    """Compute and save table_plane.h5, or fixed_table_plane.h5 with -fix_transform."""
+    """Compute and save the canonical corrected table_plane.h5 prior."""
     result = {"name": seq_dir.name, "success": False, "n_frames": 0, "error": None}
 
     depth_h5_path = seq_dir / "hdf5" / "depth_in_event_frame.h5"
@@ -221,8 +220,7 @@ def process_sequence(
         result["error"] = "poses.h5 not found"
         return result
 
-    table_plane_filename = "fixed_table_plane.h5" if fix_transform else "table_plane.h5"
-    out_path = seq_dir / "hdf5" / table_plane_filename
+    out_path = seq_dir / "hdf5" / "table_plane.h5"
 
     with h5py.File(depth_h5_path, "r") as df:
         n_depth = df["depth"].shape[0]
@@ -246,14 +244,17 @@ def process_sequence(
     if not overwrite and out_path.exists():
         with h5py.File(out_path, "r") as ef:
             if ef["table_plane"].shape[0] >= n_frames:
-                existing_fix_transform = bool(ef.attrs.get("fix_transform", False))
-                if not fix_transform or existing_fix_transform:
+                transform = ef.attrs.get("intrinsics_transform", "")
+                if isinstance(transform, bytes):
+                    transform = transform.decode("utf-8", errors="replace")
+                corrected_transform = transform == "resize_center_crop"
+                if corrected_transform:
                     result.update(success=True, n_frames=n_frames,
                                   error="Already computed (use --overwrite)")
                     return result
                 print(
-                    f"  [{seq_dir.name}] Existing {table_plane_filename} was computed without "
-                    "-fix_transform; recomputing fixed transform."
+                    f"  [{seq_dir.name}] Existing table_plane.h5 uses the obsolete "
+                    "direct-scaling geometry; recomputing with resize + centred crop."
                 )
 
     # Build T_base_from_event for every frame
@@ -277,26 +278,22 @@ def process_sequence(
         of.attrs["table_z_m"]  = float(table_z)
         of.attrs["depth_min"]  = float(DEPTH_MIN)
         of.attrs["depth_max"]  = float(D_MAX)
-        of.attrs["fix_transform"] = bool(fix_transform)
+        of.attrs["intrinsics_transform"] = "resize_center_crop"
         of.attrs["description"] = (
             f"Per-pixel normalised depth [0,1] to table plane z={table_z:.4f} m "
             f"(robot base frame). Training depth range: [{DEPTH_MIN}, {D_MAX}] m."
         )
 
-        if fix_transform:
-            K_for_table = _scale_K_resize_crop(
-                calib["K_native"],
-                native_H,
-                native_W,
-                resize_H,
-                resize_W,
-                crop_H,
-                crop_W,
-            )
-            K_native_H, K_native_W = H, W
-        else:
-            K_for_table = calib["K_native"]
-            K_native_H, K_native_W = calib["native_H"], calib["native_W"]
+        K_for_table = _scale_K_resize_crop(
+            calib["K_native"],
+            native_H,
+            native_W,
+            resize_H,
+            resize_W,
+            crop_H,
+            crop_W,
+        )
+        K_native_H, K_native_W = H, W
 
         for fi in tqdm(range(n_frames), desc=seq_dir.name, leave=False):
             channel = _compute_channel(
@@ -323,7 +320,10 @@ def process_sequence(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Precompute table-plane depth prior (hdf5/table_plane.h5, or hdf5/fixed_table_plane.h5 with -fix_transform).",
+        description=(
+            "Precompute the corrected table-plane depth prior "
+            "(hdf5/table_plane.h5)."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -348,12 +348,6 @@ def main() -> None:
         "--debug", action="store_true",
         help="Save debug/table_plane_debug.png (GT depth | table-plane depth) "
              "for each sequence.",
-    )
-    parser.add_argument(
-        "-fix_transform", "--fix_transform", action="store_true",
-        help="Opt-in geometry fix: scale event intrinsics through the stored "
-             "resize + centred crop transform instead of the historical direct "
-             "native-resolution -> final-resolution scaling.",
     )
     args = parser.parse_args()
 
@@ -418,7 +412,6 @@ def main() -> None:
             seq_dir, calib, args.table_z,
             overwrite=args.overwrite,
             debug=args.debug,
-            fix_transform=args.fix_transform,
         )
         results.append(r)
         status = "OK"   if r["success"] else "FAIL"

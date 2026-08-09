@@ -10,3 +10,4 @@
 **/*.def
 3d_reconstruction/training/results
 3d_reconstruction/training/debug
+3d_reconstruction/training/architecture
