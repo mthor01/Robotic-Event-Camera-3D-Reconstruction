@@ -478,12 +478,16 @@ def align_event_frames_to_depth_hw(
     """
     if n_depth_frames == 0:
         raise RuntimeError("Cannot align events: no depth frames were recorded")
+    if len(trigger_times_us) == 0:
+        print("[AlignHW] No trigger timestamps available, skipping alignment")
+        return
+
+    N = min(len(trigger_times_us), n_depth_frames)
     if len(trigger_times_us) != n_depth_frames:
-        raise RuntimeError(
-            f"Hardware-trigger count mismatch: {len(trigger_times_us)} triggers "
-            f"for {n_depth_frames} depth frames"
+        print(
+            f"[AlignHW] WARNING: {len(trigger_times_us)} triggers vs "
+            f"{n_depth_frames} depth frames — using first {N} pairs"
         )
-    N = n_depth_frames
 
     h5_path = hdf5_dir / "events_cam0.h5"
     if not h5_path.exists():

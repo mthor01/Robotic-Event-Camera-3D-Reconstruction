@@ -30,7 +30,10 @@ import multiprocessing
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent))
 
-from config import DATA_ROOT as _DATA_ROOT, NUM_BINS, TRAIN_RESIZE_HW, TRAIN_CROP_HW
+from config import (
+    DATA_ROOT as _DATA_ROOT, NUM_BINS, TRAIN_RESIZE_HW, TRAIN_CROP_HW,
+    CROP_THEN_RESIZE_CROP_HW, CROP_THEN_RESIZE_HW,
+)
 
 
 DATA_ROOT = _HERE.parent / _DATA_ROOT
@@ -181,6 +184,7 @@ def process_sequence(
     crop_hw: Optional[Tuple[int, int]] = None,
     show_progress: bool = True,
     normalize: bool = True,
+    crop_then_resize: bool = False,
 ) -> dict:
     """
     Process a single sequence directory.
@@ -326,8 +330,10 @@ def process_sequence(
             events = load_events_from_raw(raw_path)
             raw_t = events['t'].astype(np.int64)
 
-            # Determine final stored resolution (after resize and optional crop)
-            if crop_hw is not None:
+            # Determine final stored resolution for the selected operation order.
+            if crop_then_resize and output_hw is not None:
+                out_H, out_W = output_hw
+            elif crop_hw is not None:
                 out_H, out_W = crop_hw
             elif output_hw is not None:
                 out_H, out_W = output_hw
@@ -335,12 +341,12 @@ def process_sequence(
                 out_H, out_W = EV_H, EV_W
             dtype = np.float16 if as_float16 else np.float32
 
-            # Precompute center-crop offsets (only needed when both resize and crop are set)
+            # Precompute crop offsets in either native or resized coordinates.
             if output_hw is not None and crop_hw is not None:
                 ch, cw = crop_hw
-                rh, rw = output_hw
-                cy0 = (rh - ch) // 2
-                cx0 = (rw - cw) // 2
+                base_h, base_w = (EV_H, EV_W) if crop_then_resize else output_hw
+                cy0 = (base_h - ch) // 2
+                cx0 = (base_w - cw) // 2
             else:
                 cy0 = cx0 = 0
 
@@ -360,6 +366,14 @@ def process_sequence(
                 # crop_h/w are just out_H/out_W (== ds.shape[2/3]), stored for clarity
                 ds.attrs["crop_h"] = out_H
                 ds.attrs["crop_w"] = out_W
+                ds.attrs["intrinsics_transform"] = (
+                    "center_crop_resize" if crop_then_resize else "resize_center_crop"
+                )
+                if crop_then_resize:
+                    ds.attrs["resize_h"] = output_hw[0]
+                    ds.attrs["resize_w"] = output_hw[1]
+                    ds.attrs["crop_h"] = crop_hw[0]
+                    ds.attrs["crop_w"] = crop_hw[1]
                 ds.attrs["normalized"] = bool(normalize)
                 vf.create_dataset("hw_trigger_times_us", data=hw_trig_us[:n_frames])
                 trig = hw_trig_us[:n_frames]
@@ -381,10 +395,16 @@ def process_sequence(
                         t_start_us=t_start, t_end_us=t_end,
                         normalize=normalize,
                     )
-                    if output_hw is not None:
-                        voxel = resize_voxel(voxel, output_hw, as_float16=False)
-                    if crop_hw is not None:
-                        voxel = voxel[:, cy0:cy0+ch, cx0:cx0+cw]
+                    if crop_then_resize:
+                        if crop_hw is not None:
+                            voxel = voxel[:, cy0:cy0+ch, cx0:cx0+cw]
+                        if output_hw is not None:
+                            voxel = resize_voxel(voxel, output_hw, as_float16=False)
+                    else:
+                        if output_hw is not None:
+                            voxel = resize_voxel(voxel, output_hw, as_float16=False)
+                        if crop_hw is not None:
+                            voxel = voxel[:, cy0:cy0+ch, cx0:cx0+cw]
                     if as_float16:
                         voxel = voxel.astype(np.float16)
                     ds[frame_idx] = voxel
@@ -450,6 +470,9 @@ def main():
                        help="Store voxels as float16 instead of float32 (2x extra space saving).")
     parser.add_argument("--no_normalize", "--no-normalize", action="store_true",
                        help="Store raw accumulated voxel event counts without mean/std normalization.")
+    parser.add_argument("--crop_then_resize", "--crop-then-resize", action="store_true",
+                       help="Center-crop native voxels, then resize using the "
+                            "CROP_THEN_RESIZE_* settings from config.py")
 
     args = parser.parse_args()
 
@@ -459,7 +482,10 @@ def main():
             return path
         return (_HERE.parent / path).resolve()
 
-    # Build output_hw (resize target) and crop_hw (final stored size)
+    # Build resize and crop sizes for the selected operation order.
+    if args.crop_then_resize:
+        args.output_h, args.output_w = CROP_THEN_RESIZE_HW
+        args.crop_h, args.crop_w = CROP_THEN_RESIZE_CROP_HW
     output_hw: Optional[Tuple[int, int]] = None
     if args.output_h and args.output_w:
         output_hw = (args.output_h, args.output_w)
@@ -472,9 +498,37 @@ def main():
     elif (bool(args.crop_h)) != (bool(args.crop_w)):
         parser.error("--crop_h and --crop_w must both be non-zero or both zero")
 
+    # Resolve the native event-camera size before any crop validation. For the
+    # current pipeline this is always 1280x720; if a sequence-specific HDF5 is
+    # already present, prefer that metadata to remain consistent with the data.
+    EV_H = 1280
+    EV_W = 720
+
+    if args.data_dir:
+        candidate_dirs = [_resolve_data_path(d) for d in args.data_dir]
+    else:
+        candidate_dirs = [_resolve_data_path(args.data_root)]
+
+    for candidate in candidate_dirs:
+        if not candidate.exists():
+            continue
+        if candidate.is_dir():
+            ev_h5 = candidate / "hdf5" / "events_cam0.h5"
+            if ev_h5.exists():
+                with h5py.File(ev_h5, "r") as f:
+                    EV_H = int(f["events"].attrs["height"])
+                    EV_W = int(f["events"].attrs["width"])
+                break
+
     # Crop without a prior resize doesn't make sense
     if crop_hw is not None and output_hw is None:
         parser.error("--crop_h/w requires --output_h/w to be set")
+    if args.crop_then_resize and crop_hw is not None:
+        if crop_hw[0] > EV_H or crop_hw[1] > EV_W:
+            parser.error(f"crop {crop_hw} exceeds native event size {(EV_H, EV_W)}")
+    elif crop_hw is not None and output_hw is not None:
+        if crop_hw[0] > output_hw[0] or crop_hw[1] > output_hw[1]:
+            parser.error(f"crop {crop_hw} exceeds resized size {output_hw}")
 
     # Find sequences
     if args.data_dir:
@@ -495,10 +549,13 @@ def main():
     print(f"Voxel bins: {args.num_bins}")
     if output_hw:
         native_px = 1280 * 720
-        stored_hw = crop_hw if crop_hw is not None else output_hw
+        stored_hw = output_hw if args.crop_then_resize else (crop_hw if crop_hw is not None else output_hw)
         out_px = stored_hw[1] * stored_hw[0]
         if crop_hw is not None:
-            print(f"Resize → crop  : {output_hw[1]}×{output_hw[0]} → {stored_hw[1]}×{stored_hw[0]} "
+            operation = (f"Crop → resize  : {crop_hw[1]}×{crop_hw[0]} → {stored_hw[1]}×{stored_hw[0]}"
+                         if args.crop_then_resize else
+                         f"Resize → crop  : {output_hw[1]}×{output_hw[0]} → {stored_hw[1]}×{stored_hw[0]}")
+            print(f"{operation} "
                   f"({out_px/native_px*100:.1f}% of native 1280×720, "
                   f"~{native_px/out_px:.1f}x smaller per voxel)")
         else:
@@ -524,6 +581,7 @@ def main():
             result = process_sequence(
                 seq_dir, args.num_bins, args.overwrite, output_hw, args.float16, crop_hw,
                 show_progress=show_prog, normalize=normalize,
+                crop_then_resize=args.crop_then_resize,
             )
             results.append(result)
             if result["success"]:
@@ -543,7 +601,8 @@ def main():
                 futures = {
                     executor.submit(
                         process_sequence, seq_dir, args.num_bins, args.overwrite,
-                        output_hw, args.float16, crop_hw, False, normalize
+                        output_hw, args.float16, crop_hw, False, normalize,
+                        args.crop_then_resize,
                     ): seq_dir
                     for seq_dir in sequence_dirs
                 }

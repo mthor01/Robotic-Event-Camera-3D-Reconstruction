@@ -9,6 +9,7 @@
 #   ./precompute_all.sh --data_dir data/real/bottle             # single object
 #   ./precompute_all.sh --data_dir data/real/bottle data/real/cube
 #   ./precompute_all.sh --data_root data/real                   # explicit root (default)
+#   ./precompute_all.sh --data_root data/real --crop_then_resize # 960x720 crop -> 320x240
 #
 # Per-step flags:
 #   Use --project, --table, --voxel as section markers.

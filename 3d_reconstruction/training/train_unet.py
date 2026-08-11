@@ -45,7 +45,11 @@ from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from config import DEPTH_MIN, D_MAX, NUM_BINS, TRAIN_CROP_HW, TRAIN_RESIZE_HW
+from config import (
+    DEPTH_MIN, D_MAX, NUM_BINS, TRAIN_CROP_HW, TRAIN_RESIZE_HW,
+    CROP_THEN_RESIZE_CROP_HW, CROP_THEN_RESIZE_HW,
+)
+from preprocessing_geometry import transform_intrinsics, transform_name
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_ROOT = _SCRIPT_DIR.parent / "data" / "lego"
@@ -352,6 +356,7 @@ def _compute_table_plane_channel(
     table_z_base: float,
     depth_min: float = DEPTH_MIN,
     depth_max: float = D_MAX,
+    crop_then_resize: bool = False,
 ) -> np.ndarray:
     """
     Return (vox_H, vox_W) float32 channel where each pixel holds the
@@ -362,13 +367,16 @@ def _compute_table_plane_channel(
     how GT depth is normalised during training.
     Pixels whose rays are parallel to the plane, or face away from it, get 0.
     """
-    # Transform K through the same resize + centred crop as the voxel grid.
-    resize_H, resize_W = TRAIN_RESIZE_HW
-    K = K_native.copy().astype(np.float64)
-    K[0, :] *= resize_W / native_W
-    K[1, :] *= resize_H / native_H
-    K[0, 2] -= (resize_W - vox_W) / 2.0
-    K[1, 2] -= (resize_H - vox_H) / 2.0
+    if crop_then_resize:
+        resize_hw = CROP_THEN_RESIZE_HW
+        crop_hw = CROP_THEN_RESIZE_CROP_HW
+    else:
+        resize_hw = TRAIN_RESIZE_HW
+        crop_hw = (vox_H, vox_W)
+    K = transform_intrinsics(
+        K_native.astype(np.float64), (native_H, native_W),
+        resize_hw, crop_hw, crop_then_resize,
+    )
     fx, fy = K[0, 0], K[1, 1]
     cx, cy = K[0, 2], K[1, 2]
 
@@ -430,6 +438,7 @@ class TablePriorDataset(Dataset):
         pose_move_threshold: float = 0.01,
         recurrent: bool = False,
         recurrent_enrollment_range: int = 0,
+        crop_then_resize: bool = False,
     ):
         super().__init__()
         if num_views < 1:
@@ -471,19 +480,31 @@ class TablePriorDataset(Dataset):
 
         import h5py
         with h5py.File(self.depth_path,       "r") as f: n_d = f["depth"].shape[0]
-        with h5py.File(self.voxels_path,      "r") as f: n_v = f["voxels"].shape[0]
+        with h5py.File(self.voxels_path, "r") as f:
+            n_v = f["voxels"].shape[0]
+            voxel_transform = f["voxels"].attrs.get(
+                "intrinsics_transform", "resize_center_crop"
+            )
+            if isinstance(voxel_transform, bytes):
+                voxel_transform = voxel_transform.decode("utf-8", errors="replace")
         with h5py.File(self.table_plane_path, "r") as f:
             n_t = f["table_plane"].shape[0]
             transform = f.attrs.get("intrinsics_transform", "")
             if isinstance(transform, bytes):
                 transform = transform.decode("utf-8", errors="replace")
-            corrected_table_transform = transform == "resize_center_crop"
+            expected_transform = transform_name(crop_then_resize)
+            corrected_table_transform = transform == expected_transform
         if not corrected_table_transform:
             raise RuntimeError(
                 f"{self.table_plane_path} uses obsolete direct-scaling geometry. "
                 "Regenerate it with: python3 "
                 "data_precomputation/precompute_table_plane.py --overwrite "
                 f"--data_dir {self.seq_dir}"
+            )
+        if voxel_transform != expected_transform:
+            raise RuntimeError(
+                f"{self.voxels_path} uses {voxel_transform!r}, requested "
+                f"{expected_transform!r}. Regenerate or use the matching flag."
             )
         needs_poses = self.pose_channels or self.pose_view_selection
         if needs_poses:
@@ -1006,6 +1027,8 @@ def main() -> None:
                         help="Run name used in checkpoint filenames. Prompted if not provided.")
     parser.add_argument("--tb_root",       type=Path, default=DEFAULT_TB_ROOT,
                         help="Shared TensorBoard root. Runs are logged under <tb_root>/unet_table/<name>.")
+    parser.add_argument("--crop_then_resize", "--crop-then-resize", action="store_true",
+                        help="Train on data precomputed with native crop followed by resize")
     args = parser.parse_args()
 
     if args.model_scale <= 0:
@@ -1121,6 +1144,7 @@ def main() -> None:
         pose_move_threshold=args.pose_move_threshold,
         recurrent=args.recurrent,
         recurrent_enrollment_range=args.recurrent_enrollment_range,
+        crop_then_resize=args.crop_then_resize,
     )
     train_ds = ConcatDataset([TablePriorDataset(d, **ds_kw) for d in train_seqs])
     val_ds   = ConcatDataset([TablePriorDataset(d, **ds_kw) for d in val_seqs])
@@ -1151,13 +1175,16 @@ def main() -> None:
         model = UNet(in_ch=in_ch, base=base_channels).to(device)
 
     # K for loss: use the canonical resize + centred-crop transform.
-    resize_H, resize_W = TRAIN_RESIZE_HW
-    crop_H, crop_W = TRAIN_CROP_HW
-    K_loss = K_native.copy()
-    K_loss[0, :] *= resize_W / native_W
-    K_loss[1, :] *= resize_H / native_H
-    K_loss[0, 2] -= (resize_W - crop_W) / 2.0
-    K_loss[1, 2] -= (resize_H - crop_H) / 2.0
+    if args.crop_then_resize:
+        resize_hw = CROP_THEN_RESIZE_HW
+        crop_hw = CROP_THEN_RESIZE_CROP_HW
+    else:
+        resize_hw = TRAIN_RESIZE_HW
+        crop_hw = TRAIN_CROP_HW
+    K_loss = transform_intrinsics(
+        K_native, (native_H, native_W), resize_hw, crop_hw,
+        args.crop_then_resize,
+    )
     K_tensor = torch.from_numpy(K_loss).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1314,7 +1341,7 @@ def main() -> None:
             "recurrent": args.recurrent,
             "recurrent_enrollment_range": args.recurrent_enrollment_range,
             "early_fusion_views": True,
-            "intrinsics_transform": "resize_center_crop",
+            "intrinsics_transform": transform_name(args.crop_then_resize),
             "table_z": table_z_ckpt,
             "predict_uncertainty": args.predict_uncertainty,
             "uncertainty_weight": args.uncertainty_weight,

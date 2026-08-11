@@ -36,8 +36,14 @@ RS_HEIGHT = 480
 # ═══════════════════════════════════════════════════════════════════
 # Precomputation and reconstruction apply the same transforms. Camera
 # intrinsics must undergo this resize and centre crop as well.
-TRAIN_RESIZE_HW = (288, 384)  # (H, W) intermediate resize
-TRAIN_CROP_HW   = (240, 320)  # (H, W) final model input
+TRAIN_RESIZE_HW = (240, 427)  # (H, W) intermediate resize (288, 384)
+TRAIN_CROP_HW   = (240, 320)  # (H, W) final model input (240, 320)
+
+# Optional crop-then-resize preprocessing. Enable it explicitly with
+# --crop_then_resize; without that flag the legacy settings above are used.
+# The crop is in native event-camera pixels and the resize is the final size.
+CROP_THEN_RESIZE_CROP_HW = (720, 960)
+CROP_THEN_RESIZE_HW      = (240, 320)
 
 # ═══════════════════════════════════════════════════════════════════
 #  Event camera biases

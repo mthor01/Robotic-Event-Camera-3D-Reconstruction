@@ -43,7 +43,7 @@ import matplotlib.gridspec as gridspec
 from matplotlib.gridspec import GridSpec
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from reconstruction_config import FPS as DEFAULT_FPS
+from config import FPS as DEFAULT_FPS
 
 
 # ══════════════════════════════════════════════════════════════════════

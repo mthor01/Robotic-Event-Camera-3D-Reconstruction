@@ -57,6 +57,7 @@ from tensorboard_helper import (
     UncertaintyErrorLogger,
     VizLogger,
 )
+from preprocessing_geometry import transform_intrinsics, transform_name
 
 _CAM_DATA = _SCRIPT_DIR.parent / "camera_data"
 
@@ -107,21 +108,16 @@ def _scale_K_resize_crop(
     native_hw: tuple[int, int],
     resize_hw: tuple[int, int],
     crop_hw: tuple[int, int],
+    crop_then_resize: bool = False,
 ) -> np.ndarray:
     """Scale event intrinsics through resize + centred crop.
 
     This matches the preprocessing used by project_realsense_to_event.py and
     precompute_voxels.py.
     """
-    native_h, native_w = native_hw
-    resize_h, resize_w = resize_hw
-    crop_h, crop_w = crop_hw
-    K_scaled = K.copy()
-    K_scaled[0, :] *= resize_w / native_w
-    K_scaled[1, :] *= resize_h / native_h
-    K_scaled[0, 2] -= (resize_w - crop_w) / 2.0
-    K_scaled[1, 2] -= (resize_h - crop_h) / 2.0
-    return K_scaled.astype(np.float32)
+    return transform_intrinsics(
+        K, native_hw, resize_hw, crop_hw, crop_then_resize
+    ).astype(np.float32)
 
 
 def _inverse_depth_candidates(coarse_depths: int, depth_min: float, depth_max: float) -> np.ndarray:
@@ -279,6 +275,7 @@ class MultiViewTableDataset(Dataset):
         recurrent_enrollment_range: int = 0,
         split_indices: np.ndarray | None = None,
         aug: MultiViewAugConfig | None = None,
+        crop_then_resize: bool = False,
     ):
         super().__init__()
         if num_views < 1:
@@ -307,6 +304,7 @@ class MultiViewTableDataset(Dataset):
         self.recurrent = bool(recurrent)
         self.recurrent_enrollment_range = int(recurrent_enrollment_range)
         self.aug = aug or MultiViewAugConfig(enabled=False)
+        expected_transform = transform_name(crop_then_resize)
 
         self.voxels_path = self.seq_dir / "events" / "voxels_cam0.h5"
         self.depth_path = self.seq_dir / "hdf5" / "depth_in_event_frame.h5"
@@ -329,7 +327,7 @@ class MultiViewTableDataset(Dataset):
             transform = f.attrs.get("intrinsics_transform", "")
             if isinstance(transform, bytes):
                 transform = transform.decode("utf-8", errors="replace")
-            corrected_table_transform = transform == "resize_center_crop"
+            corrected_table_transform = transform == expected_transform
         with h5py.File(self.poses_path, "r") as f:
             ee_T = f["ee_T"][:].astype(np.float32)
 
@@ -346,11 +344,20 @@ class MultiViewTableDataset(Dataset):
         resize_w = int(vox_attrs.get("resize_w", vox_w))
         crop_h = int(vox_attrs.get("crop_h", vox_h))
         crop_w = int(vox_attrs.get("crop_w", vox_w))
+        voxel_transform = vox_attrs.get("intrinsics_transform", "resize_center_crop")
+        if isinstance(voxel_transform, bytes):
+            voxel_transform = voxel_transform.decode("utf-8", errors="replace")
+        if voxel_transform != expected_transform:
+            raise RuntimeError(
+                f"{self.voxels_path} uses {voxel_transform!r}, requested "
+                f"{expected_transform!r}. Regenerate or use the matching flag."
+            )
         self.K = _scale_K_resize_crop(
             calib["K_native"],
             (native_h, native_w),
             (resize_h, resize_w),
             (crop_h, crop_w),
+            crop_then_resize,
         )
         self.linear_depth_candidates = bool(linear_depth_candidates)
         if self.linear_depth_candidates:
@@ -1934,6 +1941,8 @@ def main() -> None:
     parser.add_argument("--debug_out", type=Path,
                         default=_SCRIPT_DIR / "debug" / "multiview",
                         help="Output directory for --debug_views PNGs and pose matrices.")
+    parser.add_argument("--crop_then_resize", "--crop-then-resize", action="store_true",
+                        help="Train on data precomputed with native crop followed by resize")
     args = parser.parse_args()
 
     if args.pose_view_selection and args.num_views % 2 != 1:
@@ -2068,6 +2077,7 @@ def main() -> None:
         linear_depth_candidates=args.linear_depth_candidates,
         fill_invalid=args.fill_invalid,
         pose_channels=False,
+        crop_then_resize=args.crop_then_resize,
     )
     train_aug = MultiViewAugConfig(
         enabled=not args.no_augmentations,
@@ -2353,7 +2363,7 @@ def main() -> None:
             "epoch": epoch,
             "model": validation_model.state_dict(),
             "model_arch": model_arch,
-            "intrinsics_transform": "resize_center_crop",
+            "intrinsics_transform": transform_name(args.crop_then_resize),
             "val_l1": va_l1,
             "val_p95": va_p95,
             "val_l1_worst10": va_worst10,

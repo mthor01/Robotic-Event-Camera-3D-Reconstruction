@@ -57,6 +57,8 @@ from config import (
     DEPTH_BLEED_RADIUS,
     TRAIN_RESIZE_HW,
     TRAIN_CROP_HW,
+    CROP_THEN_RESIZE_CROP_HW,
+    CROP_THEN_RESIZE_HW,
     DEPTH_VIZ_MIN,
     DEPTH_VIZ_MAX,
 )
@@ -69,8 +71,8 @@ DATA_ROOT  = _CFG_ROOT / _DATA_ROOT
 FPS = DEFAULT_FPS
 
 
-def _resize_crop(frame: np.ndarray, resize_hw, crop_hw) -> np.ndarray:
-    """Resize then center-crop a fully-computed (H,W) depth or (H,W,3) RGB frame.
+def _resize_crop(frame: np.ndarray, resize_hw, crop_hw, crop_then_resize=False) -> np.ndarray:
+    """Apply either supported crop/resize order to depth or RGB.
 
     For depth frames the input must already be fully gap-filled at native
     resolution.  We then track valid coverage (non-zero pixels) through the
@@ -83,30 +85,43 @@ def _resize_crop(frame: np.ndarray, resize_hw, crop_hw) -> np.ndarray:
     import torch.nn.functional as F
     is_rgb = frame.ndim == 3
     t = torch.from_numpy(frame.astype(np.float32))
+
+    def center_crop(x, hw):
+        if hw is None:
+            return x
+        ch, cw = hw
+        y0 = (x.shape[-2] - ch) // 2
+        x0 = (x.shape[-1] - cw) // 2
+        return x[..., y0:y0 + ch, x0:x0 + cw]
+
     if is_rgb:
         t = t.permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
-        if resize_hw is not None:
-            t = F.interpolate(t, size=resize_hw, mode="bilinear", align_corners=False)
-        if crop_hw is not None:
-            ch, cw = crop_hw
-            y0 = (t.shape[2] - ch) // 2
-            x0 = (t.shape[3] - cw) // 2
-            t = t[:, :, y0:y0 + ch, x0:x0 + cw]
+        if crop_then_resize:
+            t = center_crop(t, crop_hw)
+            if resize_hw is not None:
+                t = F.interpolate(t, size=resize_hw, mode="bilinear", align_corners=False)
+        else:
+            if resize_hw is not None:
+                t = F.interpolate(t, size=resize_hw, mode="bilinear", align_corners=False)
+            t = center_crop(t, crop_hw)
         return t.squeeze(0).permute(1, 2, 0).numpy().clip(0, 255).astype(np.uint8)
     else:
         # Depth: propagate a validity mask through the same transform so that
         # bilinear blending with zeros never creates ghost non-zero depths.
         valid = (t > 0).float().unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
         t = t.unsqueeze(0).unsqueeze(0)                    # (1,1,H,W)
-        if resize_hw is not None:
-            t     = F.interpolate(t,     size=resize_hw, mode="bilinear", align_corners=False)
-            valid = F.interpolate(valid, size=resize_hw, mode="bilinear", align_corners=False)
-        if crop_hw is not None:
-            ch, cw = crop_hw
-            y0 = (t.shape[2] - ch) // 2
-            x0 = (t.shape[3] - cw) // 2
-            t     = t    [:, :, y0:y0 + ch, x0:x0 + cw]
-            valid = valid[:, :, y0:y0 + ch, x0:x0 + cw]
+        if crop_then_resize:
+            t = center_crop(t, crop_hw)
+            valid = center_crop(valid, crop_hw)
+            if resize_hw is not None:
+                t = F.interpolate(t, size=resize_hw, mode="bilinear", align_corners=False)
+                valid = F.interpolate(valid, size=resize_hw, mode="bilinear", align_corners=False)
+        else:
+            if resize_hw is not None:
+                t = F.interpolate(t, size=resize_hw, mode="bilinear", align_corners=False)
+                valid = F.interpolate(valid, size=resize_hw, mode="bilinear", align_corners=False)
+            t = center_crop(t, crop_hw)
+            valid = center_crop(valid, crop_hw)
         out = t.squeeze(0).squeeze(0).numpy()
         # Zero any pixel where the bilinear footprint was not 100 % valid.
         out[valid.squeeze(0).squeeze(0).numpy() < 1.0] = 0.0
@@ -165,6 +180,43 @@ def build_depth_pixel_grid(K_depth: np.ndarray, h: int, w: int) -> np.ndarray:
     uu, vv = np.meshgrid(u, v)  # (h, w)
     rays = np.stack([(uu - cx) / fx, (vv - cy) / fy, np.ones_like(uu)], axis=-1)
     return rays.reshape(-1, 3)
+
+
+def _fill_small_depth_gaps_nearest(
+    depth: np.ndarray,
+    max_distance_px: float = 2.0,
+) -> np.ndarray:
+    """Fill small projection holes from the spatially nearest valid pixel.
+
+    A minimum-depth morphological fill makes every ambiguous boundary hole
+    foreground, visibly expanding near objects.  Nearest-neighbour filling is
+    symmetric with respect to depth and is therefore a closer depth analogue
+    of the local gap filling used for projected RGB.  The distance limit keeps
+    genuinely unobserved image regions invalid.
+    """
+    invalid = depth <= 0
+    if not np.any(invalid) or np.all(invalid):
+        return depth
+
+    # distanceTransform expects non-zero pixels to be measured to the nearest
+    # zero pixel.  DIST_LABEL_PIXEL assigns a unique label to each valid source
+    # pixel, allowing its depth to be copied into nearby holes.
+    distances, labels = cv2.distanceTransformWithLabels(
+        invalid.astype(np.uint8),
+        cv2.DIST_L2,
+        cv2.DIST_MASK_3,
+        labelType=cv2.DIST_LABEL_PIXEL,
+    )
+
+    valid_labels = labels[~invalid]
+    valid_depths = depth[~invalid]
+    label_to_depth = np.zeros(int(labels.max()) + 1, dtype=depth.dtype)
+    label_to_depth[valid_labels] = valid_depths
+
+    fill = invalid & (distances <= max_distance_px)
+    result = depth.copy()
+    result[fill] = label_to_depth[labels[fill]]
+    return result
 
 
 def project_depth_frame(
@@ -246,19 +298,10 @@ def project_depth_frame(
         )
         depth_out[bleed_mask] = local_min[bleed_mask]
 
-    # Gap fill: fill zero pixels (scatter resolution mismatch) with the nearest
-    # (minimum) valid neighbour using erode+sentinel.
-    # Do NOT use cv2.dilate (local MAX) — that fills gaps with background (far)
-    # depth, which causes a background grid pattern on the foreground object.
-    # 5×5 kernel (reach=2) needed because depth (640×480) → event (1280×720) is a
-    # 2:1 ratio, so scatter hits land every ~2 event pixels; adjacent depth pixels
-    # can round to the same event pixel, creating 2-pixel gaps the 3×3 kernel misses.
-    small_kernel = np.ones((5, 5), dtype=np.uint8)
-    depth_temp2 = depth_out.copy()
-    depth_temp2[depth_temp2 == 0] = SENTINEL
-    fill_min = cv2.erode(depth_temp2, small_kernel)
-    fill_min[fill_min >= SENTINEL * 0.9] = np.float32(0.0)
-    depth_out[depth_out == 0] = fill_min[depth_out == 0]
+    # Fill only the small holes caused by scattering the lower-resolution depth
+    # grid into the event image.  Copying the spatially nearest sample avoids
+    # the foreground expansion caused by the previous local-minimum fill.
+    depth_out = _fill_small_depth_gaps_nearest(depth_out, max_distance_px=2.0)
 
     return depth_out
 
@@ -364,7 +407,8 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
                       save_videos: bool = False, workers: int = 4,
                       bleed_correction: bool = True, overwrite: bool = False,
                       resize_hw=None, crop_hw=None,
-                      use_voxels: bool = False) -> None:
+                      use_voxels: bool = False,
+                      crop_then_resize: bool = False) -> None:
     """Project all depth (and optionally RGB) frames for one recording directory."""
     rs_h5_path = seq_dir / "hdf5" / "realsense.h5"
     if not rs_h5_path.exists():
@@ -399,10 +443,16 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
     T_color_from_depth = calib["T_color_from_depth"]
 
     out_h, out_w = ev_h, ev_w
-    if resize_hw is not None:
-        out_h, out_w = resize_hw
-    if crop_hw is not None:
-        out_h, out_w = crop_hw
+    if crop_then_resize:
+        if crop_hw is not None:
+            out_h, out_w = crop_hw
+        if resize_hw is not None:
+            out_h, out_w = resize_hw
+    else:
+        if resize_hw is not None:
+            out_h, out_w = resize_hw
+        if crop_hw is not None:
+            out_h, out_w = crop_hw
 
     # Pre-compute depth pixel rays
     rays = build_depth_pixel_grid(K_depth, dep_h, dep_w)
@@ -465,6 +515,9 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
         out_dh5.attrs["resize_w"] = resize_hw[1] if resize_hw is not None else ev_w
         out_dh5.attrs["crop_h"]   = crop_hw[0]   if crop_hw   is not None else (resize_hw[0] if resize_hw else ev_h)
         out_dh5.attrs["crop_w"]   = crop_hw[1]   if crop_hw   is not None else (resize_hw[1] if resize_hw else ev_w)
+        out_dh5.attrs["intrinsics_transform"] = (
+            "center_crop_resize" if crop_then_resize else "resize_center_crop"
+        )
 
         out_rh5 = None
         rgb_out_ds = None
@@ -476,6 +529,9 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
             )
             out_rh5.attrs["description"] = "RGB projected into event camera frame"
             out_rh5.attrs["source"] = str(rs_h5_path)
+            out_rh5.attrs["intrinsics_transform"] = (
+                "center_crop_resize" if crop_then_resize else "resize_center_crop"
+            )
 
         try:
             batch_size = max(1, workers * 4)
@@ -519,6 +575,8 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
                                 # Normalise to [0, 1]: max possible is n_bins * 1.0
                                 activity = np.clip(activity / n_bins, 0.0, 1.0)
                                 gray = (activity * 255).astype(np.uint8)
+                                if gray.shape == (out_h, out_w):
+                                    return gray
                                 # Step 1: undo center-crop → embed in resize canvas
                                 if _vox_crop_h != _vox_rsz_h or _vox_crop_w != _vox_rsz_w:
                                     canvas = np.zeros((_vox_rsz_h, _vox_rsz_w), dtype=np.uint8)
@@ -567,16 +625,17 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
                     for j, i in enumerate(batch_range):
                         proj_depth = depth_futures[j].result()
                         if resize_hw is not None or crop_hw is not None:
-                            proj_depth = _resize_crop(proj_depth, resize_hw, crop_hw)
+                            proj_depth = _resize_crop(proj_depth, resize_hw, crop_hw, crop_then_resize)
                         depth_out_ds[i] = proj_depth
 
                         if save_videos:
                             colour = colorise_depth(proj_depth)
                             ev_gray = batch_ev[j]
                             if ev_gray is not None:
-                                if resize_hw is not None or crop_hw is not None:
+                                if (_ev_source != "voxels" and
+                                        (resize_hw is not None or crop_hw is not None)):
                                     ev_gray = _resize_crop(
-                                        ev_gray.astype(np.float32), resize_hw, crop_hw
+                                        ev_gray.astype(np.float32), resize_hw, crop_hw, crop_then_resize
                                     ).astype(np.uint8)
                                 # Ensure ev_gray matches the output frame size
                                 # (voxels may be stored at a different resolution)
@@ -594,16 +653,17 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
                         if has_rgb_src:
                             proj_rgb = rgb_futures[j].result()
                             if resize_hw is not None or crop_hw is not None:
-                                proj_rgb = _resize_crop(proj_rgb, resize_hw, crop_hw)
+                                proj_rgb = _resize_crop(proj_rgb, resize_hw, crop_hw, crop_then_resize)
                             rgb_out_ds[i] = proj_rgb
 
                             if save_videos:
                                 rgb_bgr = cv2.cvtColor(proj_rgb, cv2.COLOR_RGB2BGR)
                                 ev_gray = batch_ev[j]
                                 if ev_gray is not None:
-                                    if resize_hw is not None or crop_hw is not None:
+                                    if (_ev_source != "voxels" and
+                                            (resize_hw is not None or crop_hw is not None)):
                                         ev_gray = _resize_crop(
-                                            ev_gray.astype(np.float32), resize_hw, crop_hw
+                                            ev_gray.astype(np.float32), resize_hw, crop_hw, crop_then_resize
                                         ).astype(np.uint8)
                                     # Ensure ev_gray matches the output frame size
                                     if ev_gray.shape[0] != out_h or ev_gray.shape[1] != out_w:
@@ -704,14 +764,30 @@ def main():
                         help="Use the middle bin of precomputed voxel grids (events/voxels_cam0.h5) "
                              "instead of event frames for the overlay video. "
                              "Requires precompute_voxels.py to have been run first.")
+    parser.add_argument("--crop_then_resize", "--crop-then-resize", action="store_true",
+                        help="Center-crop at native resolution, then resize using "
+                             "CROP_THEN_RESIZE_* settings from config.py")
     args = parser.parse_args()
 
+    if args.no_resize_crop and args.crop_then_resize:
+        parser.error("--no_resize_crop and --crop_then_resize are mutually exclusive")
     if args.no_resize_crop:
         resize_hw = None
         crop_hw   = None
+    elif args.crop_then_resize:
+        crop_hw = CROP_THEN_RESIZE_CROP_HW
+        resize_hw = CROP_THEN_RESIZE_HW
     else:
         resize_hw = (args.resize_h, args.resize_w) if args.resize_h > 0 and args.resize_w > 0 else None
         crop_hw   = (args.crop_h,   args.crop_w)   if args.crop_h   > 0 and args.crop_w   > 0 else None
+
+    if args.crop_then_resize:
+        calib_size = load_calibration(Path(args.calib_dir))
+        if crop_hw[0] > calib_size["ev_h"] or crop_hw[1] > calib_size["ev_w"]:
+            parser.error(
+                f"crop {crop_hw} exceeds native event size "
+                f"{(calib_size['ev_h'], calib_size['ev_w'])}"
+            )
 
     calib = load_calibration(Path(args.calib_dir))
 
@@ -728,8 +804,11 @@ def main():
     print(f"Video generation: {'on' if args.save_videos else 'off'}")
     print(f"Overlay source: {'voxel middle bin' if args.use_voxels else 'event frames'}")
     if resize_hw:
-        print(f"Resize → {resize_hw[1]}×{resize_hw[0]}"
-              + (f" → crop → {crop_hw[1]}×{crop_hw[0]}" if crop_hw else ""))
+        if args.crop_then_resize:
+            print(f"Crop → {crop_hw[1]}×{crop_hw[0]} → resize → {resize_hw[1]}×{resize_hw[0]}")
+        else:
+            print(f"Resize → {resize_hw[1]}×{resize_hw[0]}"
+                  + (f" → crop → {crop_hw[1]}×{crop_hw[0]}" if crop_hw else ""))
     FPS = args.fps
 
     for d in dirs:
@@ -743,6 +822,7 @@ def main():
             resize_hw=resize_hw,
             crop_hw=crop_hw,
             use_voxels=args.use_voxels,
+            crop_then_resize=args.crop_then_resize,
         )
 
     print("\nDone.")

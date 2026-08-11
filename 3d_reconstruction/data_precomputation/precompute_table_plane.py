@@ -47,6 +47,7 @@ from config import (
     SPATIAL_CUBE_SIDE,
     TABLE_Z_OFFSET,
 )
+from preprocessing_geometry import transform_intrinsics, transform_name
 
 CALIB_DIR = _HERE.parent / _CALIB_DIR
 DATA_ROOT = _HERE.parent / _DATA_ROOT
@@ -135,14 +136,12 @@ def _scale_K_resize_crop(
     resize_W: int,
     crop_H: int,
     crop_W: int,
+    crop_then_resize: bool = False,
 ) -> np.ndarray:
-    """Scale event intrinsics through resize + centred crop."""
-    K = K_native.copy().astype(np.float64)
-    K[0, :] *= resize_W / native_W
-    K[1, :] *= resize_H / native_H
-    K[0, 2] -= (resize_W - crop_W) / 2.0
-    K[1, 2] -= (resize_H - crop_H) / 2.0
-    return K
+    return transform_intrinsics(
+        K_native.astype(np.float64), (native_H, native_W),
+        (resize_H, resize_W), (crop_H, crop_W), crop_then_resize,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +205,7 @@ def process_sequence(
     table_z:   float,
     overwrite: bool = False,
     debug:     bool = False,
+    crop_then_resize: bool = False,
 ) -> dict:
     """Compute and save the canonical corrected table_plane.h5 prior."""
     result = {"name": seq_dir.name, "success": False, "n_frames": 0, "error": None}
@@ -232,6 +232,16 @@ def process_sequence(
         resize_W = int(df.attrs.get("resize_w", native_W))
         crop_H = int(df.attrs.get("crop_h", H))
         crop_W = int(df.attrs.get("crop_w", W))
+        stored_transform = df.attrs.get("intrinsics_transform", "resize_center_crop")
+        if isinstance(stored_transform, bytes):
+            stored_transform = stored_transform.decode("utf-8", errors="replace")
+
+    expected_transform = transform_name(crop_then_resize)
+    if stored_transform != expected_transform:
+        print(
+            f"  [{seq_dir.name}] WARNING: depth uses {stored_transform!r}, "
+            f"requested {expected_transform!r}; recomputing table-plane prior anyway"
+        )
 
     with h5py.File(poses_path, "r") as pf:
         ee_T_all = pf["ee_T"][:]
@@ -247,7 +257,7 @@ def process_sequence(
                 transform = ef.attrs.get("intrinsics_transform", "")
                 if isinstance(transform, bytes):
                     transform = transform.decode("utf-8", errors="replace")
-                corrected_transform = transform == "resize_center_crop"
+                corrected_transform = transform == expected_transform
                 if corrected_transform:
                     result.update(success=True, n_frames=n_frames,
                                   error="Already computed (use --overwrite)")
@@ -278,7 +288,7 @@ def process_sequence(
         of.attrs["table_z_m"]  = float(table_z)
         of.attrs["depth_min"]  = float(DEPTH_MIN)
         of.attrs["depth_max"]  = float(D_MAX)
-        of.attrs["intrinsics_transform"] = "resize_center_crop"
+        of.attrs["intrinsics_transform"] = expected_transform
         of.attrs["description"] = (
             f"Per-pixel normalised depth [0,1] to table plane z={table_z:.4f} m "
             f"(robot base frame). Training depth range: [{DEPTH_MIN}, {D_MAX}] m."
@@ -292,6 +302,7 @@ def process_sequence(
             resize_W,
             crop_H,
             crop_W,
+            crop_then_resize,
         )
         K_native_H, K_native_W = H, W
 
@@ -348,6 +359,10 @@ def main() -> None:
         "--debug", action="store_true",
         help="Save debug/table_plane_debug.png (GT depth | table-plane depth) "
              "for each sequence.",
+    )
+    parser.add_argument(
+        "--crop_then_resize", "--crop-then-resize", action="store_true",
+        help="Use crop-then-resize geometry; projected depth must use the same mode.",
     )
     args = parser.parse_args()
 
@@ -412,6 +427,7 @@ def main() -> None:
             seq_dir, calib, args.table_z,
             overwrite=args.overwrite,
             debug=args.debug,
+            crop_then_resize=args.crop_then_resize,
         )
         results.append(r)
         status = "OK"   if r["success"] else "FAIL"
