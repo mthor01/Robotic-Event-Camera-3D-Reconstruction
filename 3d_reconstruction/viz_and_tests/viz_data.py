@@ -785,25 +785,52 @@ def create_sensor_modalities_plot(
     else:
         events = np.zeros_like(events)
 
-    # Reproduce the resize + centre-crop used while generating projected depth
-    # so the event background and depth overlay share the same pixel frame.
+    # Reproduce the spatial transform used while generating projected depth so
+    # the event background and depth overlay share the same pixel frame.
     resize_h = int(projected_depth_attrs.get("resize_h", projected_depth.shape[0]))
     resize_w = int(projected_depth_attrs.get("resize_w", projected_depth.shape[1]))
     crop_h = int(projected_depth_attrs.get("crop_h", projected_depth.shape[0]))
     crop_w = int(projected_depth_attrs.get("crop_w", projected_depth.shape[1]))
+    intrinsics_transform = projected_depth_attrs.get(
+        "intrinsics_transform", "resize_center_crop"
+    )
+    if isinstance(intrinsics_transform, bytes):
+        intrinsics_transform = intrinsics_transform.decode(
+            "utf-8", errors="replace"
+        )
+
     overlay_events = events
-    if overlay_events.shape != (resize_h, resize_w):
+    if intrinsics_transform == "center_crop_resize":
+        crop_y = max(0, (overlay_events.shape[0] - crop_h) // 2)
+        crop_x = max(0, (overlay_events.shape[1] - crop_w) // 2)
+        overlay_events = overlay_events[
+            crop_y:crop_y + crop_h,
+            crop_x:crop_x + crop_w,
+        ]
         overlay_events = cv2.resize(
             overlay_events,
             (resize_w, resize_h),
             interpolation=cv2.INTER_LINEAR,
         )
-    crop_y = max(0, (overlay_events.shape[0] - crop_h) // 2)
-    crop_x = max(0, (overlay_events.shape[1] - crop_w) // 2)
-    overlay_events = overlay_events[
-        crop_y:crop_y + crop_h,
-        crop_x:crop_x + crop_w,
-    ]
+    elif intrinsics_transform == "resize_center_crop":
+        if overlay_events.shape != (resize_h, resize_w):
+            overlay_events = cv2.resize(
+                overlay_events,
+                (resize_w, resize_h),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        crop_y = max(0, (overlay_events.shape[0] - crop_h) // 2)
+        crop_x = max(0, (overlay_events.shape[1] - crop_w) // 2)
+        overlay_events = overlay_events[
+            crop_y:crop_y + crop_h,
+            crop_x:crop_x + crop_w,
+        ]
+    else:
+        raise ValueError(
+            f"Unsupported intrinsics_transform {intrinsics_transform!r} in "
+            f"{projected_depth_path}"
+        )
+
     if overlay_events.shape != projected_depth.shape:
         overlay_events = cv2.resize(
             overlay_events,
