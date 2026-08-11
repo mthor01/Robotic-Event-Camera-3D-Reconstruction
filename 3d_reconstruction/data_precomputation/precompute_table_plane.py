@@ -238,10 +238,11 @@ def process_sequence(
 
     expected_transform = transform_name(crop_then_resize)
     if stored_transform != expected_transform:
-        print(
-            f"  [{seq_dir.name}] WARNING: depth uses {stored_transform!r}, "
-            f"requested {expected_transform!r}; recomputing table-plane prior anyway"
+        result["error"] = (
+            f"depth uses {stored_transform!r}, requested {expected_transform!r}; "
+            "regenerate projected depth with the matching mode first"
         )
+        return result
 
     with h5py.File(poses_path, "r") as pf:
         ee_T_all = pf["ee_T"][:]
@@ -438,6 +439,8 @@ def main() -> None:
     n_skip = sum(1 for r in results if r["success"] and     r["error"])
     n_fail = sum(1 for r in results if not r["success"])
     print(f"\nDone: {n_ok} computed, {n_skip} skipped, {n_fail} failed.")
+    if n_fail:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

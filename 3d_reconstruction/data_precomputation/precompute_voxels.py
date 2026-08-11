@@ -419,18 +419,26 @@ def process_sequence(
 
 
 def find_sequence_dirs(data_root: Path) -> List[Path]:
-    """Find valid sequence directories that contain the new data structure."""
-    sequence_dirs = []
-    if not data_root.exists():
-        return sequence_dirs
-    for d in data_root.iterdir():
-        if d.is_dir():
-            realsense_h5 = d / "hdf5" / "realsense.h5"
-            raw_dir = d / "raw_event_data"
-            has_raw = raw_dir.exists() and len(list(raw_dir.glob("events_cam*.raw"))) > 0
-            if realsense_h5.exists() and has_raw:
-                sequence_dirs.append(d)
-    return sorted(sequence_dirs)
+    """Find valid sequence directories at or recursively below ``data_root``."""
+    data_root = Path(data_root)
+
+    def is_sequence(path: Path) -> bool:
+        raw_dir = path / "raw_event_data"
+        return (
+            (path / "hdf5" / "realsense.h5").is_file()
+            and raw_dir.is_dir()
+            and any(raw_dir.glob("events_cam*.raw"))
+        )
+
+    if is_sequence(data_root):
+        return [data_root]
+    if not data_root.is_dir():
+        return []
+    return sorted(
+        hdf5_dir.parent
+        for hdf5_dir in data_root.rglob("hdf5")
+        if is_sequence(hdf5_dir.parent)
+    )
 
 
 def main():
@@ -499,10 +507,10 @@ def main():
         parser.error("--crop_h and --crop_w must both be non-zero or both zero")
 
     # Resolve the native event-camera size before any crop validation. For the
-    # current pipeline this is always 1280x720; if a sequence-specific HDF5 is
+    # current pipeline this is always 1280x720 (W x H); if a sequence-specific HDF5 is
     # already present, prefer that metadata to remain consistent with the data.
-    EV_H = 1280
-    EV_W = 720
+    EV_H = 720
+    EV_W = 1280
 
     if args.data_dir:
         candidate_dirs = [_resolve_data_path(d) for d in args.data_dir]
@@ -512,13 +520,17 @@ def main():
     for candidate in candidate_dirs:
         if not candidate.exists():
             continue
-        if candidate.is_dir():
-            ev_h5 = candidate / "hdf5" / "events_cam0.h5"
-            if ev_h5.exists():
-                with h5py.File(ev_h5, "r") as f:
-                    EV_H = int(f["events"].attrs["height"])
-                    EV_W = int(f["events"].attrs["width"])
-                break
+        direct_event_file = candidate / "hdf5" / "events_cam0.h5"
+        event_files = (
+            [direct_event_file]
+            if direct_event_file.is_file()
+            else sorted(candidate.rglob("hdf5/events_cam0.h5"))
+        )
+        if event_files:
+            with h5py.File(event_files[0], "r") as f:
+                EV_H = int(f["events"].attrs["height"])
+                EV_W = int(f["events"].attrs["width"])
+            break
 
     # Crop without a prior resize doesn't make sense
     if crop_hw is not None and output_hw is None:
@@ -532,7 +544,11 @@ def main():
 
     # Find sequences
     if args.data_dir:
-        sequence_dirs = [_resolve_data_path(d) for d in args.data_dir]
+        sequence_dirs = sorted({
+            sequence
+            for data_dir in args.data_dir
+            for sequence in find_sequence_dirs(_resolve_data_path(data_dir))
+        })
     else:
         data_root = _resolve_data_path(args.data_root)
         print(f"Data root: {data_root}")
@@ -636,6 +652,7 @@ def main():
         print(f"\nFailures:")
         for r in failures:
             print(f"  - {r['name']}: {r['error']}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

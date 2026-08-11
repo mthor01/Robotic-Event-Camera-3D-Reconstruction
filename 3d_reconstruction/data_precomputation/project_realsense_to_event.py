@@ -699,12 +699,17 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
 
 
 def find_recordings(root: Path) -> list[Path]:
-    """Find all recording directories that contain hdf5/realsense.h5."""
-    recordings = []
-    for p in sorted(root.iterdir()):
-        if p.is_dir() and (p / "hdf5" / "realsense.h5").exists():
-            recordings.append(p)
-    return recordings
+    """Find recording directories at or recursively below ``root``."""
+    root = Path(root)
+    if (root / "hdf5" / "realsense.h5").is_file():
+        return [root]
+    if not root.is_dir():
+        return []
+    return sorted(
+        hdf5_dir.parent
+        for hdf5_dir in root.rglob("hdf5")
+        if (hdf5_dir / "realsense.h5").is_file()
+    )
 
 
 def main():
@@ -792,12 +797,15 @@ def main():
     calib = load_calibration(Path(args.calib_dir))
 
     if args.data_dir:
-        dirs = [Path(d) for d in args.data_dir]
+        dirs = sorted({
+            recording
+            for data_dir in args.data_dir
+            for recording in find_recordings(Path(data_dir))
+        })
     else:
         dirs = find_recordings(Path(args.data_root))
-        if not dirs:
-            print(f"No recordings found under {args.data_root}")
-            return
+    if not dirs:
+        parser.error("No recordings containing hdf5/realsense.h5 were found")
 
     print(f"Processing {len(dirs)} recording(s)")
     print(f"RGB projection: {'off' if args.no_rgb else 'on'}")

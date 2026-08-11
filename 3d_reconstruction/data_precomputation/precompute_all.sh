@@ -25,7 +25,7 @@
 #         --table  --table_z 0.02 \
 #         --voxel  --num_bins 7 --workers 2
 
-set -e
+set -euo pipefail
 
 # ---- Parse arguments -------------------------------------------------------
 DATA_ARGS=()      # --data_root / --data_dir  (shared, not forwarded to scripts directly)
