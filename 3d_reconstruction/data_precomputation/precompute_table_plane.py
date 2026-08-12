@@ -43,6 +43,10 @@ from config import (
     D_MAX,
     DEPTH_VIZ_MIN,
     DEPTH_VIZ_MAX,
+    CROP_THEN_RESIZE_CROP_HW,
+    CROP_THEN_RESIZE_HW,
+    TRAIN_RESIZE_HW,
+    TRAIN_CROP_HW,
     SPATIAL_TARGET_Z,
     SPATIAL_CUBE_SIDE,
     TABLE_Z_OFFSET,
@@ -379,6 +383,20 @@ def main() -> None:
         args.table_z = SPATIAL_TARGET_Z - SPATIAL_CUBE_SIDE / 2.0 + TABLE_Z_OFFSET
 
     print(f"Table plane Z : {args.table_z:.4f} m")
+    if args.crop_then_resize:
+        crop_h, crop_w = CROP_THEN_RESIZE_CROP_HW
+        resize_h, resize_w = CROP_THEN_RESIZE_HW
+        print(
+            f"Preprocessing : crop -> {crop_w}x{crop_h} -> "
+            f"resize -> {resize_w}x{resize_h}"
+        )
+    else:
+        resize_h, resize_w = TRAIN_RESIZE_HW
+        crop_h, crop_w = TRAIN_CROP_HW
+        print(
+            f"Preprocessing : resize -> {resize_w}x{resize_h} -> "
+            f"crop -> {crop_w}x{crop_h}"
+        )
     data_root = _resolve_data_path(args.data_root)
     print(f"Data root     : {data_root}")
 
