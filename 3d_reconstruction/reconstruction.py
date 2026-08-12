@@ -69,7 +69,7 @@ from config import (
     SPATIAL_CUBE_SIDE, SPATIAL_TARGET_X, SPATIAL_TARGET_Y, SPATIAL_TARGET_Z,
 )
 from preprocessing_geometry import transform_intrinsics, transform_name
-from spatial_mask import points_in_cube
+from spatial_mask import depth_cube_mask, points_in_cube
 from train_unet import RecurrentUNet, UNet
 from multiview import (
     ModernMVSNet,
@@ -79,6 +79,7 @@ from multiview import (
 
 CALIB_DIR = _HERE / _CALIB_DIR
 CROP_THEN_RESIZE_MODE = False
+PLUS_1CM_BOTTOM_Z_M = 0.01
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -748,6 +749,8 @@ def reconstruction_error_stats(
     K: np.ndarray,
     stride: int,
     max_points: int,
+    cube_center: Optional[np.ndarray] = None,
+    cube_half_side: float = 0.0,
 ) -> Optional[dict]:
     """Compare predicted and GT reconstructions as fused world-frame point sets."""
     if not pred_frames or not gt_frames:
@@ -770,10 +773,18 @@ def reconstruction_error_stats(
         gt_cam = depth_to_pointcloud(gt_s, gt_s > 0.0, K_s)
         if len(pred_cam):
             pred_h = np.concatenate([pred_cam, np.ones((len(pred_cam), 1), dtype=np.float32)], axis=1)
-            pred_pts_all.append((T_world_from_cam @ pred_h.T).T[:, :3].astype(np.float32))
+            pred_world = (T_world_from_cam @ pred_h.T).T[:, :3].astype(np.float32)
+            if cube_center is not None:
+                pred_world = pred_world[points_in_cube(pred_world, cube_center, cube_half_side)]
+            if len(pred_world):
+                pred_pts_all.append(pred_world)
         if len(gt_cam):
             gt_h = np.concatenate([gt_cam, np.ones((len(gt_cam), 1), dtype=np.float32)], axis=1)
-            gt_pts_all.append((T_world_from_cam @ gt_h.T).T[:, :3].astype(np.float32))
+            gt_world = (T_world_from_cam @ gt_h.T).T[:, :3].astype(np.float32)
+            if cube_center is not None:
+                gt_world = gt_world[points_in_cube(gt_world, cube_center, cube_half_side)]
+            if len(gt_world):
+                gt_pts_all.append(gt_world)
 
     if not pred_pts_all or not gt_pts_all:
         return None
@@ -866,6 +877,7 @@ def tsdf_fuse(
     confidence_levels: int = 0,
     min_confidence:   float = 0.05,
     use_color:        bool = False,
+    additional_crops: Optional[list[tuple[Path, np.ndarray]]] = None,
 ) -> bool:
     """TSDF fusion, optionally weighted by a per-pixel confidence map.
 
@@ -982,31 +994,40 @@ def tsdf_fuse(
             if np.any(weighted_depth > 0.0):
                 integrate_depth(weighted_depth, T_cam_from_world, color_np)
 
-    mesh = volume.extract_triangle_mesh()
-    mesh.compute_vertex_normals()
+    full_mesh = volume.extract_triangle_mesh()
+    full_mesh.compute_vertex_normals()
 
-    if cube_center is not None and cube_half_side > 0.0:
-        verts  = np.asarray(mesh.vertices)
-        inside = np.flatnonzero(points_in_cube(verts, cube_center, cube_half_side))
-        mesh   = mesh.select_by_index(inside)
-        mesh.compute_vertex_normals()
-        print(f"  Cube crop (side={cube_half_side*2*100:.0f} cm) → "
-              f"{len(np.asarray(mesh.vertices)):,} verts, "
-              f"{len(np.asarray(mesh.triangles)):,} triangles")
+    def cropped_mesh(center: Optional[np.ndarray]):
+        if center is None or cube_half_side <= 0.0:
+            return full_mesh
+        verts = np.asarray(full_mesh.vertices)
+        inside = np.flatnonzero(points_in_cube(verts, center, cube_half_side))
+        result = full_mesh.select_by_index(inside)
+        result.compute_vertex_normals()
+        return result
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    mesh = cropped_mesh(cube_center)
+    print(f"  Cube crop (side={cube_half_side*2*100:.0f} cm) → "
+          f"{len(np.asarray(mesh.vertices)):,} verts, "
+          f"{len(np.asarray(mesh.triangles)):,} triangles")
+
+    def write_mesh(path: Path, mesh_to_write) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        o3d.io.write_triangle_mesh(
+            str(path), mesh_to_write, write_vertex_normals=not use_color,
+        )
+        print(f"  Mesh → {path}  ({len(np.asarray(mesh_to_write.vertices)):,} verts, "
+              f"{len(np.asarray(mesh_to_write.triangles)):,} triangles)")
+
     # For colored PLYs, prefer a simple xyz+rgb vertex layout.  Some viewers
     # pick the normal/scalar array for false-color rendering when Open3D writes
     # normals before red/green/blue, which makes the mesh look psychedelic even
     # though the stored RGB values are sane.  Viewers can recompute normals.
-    o3d.io.write_triangle_mesh(
-        str(out_path),
-        mesh,
-        write_vertex_normals=not use_color,
-    )
+    write_mesh(out_path, mesh)
+    for extra_path, extra_center in additional_crops or []:
+        write_mesh(extra_path, cropped_mesh(extra_center))
     n_v = len(np.asarray(mesh.vertices))
     n_t = len(np.asarray(mesh.triangles))
-    print(f"  Mesh → {out_path}  ({n_v:,} verts, {n_t:,} triangles)")
     return n_v > 0 and n_t > 0
 
 
@@ -1447,6 +1468,101 @@ def _set_cli_option(argv: list[str], option: str, value: str) -> list[str]:
     return updated
 
 
+def _write_reconstruction_summary(output_root: Path, sequence_dirs: list[Path]) -> None:
+    """Aggregate per-sequence two-mask metrics and write plots/mean values."""
+    runs = []
+    for sequence_dir in sequence_dirs:
+        path = output_root / sequence_dir.name / "reconstruction_metrics.json"
+        if path.is_file():
+            runs.append((sequence_dir.name, json.loads(path.read_text(encoding="utf-8"))))
+    if not runs:
+        return
+
+    def values(case: str, section: str, metric: str) -> list[float]:
+        result = []
+        for _, payload in runs:
+            value = ((payload.get("cases", {}).get(case, {}).get(section) or {}).get(metric))
+            if isinstance(value, (int, float)) and np.isfinite(value):
+                result.append(float(value))
+        return result
+
+    cases = (("current_mask", "Current mask"), ("plus_1cm", "+1 cm bottom"))
+    sections = {
+        "depth_metrics": ("mae_m", "rmse_m", "max_m"),
+        "prefusion_pointcloud_metrics": (
+            "chamfer_l1_m", "accuracy_m", "completeness_m",
+            "accuracy_p95_m", "completeness_p95_m",
+        ),
+        "surface_metrics": (
+            "accuracy_mean_m", "accuracy_median_m", "completeness_mean_m",
+            "completeness_median_m", "chamfer_mean_m", "chamfer_median_m",
+            "normal_consistency_symmetric", "precision_1cm", "recall_1cm",
+            "fscore_1cm", "precision_2cm", "recall_2cm", "fscore_2cm",
+            "precision_5cm", "recall_5cm", "fscore_5cm",
+        ),
+        "rendered_depth_metrics": ("mae_m", "rmse_m", "abs_rel", "valid_render_percentage"),
+    }
+    lines = ["Reconstruction summary (unweighted mean across objects)",
+             f"Objects: {len(runs)} ({', '.join(name for name, _ in runs)})", ""]
+    summary_json = {"object_count": len(runs), "objects": [name for name, _ in runs], "cases": {}}
+    for case, label in cases:
+        lines.append(label)
+        summary_json["cases"][case] = {}
+        for section, metrics in sections.items():
+            lines.append(f"  {section}")
+            summary_json["cases"][case][section] = {}
+            for metric in metrics:
+                vals = values(case, section, metric)
+                if not vals:
+                    continue
+                mean = float(np.mean(vals))
+                summary_json["cases"][case][section][metric] = mean
+                unit = " m" if metric.endswith("_m") else ""
+                lines.append(f"    {metric}: {mean:.6f}{unit}  (n={len(vals)})")
+        lines.append("")
+    (output_root / "reconstruction_summary.txt").write_text("\n".join(lines), encoding="utf-8")
+    (output_root / "reconstruction_summary.json").write_text(
+        json.dumps(summary_json, indent=2) + "\n", encoding="utf-8"
+    )
+
+    names = [name for name, _ in runs]
+    x = np.arange(len(names))
+    width = 0.38
+    fig, ax = plt.subplots(figsize=(max(8, 1.35 * len(names)), 5))
+    for offset, (case, label) in zip((-width / 2, width / 2), cases):
+        vals = [
+            100.0 * float(((payload["cases"].get(case, {}).get("surface_metrics") or {}).get("chamfer_mean_m", np.nan)))
+            for _, payload in runs
+        ]
+        ax.bar(x + offset, vals, width, label=label)
+    ax.set_xticks(x, names)
+    ax.set_ylabel("Post-TSDF surface Chamfer [cm]")
+    ax.set_title("Reconstruction Chamfer by object and spatial mask")
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_root / "chamfer_by_object_and_mask.png", dpi=180)
+    plt.close(fig)
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
+    panels = (
+        ("depth_metrics", "mae_m", "Depth MAE [cm]"),
+        ("surface_metrics", "chamfer_mean_m", "Surface Chamfer [cm]"),
+        ("rendered_depth_metrics", "mae_m", "Rendered-depth MAE [cm]"),
+    )
+    for ax, (section, metric, title) in zip(axes, panels):
+        for offset, (case, label) in zip((-width / 2, width / 2), cases):
+            vals = [100.0 * float(((payload["cases"].get(case, {}).get(section) or {}).get(metric, np.nan))) for _, payload in runs]
+            ax.bar(x + offset, vals, width, label=label)
+        ax.set_xticks(x, names, rotation=35, ha="right")
+        ax.set_title(title)
+        ax.grid(axis="y", alpha=0.25)
+    axes[0].legend()
+    fig.tight_layout()
+    fig.savefig(output_root / "reconstruction_error_overview.png", dpi=180)
+    plt.close(fig)
+
+
 def _run_sequence_directory(args: argparse.Namespace) -> bool:
     """Run one child process per sequence when --data_dir is a parent folder."""
     data_root = Path(args.data_dir)
@@ -1504,6 +1620,8 @@ def _run_sequence_directory(args: argparse.Namespace) -> bool:
             f"sequences: {failure_text}"
         )
 
+    _write_reconstruction_summary(output_root, sequence_dirs)
+
     print(
         f"\nCompleted reconstruction for all {len(sequence_dirs)} sequences. "
         f"Output root: {output_root}",
@@ -1529,6 +1647,9 @@ def main() -> None:
             "directories are sequences"
         ),
     )
+    parser.add_argument("--save_frame_visualizations", "--save-frame-visualizations",
+                        action="store_true",
+                        help="Write per-frame depth/point-cloud folders and overview.png")
     parser.add_argument("--n_frames", type=int, default=5,
                         help="Number of frames to visualise in the overview")
     parser.add_argument("--frame_step", type=int, default=None,
@@ -1624,6 +1745,10 @@ def main() -> None:
     data_dir       = Path(args.data_dir)
     cube_center    = np.array([args.target_x, args.target_y, args.target_z], dtype=np.float64)
     cube_half_side = args.cube_side / 2.0
+    plus_1cm_center = np.array(
+        [args.target_x, args.target_y, PLUS_1CM_BOTTOM_Z_M + cube_half_side],
+        dtype=np.float64,
+    )
 
     CROP_THEN_RESIZE_MODE = args.crop_then_resize
     if args.crop_then_resize:
@@ -1828,7 +1953,9 @@ def main() -> None:
         mesh_frames = sorted(set(mesh_frames))
         step = None
 
-    if args.indices is not None:
+    if not args.save_frame_visualizations:
+        viz_frames = []
+    elif args.indices is not None:
         viz_frames = sorted([
             int(i) for i in args.indices
             if frame_start <= int(i) <= frame_end
@@ -1884,6 +2011,10 @@ def main() -> None:
     recurrent_states = None
     t_infer_total = 0.0
     depth_error_total = {"n": 0, "abs_sum": 0.0, "sq_sum": 0.0, "max_abs": 0.0}
+    depth_error_by_case = {
+        "current_mask": {"n": 0, "abs_sum": 0.0, "sq_sum": 0.0, "max_abs": 0.0},
+        "plus_1cm": {"n": 0, "abs_sum": 0.0, "sq_sum": 0.0, "max_abs": 0.0},
+    }
 
     try:
         for frame_idx in run_frames:
@@ -1972,6 +2103,19 @@ def main() -> None:
             frame_err = depth_error_stats(pred_m, gt, gt_mask)
             merge_depth_error_stats(depth_error_total, frame_err)
 
+            if use_poses and frame_idx < len(ee_T_all):
+                T_base_from_event = ee_T_all[frame_idx] @ T_ee_from_event
+                T_event_from_base = np.linalg.inv(T_base_from_event)
+                for case_name, case_center in (
+                    ("current_mask", cube_center),
+                    ("plus_1cm", plus_1cm_center),
+                ):
+                    spatial = depth_cube_mask(
+                        gt, T_event_from_base, K, case_center, cube_half_side
+                    )
+                    case_err = depth_error_stats(pred_m, gt, gt_mask * spatial)
+                    merge_depth_error_stats(depth_error_by_case[case_name], case_err)
+
             # Per-frame point cloud
             pts = depth_to_pointcloud(pred_m, pred_mask, K)
 
@@ -2051,7 +2195,6 @@ def main() -> None:
             print("MAE frame select : no finite-MAE candidates available")
 
     print(f"Inference/prep   : {len(run_frames)} frames in {t_infer_total:.1f}s")
-    print(f"Inference/prep   : {len(run_frames)} frames in {t_infer_total:.1f}s")
 
     depth_summary = summarize_depth_error(depth_error_total)
     if depth_summary is not None:
@@ -2065,6 +2208,11 @@ def main() -> None:
         print("Depth error      : no valid GT pixels")
 
     recon_summary = None
+    recon_by_case = {}
+    depth_by_case = {
+        name: summarize_depth_error(stats)
+        for name, stats in depth_error_by_case.items()
+    }
     if mesh_data and gt_mesh_data:
         t_err0 = time.perf_counter()
         try:
@@ -2075,6 +2223,17 @@ def main() -> None:
                 stride=args.error_stride,
                 max_points=args.error_max_points,
             )
+            for case_name, case_center in (
+                ("current_mask", cube_center),
+                ("plus_1cm", plus_1cm_center),
+            ):
+                recon_by_case[case_name] = reconstruction_error_stats(
+                    mesh_data, gt_mesh_data, K,
+                    stride=args.error_stride,
+                    max_points=args.error_max_points,
+                    cube_center=case_center,
+                    cube_half_side=cube_half_side,
+                )
         except RuntimeError as exc:
             print(f"Recon error      : skipped ({exc})")
         if recon_summary is not None:
@@ -2093,6 +2252,12 @@ def main() -> None:
         print("Recon error      : no pose-aligned TSDF frames available")
 
     write_error_report(out_dir / "error_report.txt", depth_summary, recon_summary)
+    for case_name in ("current_mask", "plus_1cm"):
+        write_error_report(
+            out_dir / f"error_report_{case_name}.txt",
+            depth_by_case.get(case_name),
+            recon_by_case.get(case_name),
+        )
     print(f"  Error report   : {out_dir / 'error_report.txt'}")
 
     # ── TSDF mesh ─────────────────────────────────────────────────
@@ -2110,6 +2275,12 @@ def main() -> None:
     )
     gt_mesh_path = (
         out_dir / f"{sequence_name}_{frame_selection_name}_gt_mesh.obj"
+    )
+    plus_1cm_pred_mesh_path = out_dir / (
+        f"{sequence_name}_{frame_selection_name}_plus_1cm_mesh{pred_mesh_ext}"
+    )
+    plus_1cm_gt_mesh_path = out_dir / (
+        f"{sequence_name}_{frame_selection_name}_plus_1cm_gt_mesh.obj"
     )
     original_depth_mesh_path = (
         out_dir / f"{sequence_name}_{frame_selection_name}_original_depth_mesh.obj"
@@ -2188,6 +2359,7 @@ def main() -> None:
             confidence_levels=confidence_levels,
             min_confidence=args.tsdf_min_confidence,
             use_color=args.color_mesh,
+            additional_crops=[(plus_1cm_pred_mesh_path, plus_1cm_center)],
         )
         print(f"  Pred TSDF time : {time.perf_counter() - t_tsdf0:.1f}s")
     if gt_mesh_data and not args.skip_gt_mesh:
@@ -2201,6 +2373,7 @@ def main() -> None:
             depth_max=depth_max,
             cube_center=cube_center,
             cube_half_side=cube_half_side,
+            additional_crops=[(plus_1cm_gt_mesh_path, plus_1cm_center)],
         )
         print(f"  GT TSDF time   : {time.perf_counter() - t_tsdf0:.1f}s")
     elif gt_mesh_data:
@@ -2223,13 +2396,20 @@ def main() -> None:
 
     # ── Post-TSDF reconstruction evaluation ──────────────────────
     surface_metrics = None
+    plus_1cm_surface_metrics = None
     rendered_metrics = None
+    plus_1cm_rendered_metrics = None
     if pred_mesh_created and gt_mesh_created:
         t_metric0 = time.perf_counter()
         try:
             surface_metrics = evaluate_tsdf_meshes(
                 pred_mesh_path,
                 gt_mesh_path,
+                surface_samples=args.surface_samples,
+            )
+            plus_1cm_surface_metrics = evaluate_tsdf_meshes(
+                plus_1cm_pred_mesh_path,
+                plus_1cm_gt_mesh_path,
                 surface_samples=args.surface_samples,
             )
         except RuntimeError as exc:
@@ -2244,6 +2424,12 @@ def main() -> None:
                 f"normal={surface_metrics['normal_consistency_symmetric']:.3f}"
             )
             print(f"  Surface metric time: {time.perf_counter() - t_metric0:.1f}s")
+        if plus_1cm_surface_metrics is not None:
+            print(
+                f"  Surface +1 cm : F@1cm={plus_1cm_surface_metrics['fscore_1cm']:.1%}, "
+                f"Chamfer={plus_1cm_surface_metrics['chamfer_mean_m'] * 100:.2f} cm, "
+                f"normal={plus_1cm_surface_metrics['normal_consistency_symmetric']:.3f}"
+            )
     elif args.skip_gt_mesh:
         print("  Surface metrics: unavailable because --skip_gt_mesh was used")
 
@@ -2272,6 +2458,18 @@ def main() -> None:
                 depth_min,
                 depth_max,
             )
+            plus_1cm_rendered_metrics = evaluate_rendered_depth(
+                plus_1cm_pred_mesh_path,
+                held_out_frames,
+                depth_h5_path,
+                ee_T_all,
+                T_ee_from_event,
+                K,
+                resize_hw,
+                crop_hw,
+                depth_min,
+                depth_max,
+            )
             if rendered_metrics is not None:
                 print(
                     f"  Rendered depth : MAE={rendered_metrics['mae_m'] * 100:.2f} cm, "
@@ -2285,6 +2483,57 @@ def main() -> None:
             print("  Rendered depth : no camera frames held out from TSDF fusion")
 
     write_tsdf_metric_outputs(out_dir, surface_metrics, rendered_metrics)
+    reconstruction_metrics = {
+        "mask_definition": {
+            "current_mask_center_world_m": cube_center.tolist(),
+            "plus_1cm_bottom_z_m": PLUS_1CM_BOTTOM_Z_M,
+            "plus_1cm_center_world_m": plus_1cm_center.tolist(),
+            "cube_side_m": args.cube_side,
+        },
+        "cases": {
+            "current_mask": {
+                "depth_metrics": depth_by_case.get("current_mask"),
+                "prefusion_pointcloud_metrics": recon_by_case.get("current_mask"),
+                "surface_metrics": surface_metrics,
+                "rendered_depth_metrics": rendered_metrics,
+            },
+            "plus_1cm": {
+                "depth_metrics": depth_by_case.get("plus_1cm"),
+                "prefusion_pointcloud_metrics": recon_by_case.get("plus_1cm"),
+                "surface_metrics": plus_1cm_surface_metrics,
+                "rendered_depth_metrics": plus_1cm_rendered_metrics,
+            },
+        },
+    }
+    (out_dir / "reconstruction_metrics.json").write_text(
+        json.dumps(reconstruction_metrics, indent=2) + "\n", encoding="utf-8"
+    )
+    case_lines = [
+        "Reconstruction metrics for two spatial masks",
+        f"Current cube center: {cube_center.tolist()} m",
+        f"+1 cm cube bottom: z={PLUS_1CM_BOTTOM_Z_M:.3f} m; center={plus_1cm_center.tolist()} m",
+        "",
+    ]
+    for case_name, label in (("current_mask", "Current mask"), ("plus_1cm", "+1 cm bottom")):
+        case = reconstruction_metrics["cases"][case_name]
+        case_lines.append(label)
+        depth_case = case["depth_metrics"]
+        point_case = case["prefusion_pointcloud_metrics"]
+        surface_case = case["surface_metrics"]
+        render_case = case["rendered_depth_metrics"]
+        if depth_case:
+            case_lines.append(f"  Depth MAE/RMSE: {depth_case['mae_m']:.6f}/{depth_case['rmse_m']:.6f} m")
+        if point_case:
+            case_lines.append(f"  Pre-fusion Chamfer-L1: {point_case['chamfer_l1_m']:.6f} m")
+        if surface_case:
+            case_lines.append(f"  Post-TSDF Chamfer mean/median: {surface_case['chamfer_mean_m']:.6f}/{surface_case['chamfer_median_m']:.6f} m")
+            case_lines.append(f"  Normal consistency: {surface_case['normal_consistency_symmetric']:.6f}")
+            case_lines.append(f"  F-score @1/2/5 cm: {surface_case['fscore_1cm']:.2%}/{surface_case['fscore_2cm']:.2%}/{surface_case['fscore_5cm']:.2%}")
+        if render_case:
+            case_lines.append(f"  Rendered MAE/RMSE: {render_case['mae_m']:.6f}/{render_case['rmse_m']:.6f} m")
+            case_lines.append(f"  Render coverage: {render_case['valid_render_percentage']:.2%}")
+        case_lines.append("")
+    (out_dir / "reconstruction_metrics.txt").write_text("\n".join(case_lines), encoding="utf-8")
     print(f"  TSDF metrics   : {out_dir / 'tsdf_metrics.txt'}")
 
     # ── Overview PNG ──────────────────────────────────────────────

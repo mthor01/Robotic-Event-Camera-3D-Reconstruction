@@ -942,6 +942,8 @@ class ModernMVSNet(nn.Module):
         fine_depths: int = 5,
         fine_window: float = 0.08,
         fine_offset_radius: float = 2.0,
+        fine_window_min: float = 0.04,
+        fine_window_max: float = 0.16,
         learned_fine_window: bool = False,
         reference_channels: int = 0,
         coarse_cost_channels: int = 0,
@@ -970,6 +972,10 @@ class ModernMVSNet(nn.Module):
             raise ValueError("middle_depths must be >= 3")
         if middle_window <= 0:
             raise ValueError("middle_window must be > 0")
+        if fine_window_min <= 0:
+            raise ValueError("fine_window_min must be > 0")
+        if fine_window_max < fine_window_min:
+            raise ValueError("fine_window_max must be >= fine_window_min")
         feature_ch = feature_ch or max(32, base)
         cost_base = cost_base or max(8, base // 4)
         coarse_cost_base = coarse_cost_channels or cost_base
@@ -979,6 +985,8 @@ class ModernMVSNet(nn.Module):
         self.middle_depths = int(middle_depths)
         self.middle_window = float(middle_window)
         self.fine_window = float(fine_window)
+        self.fine_window_min = float(fine_window_min)
+        self.fine_window_max = float(fine_window_max)
         self.refiner_max_residual_override = refiner_max_residual_m is not None
         if refiner_max_residual_m is not None and refiner_max_residual_m <= 0:
             raise ValueError("--refiner_max_residual_m must be > 0")
@@ -1206,21 +1214,26 @@ class ModernMVSNet(nn.Module):
             coarse_m, size=fine_ref.shape[-2:], mode="bilinear", align_corners=False
         )
         if self.learned_fine_window:
-            scale = 0.25 + 0.75 * torch.sigmoid(
+            half_window = self.fine_window_min + (
+                self.fine_window_max - self.fine_window_min
+            ) * torch.sigmoid(
                 self.window_head(torch.cat([fine_ref, coarse_up], dim=1))
             )
-            sigma = self.fine_window * scale
+            offset_radius = 1.0
         else:
-            sigma = torch.full_like(coarse_up, self.fine_window)
+            half_window = torch.full_like(
+                coarse_up, self.fine_window * self.fine_offset_radius
+            )
+            offset_radius = 1.0
         offsets = torch.linspace(
-            -self.fine_offset_radius,
-            self.fine_offset_radius,
+            -offset_radius,
+            offset_radius,
             self.fine_depths,
             device=coarse_up.device,
             dtype=coarse_up.dtype,
         )
         return (
-            coarse_up + sigma * offsets.view(1, self.fine_depths, 1, 1)
+            coarse_up + half_window * offsets.view(1, self.fine_depths, 1, 1)
         ).clamp(DEPTH_MIN, D_MAX)
 
     def forward(
@@ -1903,6 +1916,10 @@ def main() -> None:
                         help="Fine-stage sigma/window in metres before multiplying by offsets")
     parser.add_argument("--fine_offset_radius", type=float, default=2.0,
                         help="Fine offsets span [-radius, radius]; 2 with 5 planes gives [-2,-1,0,1,2]")
+    parser.add_argument("--fine_window_min", type=float, default=0.04,
+                        help="Minimum learned fine-stage search half-width in metres")
+    parser.add_argument("--fine_window_max", type=float, default=0.16,
+                        help="Maximum learned fine-stage search half-width in metres")
     parser.add_argument("--learned_fine_window", action="store_true",
                         help="Predict a per-pixel fine-stage window from target features and coarse depth")
     parser.add_argument("--uncertainty", action="store_true",
@@ -2124,6 +2141,7 @@ def main() -> None:
     print(
         f"  Fine stage: planes={args.fine_depths}, window={args.fine_window:.4f} m, "
         f"offset radius={args.fine_offset_radius:g}, "
+        f"learned half-width=[{args.fine_window_min:g}, {args.fine_window_max:g}] m, "
         f"learned window={args.learned_fine_window}\n"
     )
     print(
@@ -2201,6 +2219,8 @@ def main() -> None:
         fine_depths=args.fine_depths,
         fine_window=args.fine_window,
         fine_offset_radius=args.fine_offset_radius,
+        fine_window_min=args.fine_window_min,
+        fine_window_max=args.fine_window_max,
         learned_fine_window=args.learned_fine_window,
         reference_channels=args.reference_channels,
         coarse_cost_channels=args.coarse_cost_channels,
@@ -2406,6 +2426,8 @@ def main() -> None:
             "fine_depths": args.fine_depths,
             "fine_window": args.fine_window,
             "fine_offset_radius": args.fine_offset_radius,
+            "fine_window_min": args.fine_window_min,
+            "fine_window_max": args.fine_window_max,
             "learned_fine_window": args.learned_fine_window,
             "uncertainty": args.uncertainty,
             "optimizer": args.optimizer,

@@ -308,12 +308,19 @@ def create_speed_distribution_plot(speeds_m_s: np.ndarray, output_path: Path) ->
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure, axis = plt.subplots(figsize=(10, 6))
-    sns.histplot(speed, bins="auto", stat="density", kde=True, ax=axis, color="#2878B5")
-    median, p90, p95 = np.percentile(speed, [50, 90, 95])
+    sns.kdeplot(
+        x=speed,
+        ax=axis,
+        color="#2878B5",
+        linewidth=2.6,
+        fill=False,
+        cut=0,
+    )
+    median, p95, p99 = np.percentile(speed, [50, 95, 99])
     for value, label, color in (
         (median, "median", "#E07A1F"),
-        (p90, "90th percentile", "#3A923A"),
         (p95, "95th percentile", "#C33C54"),
+        (p99, "99th percentile", "#3A923A"),
     ):
         axis.axvline(value, color=color, linestyle="--", linewidth=1.8,
                      label=f"{label}: {value:.3f} m/s")
@@ -585,7 +592,6 @@ def create_recording_path_plot(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import seaborn as sns
-    from matplotlib.lines import Line2D
 
     sns.set_theme(
         context="talk",
@@ -694,16 +700,6 @@ def create_recording_path_plot(
         fontweight="bold",
         color="black",
     )
-    handles, labels = axis.get_legend_handles_labels()
-    handles.append(
-        Line2D([0], [0], color="#F4A261", linewidth=2.0)
-    )
-    labels.append("Camera Viewing Axis")
-    axis.legend(
-        handles, labels, loc="upper left", bbox_to_anchor=(0.02, 0.96),
-        fontsize=12, markerscale=1.25, frameon=True, framealpha=0.94,
-        borderpad=0.8, labelspacing=0.7,
-    )
     axis.grid(True, linestyle="--", linewidth=0.7, alpha=0.55)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=190, bbox_inches="tight", facecolor="white")
@@ -717,7 +713,6 @@ def create_sensor_modalities_plot(
     sequence_name: str,
 ) -> tuple[Path, int]:
     """Render aligned RGB, depth, events, and event-frame depth in a 2x2 grid."""
-    import cv2
     import h5py
     import matplotlib
 
@@ -727,9 +722,9 @@ def create_sensor_modalities_plot(
 
     hdf5_dir = sequence_dir / "hdf5"
     realsense_path = hdf5_dir / "realsense.h5"
-    events_path = hdf5_dir / "events_cam0.h5"
+    voxels_path = sequence_dir / "events" / "voxels_cam0.h5"
     projected_depth_path = hdf5_dir / "depth_in_event_frame.h5"
-    required_paths = (realsense_path, events_path, projected_depth_path)
+    required_paths = (realsense_path, voxels_path, projected_depth_path)
     missing = [str(path) for path in required_paths if not path.is_file()]
     if missing:
         raise FileNotFoundError(
@@ -738,12 +733,12 @@ def create_sensor_modalities_plot(
         )
 
     with h5py.File(realsense_path, "r") as realsense_file, \
-         h5py.File(events_path, "r") as events_file, \
+         h5py.File(voxels_path, "r") as voxels_file, \
          h5py.File(projected_depth_path, "r") as projected_depth_file:
         for file_path, handle, key in (
             (realsense_path, realsense_file, "rgb"),
             (realsense_path, realsense_file, "depth"),
-            (events_path, events_file, "events/frames"),
+            (voxels_path, voxels_file, "voxels"),
             (projected_depth_path, projected_depth_file, "depth"),
         ):
             if key not in handle:
@@ -752,7 +747,7 @@ def create_sensor_modalities_plot(
         common_frames = min(
             len(realsense_file["rgb"]),
             len(realsense_file["depth"]),
-            len(events_file["events/frames"]),
+            len(voxels_file["voxels"]),
             len(projected_depth_file["depth"]),
         )
         if common_frames == 0:
@@ -766,11 +761,10 @@ def create_sensor_modalities_plot(
 
         rgb = realsense_file["rgb"][selected_frame]
         raw_depth = realsense_file["depth"][selected_frame].astype(np.float32)
-        events = events_file["events/frames"][selected_frame].astype(np.float32)
+        voxel = voxels_file["voxels"][selected_frame].astype(np.float32)
         projected_depth = projected_depth_file["depth"][selected_frame].astype(
             np.float32
         )
-        projected_depth_attrs = dict(projected_depth_file.attrs)
 
     depth_scale_path = (
         _REPOSITORY_ROOT / "3d_reconstruction" / "camera_data" / "depth_scale.npz"
@@ -778,6 +772,9 @@ def create_sensor_modalities_plot(
     depth_scale = float(np.load(depth_scale_path)["scale"])
     raw_depth *= depth_scale
 
+    # The voxel grid has already undergone the exact crop/resize transform used
+    # by the model. Collapse its temporal bins into a grayscale activity image.
+    events = np.abs(voxel).sum(axis=0)
     event_min = float(events.min())
     event_max = float(events.max())
     if event_max > event_min:
@@ -785,58 +782,13 @@ def create_sensor_modalities_plot(
     else:
         events = np.zeros_like(events)
 
-    # Reproduce the spatial transform used while generating projected depth so
-    # the event background and depth overlay share the same pixel frame.
-    resize_h = int(projected_depth_attrs.get("resize_h", projected_depth.shape[0]))
-    resize_w = int(projected_depth_attrs.get("resize_w", projected_depth.shape[1]))
-    crop_h = int(projected_depth_attrs.get("crop_h", projected_depth.shape[0]))
-    crop_w = int(projected_depth_attrs.get("crop_w", projected_depth.shape[1]))
-    intrinsics_transform = projected_depth_attrs.get(
-        "intrinsics_transform", "resize_center_crop"
-    )
-    if isinstance(intrinsics_transform, bytes):
-        intrinsics_transform = intrinsics_transform.decode(
-            "utf-8", errors="replace"
-        )
-
-    overlay_events = events
-    if intrinsics_transform == "center_crop_resize":
-        crop_y = max(0, (overlay_events.shape[0] - crop_h) // 2)
-        crop_x = max(0, (overlay_events.shape[1] - crop_w) // 2)
-        overlay_events = overlay_events[
-            crop_y:crop_y + crop_h,
-            crop_x:crop_x + crop_w,
-        ]
-        overlay_events = cv2.resize(
-            overlay_events,
-            (resize_w, resize_h),
-            interpolation=cv2.INTER_LINEAR,
-        )
-    elif intrinsics_transform == "resize_center_crop":
-        if overlay_events.shape != (resize_h, resize_w):
-            overlay_events = cv2.resize(
-                overlay_events,
-                (resize_w, resize_h),
-                interpolation=cv2.INTER_LINEAR,
-            )
-        crop_y = max(0, (overlay_events.shape[0] - crop_h) // 2)
-        crop_x = max(0, (overlay_events.shape[1] - crop_w) // 2)
-        overlay_events = overlay_events[
-            crop_y:crop_y + crop_h,
-            crop_x:crop_x + crop_w,
-        ]
-    else:
+    if events.shape != projected_depth.shape:
         raise ValueError(
-            f"Unsupported intrinsics_transform {intrinsics_transform!r} in "
-            f"{projected_depth_path}"
+            f"Voxel image shape {events.shape} does not match projected depth "
+            f"shape {projected_depth.shape} in {sequence_dir}. Regenerate both "
+            "with the same crop/resize mode."
         )
-
-    if overlay_events.shape != projected_depth.shape:
-        overlay_events = cv2.resize(
-            overlay_events,
-            (projected_depth.shape[1], projected_depth.shape[0]),
-            interpolation=cv2.INTER_LINEAR,
-        )
+    overlay_events = events
 
     sns.set_theme(
         context="talk",

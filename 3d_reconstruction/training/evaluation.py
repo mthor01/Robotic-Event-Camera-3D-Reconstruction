@@ -512,14 +512,24 @@ def _build_model(
     else:
         raise ValueError(f"Unsupported multiview checkpoint architecture: {model_arch}")
 
+    fine_window = float(_required_metadata(metadata, "fine_window", 0.08))
+    fine_offset_radius = float(
+        _required_metadata(metadata, "fine_offset_radius", 2.0)
+    )
     model = model_cls(
         in_ch=int(_required_metadata(metadata, "in_ch", NUM_BINS + 1)),
         base=base,
         feature_ch=int(_required_metadata(metadata, "feature_channels", base * 4)),
         cost_base=int(_required_metadata(metadata, "cost_channels", max(base // 2, 8))),
         fine_depths=int(_required_metadata(metadata, "fine_depths", 5)),
-        fine_window=float(_required_metadata(metadata, "fine_window", 0.08)),
-        fine_offset_radius=float(_required_metadata(metadata, "fine_offset_radius", 2.0)),
+        fine_window=fine_window,
+        fine_offset_radius=fine_offset_radius,
+        fine_window_min=float(
+            metadata.get("fine_window_min", 0.25 * fine_window * fine_offset_radius)
+        ),
+        fine_window_max=float(
+            metadata.get("fine_window_max", fine_window * fine_offset_radius)
+        ),
         learned_fine_window=bool(_required_metadata(metadata, "learned_fine_window", False)),
         reference_channels=int(metadata.get("reference_channels", 0)),
         coarse_cost_channels=int(metadata.get("coarse_cost_channels", 0)),
@@ -833,6 +843,73 @@ def _setup_seaborn_plotting():
         },
     )
     return plt, sns
+
+
+def _plot_uncertainty_vs_prediction_error(
+    output_dir: Path,
+    uncertainty: list[float],
+    absolute_error_m: list[float],
+) -> None:
+    """Save a publication-style equivalent of the TensorBoard scatter plot."""
+    if not uncertainty:
+        return
+    x = np.asarray(uncertainty, dtype=np.float64)
+    y_mm = 1000.0 * np.asarray(absolute_error_m, dtype=np.float64)
+    finite = np.isfinite(x) & np.isfinite(y_mm)
+    x, y_mm = x[finite], y_mm[finite]
+    if x.size < 2:
+        return
+
+    plt, sns = _setup_seaborn_plotting()
+    figure, axis = plt.subplots(figsize=(8.2, 5.8))
+    sns.scatterplot(
+        x=x,
+        y=y_mm,
+        s=15,
+        alpha=0.18,
+        linewidth=0,
+        color=sns.color_palette("deep")[0],
+        rasterized=True,
+        ax=axis,
+    )
+
+    groups = [part for part in np.array_split(np.argsort(x), min(12, x.size)) if part.size]
+    mean_x = np.asarray([x[group].mean() for group in groups])
+    mean_y = np.asarray([y_mm[group].mean() for group in groups])
+    sns.lineplot(
+        x=mean_x,
+        y=mean_y,
+        marker="o",
+        markersize=6,
+        linewidth=2.5,
+        color=sns.color_palette("deep")[3],
+        label="Equal-count-bin mean",
+        ax=axis,
+    )
+    correlation = (
+        float(np.corrcoef(x, y_mm)[0, 1])
+        if np.std(x) > 1e-12 and np.std(y_mm) > 1e-12
+        else 0.0
+    )
+    axis.text(
+        0.03,
+        0.96,
+        f"Pearson r = {correlation:.3f}\nn = {x.size:,}",
+        transform=axis.transAxes,
+        va="top",
+        bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "alpha": 0.9, "edgecolor": "0.8"},
+    )
+    axis.set(
+        xlabel="Predicted uncertainty (1 − confidence)",
+        ylabel="Absolute depth error [mm]",
+        title="Predicted uncertainty vs. depth error",
+        xlim=(0.0, 1.0),
+    )
+    axis.legend(frameon=True)
+    figure.tight_layout()
+    figure.savefig(output_dir / "uncertainty_vs_prediction_error.png", dpi=220)
+    figure.savefig(output_dir / "uncertainty_vs_prediction_error.pdf", bbox_inches="tight")
+    plt.close(figure)
 
 
 def _set_inverse_percentage_axis(axis: Any, values: list[float]) -> None:
@@ -2108,6 +2185,11 @@ def _evaluate_checkpoint(
         model_arch in ("UNet", "UNet+uncertainty", "RecurrentUNet")
         or "predict_uncertainty" in metadata
     )
+    evaluates_confidence = (
+        not unet_model
+        and bool(metadata.get("uncertainty", False))
+        and any(key.startswith("confidence_head.") for key in state)
+    )
     recurrent_model = bool(metadata.get("recurrent", False)) or model_arch == "RecurrentUNet"
     num_views = int(metadata.get("num_views", 1)) if unet_model else int(
         _required_metadata(metadata, "num_views", 5)
@@ -2145,6 +2227,10 @@ def _evaluate_checkpoint(
     sequence_rows: list[dict[str, Any]] = []
     worst_frame_by_sequence: dict[str, dict[str, Any]] = {}
     spatial_mask_offset_samples: dict[str, dict[str, Any]] = {}
+    uncertainty_samples: list[float] = []
+    uncertainty_error_samples: list[float] = []
+    uncertainty_rng = np.random.default_rng(20260812)
+    uncertainty_seen = 0
     boundary_region_samples: list[dict[str, Any]] = []
     boundary_region_frames_seen = 0
     boundary_region_rng = np.random.default_rng(
@@ -2276,7 +2362,14 @@ def _evaluate_checkpoint(
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
                 inference_start = time.perf_counter()
-                prediction_norm = model(imgs, cam_mats, K, depth_values)
+                if evaluates_confidence:
+                    model_output = model(
+                        imgs, cam_mats, K, depth_values, return_uncertainty=True
+                    )
+                    prediction_norm, confidence = model_output
+                else:
+                    prediction_norm = model(imgs, cam_mats, K, depth_values)
+                    confidence = None
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
                 inference_elapsed = time.perf_counter() - inference_start
@@ -2293,9 +2386,37 @@ def _evaluate_checkpoint(
                 prediction = (
                     prediction_norm * (D_MAX - DEPTH_MIN) + DEPTH_MIN
                 ).detach().cpu()
+                uncertainty_batch = (
+                    (1.0 - confidence).detach().cpu() if confidence is not None else None
+                )
 
                 gt_batch = batch["dep_t"].float()
                 mask_batch = batch["mask_t"] > 0.5
+                if uncertainty_batch is not None:
+                    uncertainty_valid = (
+                        mask_batch
+                        & torch.isfinite(gt_batch)
+                        & torch.isfinite(prediction)
+                        & (gt_batch > 0.0)
+                        & (prediction > 0.0)
+                    )
+                    unc_np = uncertainty_batch[uncertainty_valid].numpy()
+                    err_np = torch.abs(prediction - gt_batch)[uncertainty_valid].numpy()
+                    if unc_np.size > 4096:
+                        selected = uncertainty_rng.choice(unc_np.size, size=4096, replace=False)
+                        unc_np, err_np = unc_np[selected], err_np[selected]
+                    for uncertainty_value, error_value in zip(unc_np, err_np):
+                        if not np.isfinite(uncertainty_value) or not np.isfinite(error_value):
+                            continue
+                        uncertainty_seen += 1
+                        if len(uncertainty_samples) < 20000:
+                            uncertainty_samples.append(float(uncertainty_value))
+                            uncertainty_error_samples.append(float(error_value))
+                        else:
+                            replacement = int(uncertainty_rng.integers(0, uncertainty_seen))
+                            if replacement < 20000:
+                                uncertainty_samples[replacement] = float(uncertainty_value)
+                                uncertainty_error_samples[replacement] = float(error_value)
                 ref_indices = batch["ref_idx"].tolist()
                 cam_batch = batch["cam_mats"][:, 0].float().numpy()
                 K_batch = batch["K"].float().numpy()
@@ -2761,6 +2882,9 @@ def _evaluate_checkpoint(
         spatial_mask_z_offsets_m,
     )
     _plot_masked_boundary_regions(output_dir, boundary_region_samples)
+    _plot_uncertainty_vs_prediction_error(
+        output_dir, uncertainty_samples, uncertainty_error_samples
+    )
     worst_frame_samples = list(worst_frame_by_sequence.values())
     _plot_worst_frames(output_dir, worst_frame_samples)
     timers.add("plotting", time.perf_counter() - t_plotting)

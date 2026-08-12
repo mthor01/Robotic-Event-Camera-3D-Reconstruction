@@ -6,6 +6,7 @@
 3d_reconstruction/training/checkpoints/
 **/logs/
 **/*.sbatch
+!3d_reconstruction/viz_and_tests/plot_voxel_activity_ee_speed.sbatch
 **/*.sif
 **/*.def
 3d_reconstruction/training/results
