@@ -17,7 +17,11 @@ from pathlib import Path
 
 import cv2
 import h5py
+import matplotlib
 import numpy as np
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 
 _HERE = Path(__file__).resolve().parent
@@ -47,7 +51,15 @@ CUBE_EDGES = (
 CUBE_COLOR_BGR = (255, 80, 30)
 MASK_COLOR_BGR = np.array([255, 80, 30], dtype=np.float32)
 BOUNDARY_COLOR_BGR = np.array([42, 95, 232], dtype=np.uint8)
-RAISED_CUBE_BOTTOM_Z_M = 0.01
+SPATIAL_MASK_VERTICAL_SHIFT_M = 0.005
+RAISED_CUBE_BOTTOM_Z_M = 0.01 + SPATIAL_MASK_VERTICAL_SHIFT_M
+OUTSIDE_OVERLAY_RGB = np.array([76, 114, 176], dtype=np.float32) / 255.0
+REGION_COLORS_RGB = {
+    "outside": np.asarray([35, 39, 47], dtype=np.uint8),
+    "inside_excluded": np.asarray([150, 155, 165], dtype=np.uint8),
+    "non_boundary": np.asarray([43, 116, 189], dtype=np.uint8),
+    "boundary": np.asarray([232, 95, 42], dtype=np.uint8),
+}
 
 
 def resolve_sequence(sequence: str, data_root: Path) -> Path:
@@ -304,23 +316,22 @@ def reproject_depth_mask_to_rgb(
     return rgb_mask.astype(bool)
 
 
-def visualize(args: argparse.Namespace) -> tuple[Path, Path]:
+def visualize(args: argparse.Namespace) -> Path:
     sequence_dir = resolve_sequence(args.sequence, args.data_root)
     depth_path = sequence_dir / "hdf5" / "depth_in_event_frame.h5"
-    event_rgb_path = sequence_dir / "hdf5" / "rgb_in_event_frame.h5"
     poses_path = sequence_dir / "hdf5" / "poses.h5"
-    for path in (depth_path, event_rgb_path, poses_path):
+    for path in (depth_path, poses_path):
         if not path.is_file():
             raise FileNotFoundError(f"Missing required file: {path}")
 
     center = np.asarray(args.center, dtype=np.float64)
+    center[2] += SPATIAL_MASK_VERTICAL_SHIFT_M
     with h5py.File(depth_path, "r") as depths, \
-            h5py.File(event_rgb_path, "r") as rgbs, \
             h5py.File(poses_path, "r") as poses:
         K_event, T_event_from_ee = load_event_calibration(
             args.calib_dir.resolve(), depths
         )
-        frame_count = min(len(depths["depth"]), len(rgbs["rgb"]), len(poses["ee_T"]))
+        frame_count = min(len(depths["depth"]), len(poses["ee_T"]))
         if args.farthest_frame:
             T_base_from_ee_all = poses["ee_T"][:frame_count].astype(np.float64)
             T_ee_from_event = np.linalg.inv(T_event_from_ee)
@@ -338,18 +349,8 @@ def visualize(args: argparse.Namespace) -> tuple[Path, Path]:
             selected_distance = None
         if not 0 <= frame_index < frame_count:
             raise IndexError(f"Frame {frame_index} is outside the valid range 0..{frame_count - 1}")
-        rgb = rgbs["rgb"][frame_index]
         depth_m = depths["depth"][frame_index].astype(np.float32)
         T_base_from_ee = poses["ee_T"][frame_index].astype(np.float64)
-
-    corners = cube_corners(center, args.cube_side)
-    projected_event, event_depths = project_points(
-        corners,
-        T_base_from_ee,
-        T_event_from_ee,
-        K_event,
-        np.zeros(5, dtype=np.float64),
-    )
 
     T_event_from_base = T_event_from_ee @ np.linalg.inv(T_base_from_ee)
     mask = depth_cube_mask(
@@ -374,38 +375,63 @@ def visualize(args: argparse.Namespace) -> tuple[Path, Path]:
     raised_domain = valid_depth & raised_mask
     raised_boundary = boundary_mask(raised_domain, args.boundary_dilation)
 
-    rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    rgb_image = overlay_mask(
-        rgb_bgr, mask, args.mask_alpha
+    raised_non_boundary = raised_domain & ~raised_boundary
+    regions = np.empty((*depth_m.shape, 3), dtype=np.uint8)
+    regions[:] = REGION_COLORS_RGB["outside"]
+    regions[raised_mask] = REGION_COLORS_RGB["inside_excluded"]
+    regions[raised_non_boundary] = REGION_COLORS_RGB["non_boundary"]
+    regions[raised_boundary] = REGION_COLORS_RGB["boundary"]
+
+    figure, axes = plt.subplots(2, 2, figsize=(8, 6.5))
+    axes = axes.ravel()
+    outside_overlay = np.zeros((*depth_m.shape, 4), dtype=np.float32)
+    outside_overlay[..., :3] = OUTSIDE_OVERLAY_RGB
+
+    axes[0].imshow(
+        depth_m,
+        cmap="turbo",
+        vmin=DEPTH_VIZ_MIN,
+        vmax=DEPTH_VIZ_MAX,
     )
-    colored_depth = colorize_depth(depth_m)
-    depth_image = overlay_mask(colored_depth, mask, args.mask_alpha)
-    masked_depth_image = black_outside(colored_depth, valid_depth & mask)
-    raised_boundary_image = black_outside(colored_depth, raised_domain)
-    raised_boundary_image[raised_boundary] = BOUNDARY_COLOR_BGR
-    if args.wireframe:
-        rgb_image = draw_cube(
-            rgb_image, projected_event, event_depths, args.thickness
+    axes[0].set_title("Depth", fontsize=11)
+
+    for axis, spatial_mask, title in (
+        (axes[1], mask, "Workspace mask"),
+        (axes[2], raised_mask, "Raised mask"),
+    ):
+        axis.imshow(
+            depth_m,
+            cmap="turbo",
+            vmin=DEPTH_VIZ_MIN,
+            vmax=DEPTH_VIZ_MAX,
         )
-        depth_image = draw_cube(
-            depth_image, projected_event, event_depths, args.thickness
-        )
+        overlay = outside_overlay.copy()
+        overlay[..., 3] = np.where(spatial_mask, 0.0, 0.72)
+        axis.imshow(overlay)
+        axis.set_title(title, fontsize=11)
+
+    axes[3].imshow(regions)
+    axes[3].set_title("Boundary regions", fontsize=11)
+    for axis in axes:
+        axis.set_xticks([])
+        axis.set_yticks([])
+        for spine in axis.spines.values():
+            spine.set_visible(False)
+    figure.subplots_adjust(
+        left=0.01,
+        right=0.99,
+        top=0.94,
+        bottom=0.01,
+        wspace=0.04,
+        hspace=0.12,
+    )
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = f"spatial_mask_cube_{sequence_dir.name}_frame_{frame_index:05d}"
-    rgb_output = output_dir / f"{stem}_rgb.png"
-    depth_output = output_dir / f"{stem}_depth.png"
-    masked_output = output_dir / f"{stem}_depth_masked.png"
-    raised_output = output_dir / f"{stem}_depth_raised_boundary.png"
-    if not cv2.imwrite(str(rgb_output), rgb_image):
-        raise OSError(f"Could not write {rgb_output}")
-    if not cv2.imwrite(str(depth_output), depth_image):
-        raise OSError(f"Could not write {depth_output}")
-    if not cv2.imwrite(str(masked_output), masked_depth_image):
-        raise OSError(f"Could not write {masked_output}")
-    if not cv2.imwrite(str(raised_output), raised_boundary_image):
-        raise OSError(f"Could not write {raised_output}")
+    output = output_dir / f"{stem}.png"
+    figure.savefig(output, dpi=args.dpi, bbox_inches="tight", facecolor="white")
+    plt.close(figure)
 
     print(f"Sequence:          {sequence_dir}")
     print(f"Frame:             {frame_index} / {frame_count - 1}")
@@ -415,19 +441,14 @@ def visualize(args: argparse.Namespace) -> tuple[Path, Path]:
     print(f"Cube center [m]:   {center.tolist()}")
     print(f"Cube side [m]:     {args.cube_side:.3f}")
     print(f"Masked depth px:   {int(mask.sum())}")
-    print(f"Saved RGB:         {rgb_output}")
-    print(f"Saved depth:       {depth_output}")
-    print(f"Saved masked:      {masked_output}")
-    print(f"Saved raised edge: {raised_output}")
+    print(f"Saved:             {output}")
 
     if args.show:
-        cv2.imshow("RGB with spatial mask cube", rgb_image)
-        cv2.imshow("Depth with spatial mask cube", depth_image)
-        cv2.imshow("Depth inside spatial mask", masked_depth_image)
-        cv2.imshow("Raised mask with evaluation boundary", raised_boundary_image)
+        image = cv2.imread(str(output))
+        cv2.imshow("Spatial mask evaluation regions", image)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
-    return rgb_output, depth_output
+    return output
 
 
 def parse_args() -> argparse.Namespace:
@@ -474,18 +495,6 @@ def parse_args() -> argparse.Namespace:
         default=SPATIAL_CUBE_SIDE,
         help="Cube side length in metres.",
     )
-    parser.add_argument("--thickness", type=int, default=2, help="Cube-edge thickness.")
-    parser.add_argument(
-        "--wireframe",
-        action="store_true",
-        help="Also draw all twelve projected cube edges in both images.",
-    )
-    parser.add_argument(
-        "--mask-alpha",
-        type=float,
-        default=0.32,
-        help="Opacity of in-cube measured depth pixels.",
-    )
     parser.add_argument(
         "--boundary-dilation",
         type=int,
@@ -496,20 +505,19 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=_HERE / "plots",
-        help="Directory for the two output PNG files.",
+        help="Directory for the output PNG file.",
     )
-    parser.add_argument("--show", action="store_true", help="Display both images interactively.")
+    parser.add_argument("--dpi", type=int, default=180, help="Output resolution.")
+    parser.add_argument("--show", action="store_true", help="Display the output interactively.")
     args = parser.parse_args()
     if args.frame is not None and args.frame < 0:
         parser.error("--frame must be non-negative")
     if args.cube_side <= 0.0:
         parser.error("--cube-side must be positive")
-    if args.thickness <= 0:
-        parser.error("--thickness must be positive")
-    if not 0.0 <= args.mask_alpha <= 1.0:
-        parser.error("--mask-alpha must be between zero and one")
     if args.boundary_dilation < 0:
         parser.error("--boundary-dilation must be non-negative")
+    if args.dpi <= 0:
+        parser.error("--dpi must be positive")
     return args
 
 

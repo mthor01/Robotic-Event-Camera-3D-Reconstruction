@@ -60,7 +60,8 @@ DEPTH_METRIC_NAMES = (
     "delta_3",
 )
 MVC_THRESHOLDS_M = (0.01, 0.02, 0.05)
-BOUNDARY_SPATIAL_MASK_OFFSET_M = 0.01
+SPATIAL_MASK_VERTICAL_SHIFT_M = 0.005
+BOUNDARY_SPATIAL_MASK_OFFSET_M = 0.01 + SPATIAL_MASK_VERTICAL_SHIFT_M
 BOUNDARY_VISUALIZATION_SAMPLE_COUNT = 5
 BOUNDARY_VISUALIZATION_RANDOM_SEED = 0
 
@@ -774,7 +775,7 @@ def _write_summary_text(path: Path, summary: dict[str, Any]) -> None:
             f"  non_boundary_mae_m: {_format_metric('mae_m', boundary['non_boundary']['mae_m'])}",
             f"  non_boundary_rmse_m: {_format_metric('rmse_m', boundary['non_boundary']['rmse_m'])}",
             "",
-            "Depth-boundary metrics inside +1 cm spatial mask",
+            "Depth-boundary metrics inside +1.5 cm spatial mask",
             f"  spatial_mask_cube_bottom_z_offset_m: "
             f"{masked_boundary['z_offset_m']:.6f}",
             f"  boundary_pixels: {masked_boundary['boundary']['count']}",
@@ -1114,7 +1115,7 @@ def _plot_results(
         legend=False,
     )
     axis.set_ylabel("MAE [cm]")
-    axis.set_title("Depth-boundary error inside +1 cm spatial mask")
+    axis.set_title("Depth-boundary error inside +1.5 cm spatial mask")
     figure.tight_layout()
     figure.savefig(
         output_dir / "boundary_error_spatial_mask_plus_1cm.png", dpi=180
@@ -1661,7 +1662,7 @@ def _write_comparison_results(
         masked_boundary_rows,
         "region",
         "mae_cm",
-        "Depth-boundary error inside +1 cm spatial mask",
+        "Depth-boundary error inside +1.5 cm spatial mask",
         "MAE [cm]",
     )
     figure.tight_layout()
@@ -1947,7 +1948,7 @@ def _plot_masked_boundary_regions(
     output_dir: Path,
     samples: list[dict[str, Any]],
 ) -> None:
-    """Visualize the exact +1 cm masked boundary evaluation regions."""
+    """Visualize the exact +1.5 cm masked boundary evaluation regions."""
     if not samples:
         return
 
@@ -2005,7 +2006,7 @@ def _plot_masked_boundary_regions(
             axis.set_xticks([])
             axis.set_yticks([])
 
-    axes[0, 0].set_title("GT depth inside +1 cm spatial mask")
+    axes[0, 0].set_title("GT depth inside +1.5 cm spatial mask")
     axes[0, 1].set_title("Pixels used by boundary metric")
     if depth_image is not None:
         figure.colorbar(
@@ -2028,7 +2029,7 @@ def _plot_masked_boundary_regions(
             ),
             Patch(
                 color=region_colors["outside"] / 255.0,
-                label="Outside +1 cm mask",
+                label="Outside +1.5 cm mask",
             ),
         ],
         loc="lower center",
@@ -2037,7 +2038,7 @@ def _plot_masked_boundary_regions(
         frameon=True,
     )
     figure.suptitle(
-        "Depth-boundary evaluation regions inside the +1 cm spatial mask",
+        "Depth-boundary evaluation regions inside the +1.5 cm spatial mask",
         fontsize=14,
         fontweight="bold",
     )
@@ -2242,7 +2243,7 @@ def _evaluate_checkpoint(
         args.spatial_mask_offset_max,
         args.spatial_mask_offset_steps,
         dtype=np.float64,
-    )
+    ) + SPATIAL_MASK_VERTICAL_SHIFT_M
     plus_1cm_indices = np.flatnonzero(
         np.isclose(
             spatial_mask_z_offsets_m,
@@ -2272,7 +2273,12 @@ def _evaluate_checkpoint(
     timers = EvalTimer()
     evaluation_loop_start = time.perf_counter()
     cube_center = np.asarray(
-        [args.target_x, args.target_y, args.target_z], dtype=np.float64
+        [
+            args.target_x,
+            args.target_y,
+            args.target_z + SPATIAL_MASK_VERTICAL_SHIFT_M,
+        ],
+        dtype=np.float64,
     )
     cube_half_side = args.cube_side / 2.0
 
@@ -2836,13 +2842,16 @@ def _evaluate_checkpoint(
             ),
             "cube_center_world_m": cube_center.tolist(),
             "cube_side_m": args.cube_side,
-            "spatial_mask_offset_min_m": args.spatial_mask_offset_min,
-            "spatial_mask_offset_max_m": args.spatial_mask_offset_max,
+            "spatial_mask_offset_min_m": float(spatial_mask_z_offsets_m[0]),
+            "spatial_mask_offset_max_m": float(spatial_mask_z_offsets_m[-1]),
             "spatial_mask_offset_steps": args.spatial_mask_offset_steps,
             "spatial_mask_offset_definition": (
                 "offset is the world-frame cube-bottom Z; cube center Z equals "
-                "offset + cube_side/2; recomputed mask replaces the stored mask"
+                "offset + cube_side/2; all configured offsets include an "
+                f"additional {SPATIAL_MASK_VERTICAL_SHIFT_M:.3f} m upward shift; "
+                "recomputed mask replaces the stored mask"
             ),
+            "spatial_mask_vertical_shift_m": SPATIAL_MASK_VERTICAL_SHIFT_M,
         },
         "depth_metrics": depth_total.metrics(),
         "boundary_metrics": {

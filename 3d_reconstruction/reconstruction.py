@@ -878,6 +878,7 @@ def tsdf_fuse(
     min_confidence:   float = 0.05,
     use_color:        bool = False,
     additional_crops: Optional[list[tuple[Path, np.ndarray]]] = None,
+    full_mesh_path:   Optional[Path] = None,
 ) -> bool:
     """TSDF fusion, optionally weighted by a per-pixel confidence map.
 
@@ -1023,6 +1024,8 @@ def tsdf_fuse(
     # pick the normal/scalar array for false-color rendering when Open3D writes
     # normals before red/green/blue, which makes the mesh look psychedelic even
     # though the stored RGB values are sane.  Viewers can recompute normals.
+    if full_mesh_path is not None:
+        write_mesh(full_mesh_path, full_mesh)
     write_mesh(out_path, mesh)
     for extra_path, extra_center in additional_crops or []:
         write_mesh(extra_path, cropped_mesh(extra_center))
@@ -1486,7 +1489,11 @@ def _write_reconstruction_summary(output_root: Path, sequence_dirs: list[Path]) 
                 result.append(float(value))
         return result
 
-    cases = (("current_mask", "Current mask"), ("plus_1cm", "+1 cm bottom"))
+    cases = (
+        ("full_scale", "Full scale"),
+        ("current_mask", "Current mask"),
+        ("plus_1cm", "+1 cm bottom"),
+    )
     sections = {
         "depth_metrics": ("mae_m", "rmse_m", "max_m"),
         "prefusion_pointcloud_metrics": (
@@ -1695,6 +1702,15 @@ def main() -> None:
     )
     parser.add_argument("--skip_gt_mesh", action="store_true",
                         help="Do not fuse gt_mesh.obj; useful for faster iteration")
+    parser.add_argument(
+        "--evaluate_full_scale",
+        "--evaluate-full-scale",
+        action="store_true",
+        help=(
+            "Save uncropped predicted/GT TSDF meshes and report their surface "
+            "and held-out rendered-depth errors"
+        ),
+    )
     parser.add_argument(
         "--color_mesh",
         "--rgb_mesh",
@@ -2276,6 +2292,12 @@ def main() -> None:
     gt_mesh_path = (
         out_dir / f"{sequence_name}_{frame_selection_name}_gt_mesh.obj"
     )
+    full_pred_mesh_path = out_dir / (
+        f"{sequence_name}_{frame_selection_name}_full_mesh{pred_mesh_ext}"
+    )
+    full_gt_mesh_path = out_dir / (
+        f"{sequence_name}_{frame_selection_name}_full_gt_mesh.obj"
+    )
     plus_1cm_pred_mesh_path = out_dir / (
         f"{sequence_name}_{frame_selection_name}_plus_1cm_mesh{pred_mesh_ext}"
     )
@@ -2360,6 +2382,7 @@ def main() -> None:
             min_confidence=args.tsdf_min_confidence,
             use_color=args.color_mesh,
             additional_crops=[(plus_1cm_pred_mesh_path, plus_1cm_center)],
+            full_mesh_path=(full_pred_mesh_path if args.evaluate_full_scale else None),
         )
         print(f"  Pred TSDF time : {time.perf_counter() - t_tsdf0:.1f}s")
     if gt_mesh_data and not args.skip_gt_mesh:
@@ -2374,6 +2397,7 @@ def main() -> None:
             cube_center=cube_center,
             cube_half_side=cube_half_side,
             additional_crops=[(plus_1cm_gt_mesh_path, plus_1cm_center)],
+            full_mesh_path=(full_gt_mesh_path if args.evaluate_full_scale else None),
         )
         print(f"  GT TSDF time   : {time.perf_counter() - t_tsdf0:.1f}s")
     elif gt_mesh_data:
@@ -2395,6 +2419,7 @@ def main() -> None:
             print("  Original depth TSDF     : empty mesh")
 
     # ── Post-TSDF reconstruction evaluation ──────────────────────
+    full_surface_metrics = None
     surface_metrics = None
     plus_1cm_surface_metrics = None
     rendered_metrics = None
@@ -2402,6 +2427,12 @@ def main() -> None:
     if pred_mesh_created and gt_mesh_created:
         t_metric0 = time.perf_counter()
         try:
+            if args.evaluate_full_scale:
+                full_surface_metrics = evaluate_tsdf_meshes(
+                    full_pred_mesh_path,
+                    full_gt_mesh_path,
+                    surface_samples=args.surface_samples,
+                )
             surface_metrics = evaluate_tsdf_meshes(
                 pred_mesh_path,
                 gt_mesh_path,
@@ -2424,6 +2455,12 @@ def main() -> None:
                 f"normal={surface_metrics['normal_consistency_symmetric']:.3f}"
             )
             print(f"  Surface metric time: {time.perf_counter() - t_metric0:.1f}s")
+        if full_surface_metrics is not None:
+            print(
+                f"  Surface full   : F@1cm={full_surface_metrics['fscore_1cm']:.1%}, "
+                f"Chamfer={full_surface_metrics['chamfer_mean_m'] * 100:.2f} cm, "
+                f"normal={full_surface_metrics['normal_consistency_symmetric']:.3f}"
+            )
         if plus_1cm_surface_metrics is not None:
             print(
                 f"  Surface +1 cm : F@1cm={plus_1cm_surface_metrics['fscore_1cm']:.1%}, "
@@ -2433,6 +2470,7 @@ def main() -> None:
     elif args.skip_gt_mesh:
         print("  Surface metrics: unavailable because --skip_gt_mesh was used")
 
+    full_rendered_metrics = None
     if pred_mesh_created and use_poses and args.render_eval_frames > 0:
         fusion_ids = set(final_mesh_frame_ids)
         held_out_candidates = [
@@ -2446,6 +2484,19 @@ def main() -> None:
             ).astype(int)
             held_out_frames = [held_out_candidates[pos] for pos in sorted(set(positions))]
             t_render0 = time.perf_counter()
+            if args.evaluate_full_scale:
+                full_rendered_metrics = evaluate_rendered_depth(
+                    full_pred_mesh_path,
+                    held_out_frames,
+                    depth_h5_path,
+                    ee_T_all,
+                    T_ee_from_event,
+                    K,
+                    resize_hw,
+                    crop_hw,
+                    depth_min,
+                    depth_max,
+                )
             rendered_metrics = evaluate_rendered_depth(
                 pred_mesh_path,
                 held_out_frames,
@@ -2491,6 +2542,12 @@ def main() -> None:
             "cube_side_m": args.cube_side,
         },
         "cases": {
+            "full_scale": {
+                "depth_metrics": None,
+                "prefusion_pointcloud_metrics": None,
+                "surface_metrics": full_surface_metrics,
+                "rendered_depth_metrics": full_rendered_metrics,
+            },
             "current_mask": {
                 "depth_metrics": depth_by_case.get("current_mask"),
                 "prefusion_pointcloud_metrics": recon_by_case.get("current_mask"),
@@ -2509,12 +2566,16 @@ def main() -> None:
         json.dumps(reconstruction_metrics, indent=2) + "\n", encoding="utf-8"
     )
     case_lines = [
-        "Reconstruction metrics for two spatial masks",
+        "Reconstruction metrics for full-scale and spatially cropped meshes",
         f"Current cube center: {cube_center.tolist()} m",
         f"+1 cm cube bottom: z={PLUS_1CM_BOTTOM_Z_M:.3f} m; center={plus_1cm_center.tolist()} m",
         "",
     ]
-    for case_name, label in (("current_mask", "Current mask"), ("plus_1cm", "+1 cm bottom")):
+    for case_name, label in (
+        ("full_scale", "Full scale (uncropped)"),
+        ("current_mask", "Current mask"),
+        ("plus_1cm", "+1 cm bottom"),
+    ):
         case = reconstruction_metrics["cases"][case_name]
         case_lines.append(label)
         depth_case = case["depth_metrics"]

@@ -17,7 +17,7 @@ mkdir -p "${SCRIPT_DIR}/logs"
 
 # Plot configuration. Change --sequence here before submitting the job.
 ARGS=(
-    --sequence data/temporal_check
+    --sequence data/new_2/eval/20
     --smooth-frames 3
     # --output viz_and_tests/plots/voxel_activity_ee_speed.png
 )
