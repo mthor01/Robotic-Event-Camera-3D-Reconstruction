@@ -50,6 +50,7 @@ from config import (
     CROP_THEN_RESIZE_CROP_HW, CROP_THEN_RESIZE_HW,
 )
 from preprocessing_geometry import transform_intrinsics, transform_name
+from view_selection import build_pose_view_ids, pose_layout_counts
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_ROOT = _SCRIPT_DIR.parent / "data" / "lego"
@@ -436,6 +437,7 @@ class TablePriorDataset(Dataset):
         pose_channels: bool = False,
         pose_view_selection: bool = False,
         pose_move_threshold: float = 0.01,
+        allow_unbalanced_pose_views: bool = True,
         recurrent: bool = False,
         recurrent_enrollment_range: int = 0,
         crop_then_resize: bool = False,
@@ -465,6 +467,7 @@ class TablePriorDataset(Dataset):
         self.pose_channels   = bool(pose_channels)
         self.pose_view_selection = bool(pose_view_selection)
         self.pose_move_threshold = float(pose_move_threshold)
+        self.allow_unbalanced_pose_views = bool(allow_unbalanced_pose_views)
         self.recurrent = bool(recurrent)
         self.recurrent_enrollment_range = int(recurrent_enrollment_range)
         self.voxels_path     = seq_dir / "events" / "voxels_cam0.h5"
@@ -522,6 +525,7 @@ class TablePriorDataset(Dataset):
             n_p = n_d
 
         n_frames      = min(n_d, n_v, n_t, n_p)
+        self.n_frames = n_frames
 
         self.pose_view_ids: dict[int, list[int]] = {}
         if self.pose_view_selection:
@@ -585,37 +589,14 @@ class TablePriorDataset(Dataset):
             distance += 1
         return offsets
 
-    def _find_pose_neighbours(
-        self,
-        idx: int,
-        direction: int,
-        per_direction: int,
-        move_threshold: float,
-    ) -> list[int] | None:
-        neighbours: list[int] = []
-        anchor = idx
-        cursor = idx + direction
-        while 0 <= cursor < len(self.cam_centers_base) and len(neighbours) < per_direction:
-            moved = np.linalg.norm(self.cam_centers_base[cursor] - self.cam_centers_base[anchor])
-            if moved >= move_threshold:
-                neighbours.append(cursor)
-                anchor = cursor
-            cursor += direction
-        if len(neighbours) != per_direction:
-            return None
-        return neighbours
-
     def _make_pose_view_ids(self, num_views: int, move_threshold: float) -> np.ndarray:
-        per_direction = (num_views - 1) // 2
-        valid: list[int] = []
-        for idx in range(len(self.cam_centers_base)):
-            before = self._find_pose_neighbours(idx, -1, per_direction, move_threshold)
-            after = self._find_pose_neighbours(idx, 1, per_direction, move_threshold)
-            if before is None or after is None:
-                continue
-            self.pose_view_ids[idx] = [idx] + before + after
-            valid.append(idx)
-        return np.array(valid, dtype=np.int64)
+        self.pose_view_ids, valid = build_pose_view_ids(
+            self.cam_centers_base,
+            num_views,
+            move_threshold,
+            self.allow_unbalanced_pose_views,
+        )
+        return valid
 
     def _load_input(self, idx: int) -> torch.Tensor:
         vox = self._vox[idx].astype(np.float32)
@@ -647,7 +628,13 @@ class TablePriorDataset(Dataset):
             inp = torch.stack(view_inputs, dim=0)
         elif self.pose_view_selection:
             view_ids = self.pose_view_ids[idx]
-            view_inputs = [self._load_input(view_idx) for view_idx in view_ids]
+            target_input = self._load_input(idx)
+            view_inputs = [
+                target_input if view_idx == idx else
+                self._load_input(view_idx) if view_idx >= 0 else
+                torch.zeros_like(target_input)
+                for view_idx in view_ids
+            ]
             inp = torch.cat(view_inputs, dim=0)
         else:
             view_ids = [idx] + [idx + offset for offset in self.src_offsets]
@@ -669,7 +656,7 @@ class TablePriorDataset(Dataset):
 
         # Optionally fill invalid depth pixels with the table-plane prior [m]
         if self.fill_invalid:
-            target_tbl = view_inputs[-1][NUM_BINS:NUM_BINS + 1]
+            target_tbl = view_inputs[0][NUM_BINS:NUM_BINS + 1]
             tbl_m = target_tbl * (D_MAX - DEPTH_MIN) + DEPTH_MIN
             dep_t = torch.where(msk_t > 0.5, dep_t, tbl_m)
             msk_t = torch.ones_like(msk_t)  # all pixels now have a valid target
@@ -981,6 +968,8 @@ def main() -> None:
     parser.add_argument("--epochs",        type=int,  default=50)
     parser.add_argument("--batch_size",    type=int,  default=64)
     parser.add_argument("--lr",            type=float, default=1e-3)
+    parser.add_argument("--weight_decay",  type=float, default=5e-4,
+                        help="AdamW weight decay")
     parser.add_argument("--workers",       type=int,  default=4)
     parser.add_argument("--base_channels", type=int,  default=32)
     parser.add_argument("--model_scale",   type=float, default=1.0,
@@ -994,6 +983,27 @@ def main() -> None:
                              "Requires odd --num_views.")
     parser.add_argument("--pose_move_threshold", type=float, default=0.01,
                         help="Minimum event-camera translation in metres between pose-selected views")
+    pose_layout_group = parser.add_mutually_exclusive_group()
+    pose_layout_group.add_argument(
+        "--allow_fewer_pose_views",
+        "--allow-fewer-pose-views",
+        "--allow_unbalanced_pose_views",
+        "--allow-unbalanced-pose-views",
+        dest="allow_unbalanced_pose_views",
+        action="store_true",
+        help=(
+            "Allow pose-selected targets near sequence boundaries to use fewer "
+            "sources; missing past/future input blocks are zero-padded (default)"
+        ),
+    )
+    pose_layout_group.add_argument(
+        "--strict_balanced_pose_views",
+        "--strict-balanced-pose-views",
+        dest="allow_unbalanced_pose_views",
+        action="store_false",
+        help="Require equal numbers of pose-selected sources before and after every target",
+    )
+    parser.set_defaults(allow_unbalanced_pose_views=True)
     parser.add_argument("--pose_channels", "--pose_bins", action="store_true",
                         help="Append six constant pose channels per view: event-camera "
                              "position xyz and optical-axis direction xyz in robot base frame")
@@ -1033,6 +1043,8 @@ def main() -> None:
 
     if args.model_scale <= 0:
         parser.error("--model_scale must be > 0")
+    if args.weight_decay < 0:
+        parser.error("--weight_decay must be >= 0")
     if args.num_views < 1:
         parser.error("--num_views must be at least 1")
     if args.view_interval < 1:
@@ -1142,13 +1154,51 @@ def main() -> None:
         pose_channels=args.pose_channels,
         pose_view_selection=args.pose_view_selection,
         pose_move_threshold=args.pose_move_threshold,
+        allow_unbalanced_pose_views=args.allow_unbalanced_pose_views,
         recurrent=args.recurrent,
         recurrent_enrollment_range=args.recurrent_enrollment_range,
         crop_then_resize=args.crop_then_resize,
     )
-    train_ds = ConcatDataset([TablePriorDataset(d, **ds_kw) for d in train_seqs])
-    val_ds   = ConcatDataset([TablePriorDataset(d, **ds_kw) for d in val_seqs])
-    print(f"  Train frames: {len(train_ds)},  Val frames: {len(val_ds)}")
+    train_sets = [TablePriorDataset(d, **ds_kw) for d in train_seqs]
+    val_sets = [TablePriorDataset(d, **ds_kw) for d in val_seqs]
+    train_ds = ConcatDataset(train_sets)
+    val_ds = ConcatDataset(val_sets)
+    train_total_frames = sum(ds.n_frames for ds in train_sets)
+    val_total_frames = sum(ds.n_frames for ds in val_sets)
+    print("  Train target-frame usage by sequence:")
+    for sequence, dataset in zip(train_seqs, train_sets):
+        layout = pose_layout_counts(dataset.pose_view_ids)
+        layout_text = (
+            f"; layouts balanced={layout['balanced']}, "
+            f"asymmetric={layout['asymmetric']}, one-sided={layout['one_sided']}, "
+            f"reference-only={layout['reference_only']}"
+            if dataset.pose_view_selection else ""
+        )
+        print(
+            f"    {sequence.name}: {len(dataset)}/{dataset.n_frames} "
+            f"({100.0 * len(dataset) / dataset.n_frames:.1f}%){layout_text}"
+        )
+    print("  Val target-frame usage by sequence:")
+    for sequence, dataset in zip(val_seqs, val_sets):
+        layout = pose_layout_counts(dataset.pose_view_ids)
+        layout_text = (
+            f"; layouts balanced={layout['balanced']}, "
+            f"asymmetric={layout['asymmetric']}, one-sided={layout['one_sided']}, "
+            f"reference-only={layout['reference_only']}"
+            if dataset.pose_view_selection else ""
+        )
+        print(
+            f"    {sequence.name}: {len(dataset)}/{dataset.n_frames} "
+            f"({100.0 * len(dataset) / dataset.n_frames:.1f}%){layout_text}"
+        )
+    print(
+        f"  Train target frames used: {len(train_ds)}/{train_total_frames} "
+        f"({100.0 * len(train_ds) / train_total_frames:.1f}%)"
+    )
+    print(
+        f"  Val target frames used: {len(val_ds)}/{val_total_frames} "
+        f"({100.0 * len(val_ds) / val_total_frames:.1f}%)"
+    )
     print(f"  Table plane Z: {table_z_ckpt:.4f} m (from precomputed table_plane.h5)\n")
 
     loader_kw = dict(
@@ -1201,7 +1251,8 @@ def main() -> None:
         f"{' + 6 pose' if args.pose_channels else ''}) "
         f"= {in_ch} channels; "
         + (
-            f"pose_move_threshold={args.pose_move_threshold:g} m"
+            f"pose_move_threshold={args.pose_move_threshold:g} m; "
+            f"layout={'fewer boundary views allowed' if args.allow_unbalanced_pose_views else 'strictly balanced'}"
             if args.pose_view_selection
             else f"view_interval={args.view_interval}"
         )
@@ -1213,6 +1264,10 @@ def main() -> None:
         f"  Depth-loss weights: gradient={args.lambda_grad:g}, "
         f"normal={args.lambda_normal:g}"
     )
+    print(
+        f"  Optimizer: AdamW, lr={args.lr:g}, "
+        f"weight_decay={args.weight_decay:g}"
+    )
     if args.recurrent:
         print(
             f"  Recurrent mode: ConvGRU bottleneck, enrollment_range="
@@ -1220,7 +1275,9 @@ def main() -> None:
         )
     print(f"Device: {device}\n")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=args.lr * 1e-2
     )
@@ -1336,6 +1393,8 @@ def main() -> None:
             "view_interval": args.view_interval,
             "pose_view_selection": args.pose_view_selection,
             "pose_move_threshold": args.pose_move_threshold,
+            "allow_unbalanced_pose_views": args.allow_unbalanced_pose_views,
+            "allow_fewer_pose_views": args.allow_unbalanced_pose_views,
             "pose_channels": args.pose_channels,
             "pose_channel_count": pose_channel_count,
             "recurrent": args.recurrent,
@@ -1348,6 +1407,9 @@ def main() -> None:
             "depth_aux_weight": args.depth_aux_weight,
             "lambda_grad": args.lambda_grad,
             "lambda_normal": args.lambda_normal,
+            "optimizer": "adamw",
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
             "ema_decay": args.ema_decay,
         }
         if va_l1 < best_val_l1:

@@ -1,0 +1,79 @@
+RandomHemisphereAgent sampler-area check
+Config source: /home/mthormann/robot_and_record/franka_pipeline/config_defaults.py
+Pose source: 59449 recorded poses (new_1)
+
+Target XYZ [m]: [0.35, 0.0, 0.12]
+Hemisphere center XYZ [m]: [0.35, 0.0, 0.12]
+Inner/outer radius [m]: 0.22 / 0.33
+Allowed base XY radius [m]: 0.38 / 0.52
+Minimum Z [m]: 0.23
+Configured poses per run: 30
+Displayed position type: event-camera
+
+Loaded/generated positions: 59449
+Positions inside sampler region: 46324
+Fraction inside sampler region: 77.922%
+Valid EE XYZ minimum [m]: [0.26017605714580044, -0.308558807192061, 0.23000142682508062]
+Valid EE XYZ maximum [m]: [0.5199199931827404, 0.3071398830671499, 0.37704960290113715]
+Displayed XYZ minimum [m]: [0.23973000224923538, -0.3802122935675464, 0.1638911013795783]
+Displayed XYZ maximum [m]: [0.6145817394147502, 0.38156212749406776, 0.3828211869252553]
+
+Scope: sampler position constraints only; IK/collision feasibility is not tested.
+
+Recorded sequences: 56
+  eval/20: 1257 poses
+  eval/25: 1325 poses
+  eval/30: 1590 poses
+  eval/50: 922 poses
+  eval/65: 927 poses
+  eval/70: 938 poses
+  eval_and_special/20: 1257 poses
+  eval_and_special/25: 1325 poses
+  eval_and_special/30: 1590 poses
+  eval_and_special/50: 922 poses
+  eval_and_special/65: 927 poses
+  eval_and_special/70: 938 poses
+  special/40: 989 poses
+  special/60: 999 poses
+  train/21: 1143 poses
+  train/22: 1375 poses
+  train/23: 1323 poses
+  train/24: 1571 poses
+  train/26: 1278 poses
+  train/27: 1279 poses
+  train/28: 1302 poses
+  train/29: 1455 poses
+  train/31: 1207 poses
+  train/32: 1194 poses
+  train/33: 1285 poses
+  train/34: 992 poses
+  train/35: 951 poses
+  train/36: 915 poses
+  train/37: 824 poses
+  train/38: 987 poses
+  train/39: 913 poses
+  train/41: 961 poses
+  train/42: 1007 poses
+  train/43: 848 poses
+  train/44: 1044 poses
+  train/46: 835 poses
+  train/47: 802 poses
+  train/48: 798 poses
+  train/49: 922 poses
+  train/51: 945 poses
+  train/52: 882 poses
+  train/53: 945 poses
+  train/54: 910 poses
+  train/55: 1094 poses
+  train/56: 891 poses
+  train/57: 888 poses
+  train/58: 945 poses
+  train/59: 903 poses
+  train/61: 991 poses
+  train/62: 903 poses
+  train/63: 930 poses
+  train/64: 988 poses
+  train/66: 909 poses
+  train/67: 865 poses
+  train/68: 1312 poses
+  train/69: 1031 poses

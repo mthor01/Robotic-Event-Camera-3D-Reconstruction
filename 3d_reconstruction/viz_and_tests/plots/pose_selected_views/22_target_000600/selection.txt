@@ -1,0 +1,19 @@
+sequence: /home/mthormann/robot_and_record/3d_reconstruction/data/new_2/train/22
+target_frame: 600
+num_views: 9
+pose_move_threshold_m: 0.05
+allow_unbalanced_pose_views: False
+intrinsics_transform: center_crop_resize
+event_dilation_radius: 1
+binary_events: True
+
+view_index,role,frame_id
+0,target,600
+1,source,562
+2,source,531
+3,source,521
+4,source,510
+5,source,612
+6,source,666
+7,source,694
+8,source,732

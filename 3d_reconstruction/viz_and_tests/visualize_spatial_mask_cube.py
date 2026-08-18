@@ -396,8 +396,8 @@ def visualize(args: argparse.Namespace) -> Path:
     axes[0].set_title("Depth", fontsize=11)
 
     for axis, spatial_mask, title in (
-        (axes[1], mask, "Workspace mask"),
-        (axes[2], raised_mask, "Raised mask"),
+        (axes[1], mask, "Workspace Cube"),
+        (axes[2], raised_mask, "Raised Cube"),
     ):
         axis.imshow(
             depth_m,
@@ -411,7 +411,7 @@ def visualize(args: argparse.Namespace) -> Path:
         axis.set_title(title, fontsize=11)
 
     axes[3].imshow(regions)
-    axes[3].set_title("Boundary regions", fontsize=11)
+    axes[3].set_title("Raised-Cube Boundary Regions", fontsize=11)
     for axis in axes:
         axis.set_xticks([])
         axis.set_yticks([])

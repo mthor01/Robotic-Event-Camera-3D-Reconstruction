@@ -59,10 +59,40 @@ DEPTH_METRIC_NAMES = (
     "delta_2",
     "delta_3",
 )
+DEPTH_REGION_LABELS = {
+    "whole_image": "Whole Frame",
+    "lower_cube": "Workspace Cube",
+    "upper_cube": "Raised Cube",
+}
+PER_SEQUENCE_REGION_SPECS = (
+    ("whole_frame", "Whole Frame", "mae_m", "rmse_m"),
+    (
+        "workspace_cube",
+        "Workspace Cube",
+        "lower_cube_mae_m",
+        "lower_cube_rmse_m",
+    ),
+    (
+        "raised_cube",
+        "Raised Cube",
+        "upper_cube_mae_m",
+        "upper_cube_rmse_m",
+    ),
+)
+DOMAIN_SUMMARY_REGION_KEYS = {
+    "whole_frame": "whole_image",
+    "workspace_cube": "lower_cube",
+    "raised_cube": "upper_cube",
+}
 MVC_THRESHOLDS_M = (0.01, 0.02, 0.05)
 SPATIAL_MASK_VERTICAL_SHIFT_M = 0.005
 BOUNDARY_SPATIAL_MASK_OFFSET_M = 0.01 + SPATIAL_MASK_VERTICAL_SHIFT_M
 BOUNDARY_VISUALIZATION_SAMPLE_COUNT = 5
+QUALITATIVE_RANDOM_SEED = 20260813
+LEGEND_FONT_SIZE = 12
+LEGEND_TITLE_FONT_SIZE = 13
+DIAGNOSTIC_LEGEND_FONT_SIZE = 15
+DIAGNOSTIC_LEGEND_TITLE_FONT_SIZE = 16
 BOUNDARY_VISUALIZATION_RANDOM_SEED = 0
 
 
@@ -368,7 +398,7 @@ def _rotation_matrix_to_xyz_euler_deg(rotation: np.ndarray) -> np.ndarray:
 
 
 def _load_pose_motion(sequence_dir: Path) -> dict[str, np.ndarray]:
-    """Load per-frame end-effector pose and derive translational speed."""
+    """Load pose, timestamps, normalized recording time, and motion speed."""
     import h5py
 
     with h5py.File(sequence_dir / "hdf5" / "poses.h5", "r") as handle:
@@ -400,6 +430,18 @@ def _load_pose_motion(sequence_dir: Path) -> dict[str, np.ndarray]:
     positions = ee_T[:, :3, 3]
     rotations_deg = _rotation_matrix_to_xyz_euler_deg(ee_T[:, :3, :3])
 
+    normalized_time = np.zeros(n_frames, dtype=np.float64)
+    if n_frames >= 2:
+        duration_s = timestamps_s[-1] - timestamps_s[0]
+        if np.isfinite(duration_s) and duration_s > 1e-9:
+            normalized_time = np.clip(
+                (timestamps_s - timestamps_s[0]) / duration_s,
+                0.0,
+                1.0,
+            )
+        else:
+            normalized_time = np.linspace(0.0, 1.0, n_frames)
+
     speed_m_s = np.full(n_frames, np.nan, dtype=np.float64)
     if n_frames >= 2:
         left = np.maximum(np.arange(n_frames) - 1, 0)
@@ -415,6 +457,7 @@ def _load_pose_motion(sequence_dir: Path) -> dict[str, np.ndarray]:
         "position_m": positions,
         "rotation_xyz_deg": rotations_deg,
         "speed_m_s": speed_m_s,
+        "normalized_time": normalized_time,
     }
 
 
@@ -499,8 +542,9 @@ def _build_model(
                 camera_matrices: torch.Tensor,
                 intrinsics: torch.Tensor,
                 depth_values: torch.Tensor,
+                view_valid_mask: torch.Tensor | None = None,
             ) -> torch.Tensor:
-                del camera_matrices, intrinsics, depth_values
+                del camera_matrices, intrinsics, depth_values, view_valid_mask
                 if recurrent:
                     output = self.depth_model(images)
                 else:
@@ -553,6 +597,9 @@ def _build_model(
         middle_hourglass_levels=int(metadata.get("middle_hourglass_levels", 2)),
         middle_feature_channels=int(metadata.get("middle_feature_channels", 0)),
         fine_feature_channels=int(metadata.get("fine_feature_channels", 0)),
+        fpn_lateral_convolutions=not bool(
+            metadata.get("no_fpn_lateral_convolutions", False)
+        ),
     )
     incompatible = model.load_state_dict(state, strict=False)
     missing_non_confidence = [
@@ -736,8 +783,36 @@ def _format_metric(name: str, value: Any) -> str:
     return str(value)
 
 
+def _depth_region_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return one machine-readable row for each spatial evaluation region."""
+    metrics_by_region = summary["depth_metrics_by_region"]
+    return [
+        {
+            "region": region,
+            "label": DEPTH_REGION_LABELS[region],
+            **metrics_by_region[region],
+        }
+        for region in DEPTH_REGION_LABELS
+    ]
+
+
+def _pose_layout_directory_indicator(allow_unbalanced: bool) -> str:
+    """Return the filename-safe prefix describing the evaluation policy."""
+    return (
+        "unbalanced_pose_views_allowed"
+        if allow_unbalanced
+        else "unbalanced_pose_views_disallowed"
+    )
+
+
+def _model_display_name(is_unet: bool, num_views: int) -> str:
+    """Return the architecture name used in plots and comparison tables."""
+    if not is_unet:
+        return "MVS"
+    return "Single-View U-Net" if num_views == 1 else "Multi-View U-Net"
+
+
 def _write_summary_text(path: Path, summary: dict[str, Any]) -> None:
-    depth = summary["depth_metrics"]
     boundary = summary["boundary_metrics"]
     masked_boundary = summary["boundary_metrics_spatial_mask_plus_1cm"]
     mvc = summary["multiview_consistency"]
@@ -759,13 +834,15 @@ def _write_summary_text(path: Path, summary: dict[str, Any]) -> None:
         f"  evaluation_loop_ms_per_frame: "
         f"{summary['performance']['evaluation_loop_ms_per_frame']:.3f}",
         "",
-        "Depth metrics",
+        "Depth metrics by spatial region",
     ]
-    for name in DEPTH_METRIC_NAMES:
-        lines.append(f"  {name}: {_format_metric(name, depth[name])}")
+    for row in _depth_region_rows(summary):
+        lines.append(f"  {row['label']}")
+        for name in DEPTH_METRIC_NAMES:
+            lines.append(f"    {name}: {_format_metric(name, row[name])}")
+        lines.append(f"    valid_pixels: {row['valid_pixels']}")
     lines.extend(
         [
-            f"  valid_pixels: {depth['valid_pixels']}",
             "",
             "Depth-boundary metrics",
             f"  boundary_pixels: {boundary['boundary']['count']}",
@@ -841,23 +918,36 @@ def _setup_seaborn_plotting():
             "figure.facecolor": "white",
             "axes.facecolor": "white",
             "grid.alpha": 0.25,
+            "legend.fontsize": LEGEND_FONT_SIZE,
+            "legend.title_fontsize": LEGEND_TITLE_FONT_SIZE,
         },
     )
     return plt, sns
+
+
+def _sequence_display_map(sequence_names: list[str]) -> dict[str, str]:
+    """Map raw sequence directory names to presentation labels 1..N."""
+    def sort_key(name: str) -> tuple[int, Any]:
+        return (0, int(name)) if name.isdigit() else (1, name)
+
+    ordered = sorted({str(name) for name in sequence_names}, key=sort_key)
+    return {name: f"Sequence {index}" for index, name in enumerate(ordered, 1)}
 
 
 def _plot_uncertainty_vs_prediction_error(
     output_dir: Path,
     uncertainty: list[float],
     absolute_error_m: list[float],
+    domain_slug: str,
+    domain_label: str,
 ) -> None:
-    """Save a publication-style equivalent of the TensorBoard scatter plot."""
+    """Plot predicted confidence against absolute depth error."""
     if not uncertainty:
         return
-    x = np.asarray(uncertainty, dtype=np.float64)
-    y_mm = 1000.0 * np.asarray(absolute_error_m, dtype=np.float64)
-    finite = np.isfinite(x) & np.isfinite(y_mm)
-    x, y_mm = x[finite], y_mm[finite]
+    x = 1.0 - np.asarray(uncertainty, dtype=np.float64)
+    y_cm = 100.0 * np.asarray(absolute_error_m, dtype=np.float64)
+    finite = np.isfinite(x) & np.isfinite(y_cm)
+    x, y_cm = x[finite], y_cm[finite]
     if x.size < 2:
         return
 
@@ -865,52 +955,63 @@ def _plot_uncertainty_vs_prediction_error(
     figure, axis = plt.subplots(figsize=(8.2, 5.8))
     sns.scatterplot(
         x=x,
-        y=y_mm,
-        s=15,
-        alpha=0.18,
+        y=y_cm,
+        s=24,
+        alpha=0.38,
         linewidth=0,
         color=sns.color_palette("deep")[0],
         rasterized=True,
         ax=axis,
     )
-
-    groups = [part for part in np.array_split(np.argsort(x), min(12, x.size)) if part.size]
-    mean_x = np.asarray([x[group].mean() for group in groups])
-    mean_y = np.asarray([y_mm[group].mean() for group in groups])
-    sns.lineplot(
-        x=mean_x,
-        y=mean_y,
-        marker="o",
-        markersize=6,
-        linewidth=2.5,
-        color=sns.color_palette("deep")[3],
-        label="Equal-count-bin mean",
-        ax=axis,
-    )
-    correlation = (
-        float(np.corrcoef(x, y_mm)[0, 1])
-        if np.std(x) > 1e-12 and np.std(y_mm) > 1e-12
-        else 0.0
-    )
-    axis.text(
-        0.03,
-        0.96,
-        f"Pearson r = {correlation:.3f}\nn = {x.size:,}",
-        transform=axis.transAxes,
-        va="top",
-        bbox={"boxstyle": "round,pad=0.35", "facecolor": "white", "alpha": 0.9, "edgecolor": "0.8"},
-    )
     axis.set(
-        xlabel="Predicted uncertainty (1 − confidence)",
-        ylabel="Absolute depth error [mm]",
-        title="Predicted uncertainty vs. depth error",
-        xlim=(0.0, 1.0),
+        xlabel="Predicted Confidence",
+        ylabel="Absolute Depth Error [cm]",
+        title=f"Predicted Confidence vs. Depth Error: {domain_label}",
+        xlim=(-0.05, 1.05),
     )
-    axis.legend(frameon=True)
+    axis.set_xticks(np.linspace(0.0, 1.0, 6))
     figure.tight_layout()
-    figure.savefig(output_dir / "uncertainty_vs_prediction_error.png", dpi=220)
-    figure.savefig(output_dir / "uncertainty_vs_prediction_error.pdf", bbox_inches="tight")
+    figure.savefig(
+        output_dir / f"uncertainty_vs_prediction_error_{domain_slug}.png",
+        dpi=220,
+    )
+    figure.savefig(
+        output_dir / f"uncertainty_vs_prediction_error_{domain_slug}.pdf",
+        bbox_inches="tight",
+    )
     plt.close(figure)
+
+
+def _add_uncertainty_reservoir_samples(
+    state: dict[str, Any],
+    uncertainty: np.ndarray,
+    absolute_error_m: np.ndarray,
+    rng: np.random.Generator,
+    capacity: int = 20000,
+    per_frame_limit: int = 4096,
+) -> None:
+    """Add paired confidence/error samples to a bounded reservoir."""
+    uncertainty = np.asarray(uncertainty, dtype=np.float64).reshape(-1)
+    absolute_error_m = np.asarray(absolute_error_m, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(uncertainty) & np.isfinite(absolute_error_m)
+    uncertainty = uncertainty[finite]
+    absolute_error_m = absolute_error_m[finite]
+    if uncertainty.size > per_frame_limit:
+        selected = rng.choice(
+            uncertainty.size, size=per_frame_limit, replace=False
+        )
+        uncertainty = uncertainty[selected]
+        absolute_error_m = absolute_error_m[selected]
+    for uncertainty_value, error_value in zip(uncertainty, absolute_error_m):
+        state["seen"] += 1
+        if len(state["uncertainty"]) < capacity:
+            state["uncertainty"].append(float(uncertainty_value))
+            state["error"].append(float(error_value))
+            continue
+        replacement = int(rng.integers(0, state["seen"]))
+        if replacement < capacity:
+            state["uncertainty"][replacement] = float(uncertainty_value)
+            state["error"][replacement] = float(error_value)
 
 
 def _set_inverse_percentage_axis(axis: Any, values: list[float]) -> None:
@@ -953,12 +1054,179 @@ def _equal_count_mean_curve(
     return mean_x[order], mean_y[order]
 
 
+def _fixed_width_mean_curve(
+    x: np.ndarray,
+    y: np.ndarray,
+    interval: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return mean y in fixed-width x bins anchored at zero."""
+    if interval <= 0:
+        raise ValueError("interval must be positive")
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    finite = np.isfinite(x) & np.isfinite(y)
+    x = x[finite]
+    y = y[finite]
+    if x.size == 0:
+        return np.empty(0), np.empty(0)
+    bin_indices = np.floor(x / interval).astype(np.int64)
+    populated_bins = np.unique(bin_indices)
+    centers = (populated_bins.astype(np.float64) + 0.5) * interval
+    means = np.asarray(
+        [float(y[bin_indices == index].mean()) for index in populated_bins]
+    )
+    return centers, means
+
+
+def _fixed_width_mean_curve_from_rows(
+    rows: list[dict[str, Any]],
+    x_field: str,
+    interval: float,
+    y_field: str = "mae_m",
+    y_scale: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return a fixed-width mean curve from per-frame metric rows."""
+    if not rows or x_field not in rows[0] or y_field not in rows[0]:
+        return np.empty(0), np.empty(0)
+    x = np.asarray([row.get(x_field, math.nan) for row in rows], dtype=np.float64)
+    y = np.asarray([row.get(y_field, math.nan) for row in rows], dtype=np.float64)
+    return _fixed_width_mean_curve(x, y * y_scale, interval)
+
+
 def _column_mapping(rows: list[dict[str, Any]]) -> dict[str, list[Any]]:
     """Convert row dictionaries to Seaborn's version-compatible wide mapping."""
     if not rows:
         return {}
     fields = list(rows[0])
     return {field: [row.get(field) for row in rows] for field in fields}
+
+
+def _normalized_time_error_curves(
+    frame_rows: list[dict[str, Any]],
+    bins: int = 25,
+    error_field: str = "mae_m",
+) -> tuple[np.ndarray, dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
+    """Bin frame MAE over recording progress and weight recordings equally."""
+    if bins < 1:
+        raise ValueError("bins must be at least 1")
+    centers = (np.arange(bins, dtype=np.float64) + 0.5) / bins
+    sequence_curves: dict[str, np.ndarray] = {}
+    sequence_names = sorted({str(row["sequence"]) for row in frame_rows})
+    for sequence in sequence_names:
+        sequence_rows = [
+            row for row in frame_rows if str(row["sequence"]) == sequence
+        ]
+        progress = np.asarray(
+            [row.get("normalized_time", math.nan) for row in sequence_rows],
+            dtype=np.float64,
+        )
+        error_cm = np.asarray(
+            [
+                100.0 * float(row.get(error_field, math.nan))
+                for row in sequence_rows
+            ],
+            dtype=np.float64,
+        )
+        finite = np.isfinite(progress) & np.isfinite(error_cm)
+        progress = np.clip(progress[finite], 0.0, 1.0)
+        error_cm = error_cm[finite]
+        curve = np.full(bins, np.nan, dtype=np.float64)
+        if progress.size:
+            bin_indices = np.minimum((progress * bins).astype(np.int64), bins - 1)
+            for bin_index in np.unique(bin_indices):
+                curve[bin_index] = float(error_cm[bin_indices == bin_index].mean())
+        sequence_curves[sequence] = curve
+
+    if not sequence_curves:
+        empty = np.full(bins, np.nan, dtype=np.float64)
+        return centers, {}, empty, empty.copy(), np.zeros(bins, dtype=np.int64)
+
+    stacked = np.stack(list(sequence_curves.values()), axis=0)
+    finite = np.isfinite(stacked)
+    recording_counts = finite.sum(axis=0)
+    mean = np.full(bins, np.nan, dtype=np.float64)
+    std = np.full(bins, np.nan, dtype=np.float64)
+    populated = recording_counts > 0
+    mean[populated] = np.nansum(stacked[:, populated], axis=0) / recording_counts[
+        populated
+    ]
+    for bin_index in np.flatnonzero(populated):
+        values = stacked[finite[:, bin_index], bin_index]
+        std[bin_index] = float(values.std())
+    return centers, sequence_curves, mean, std, recording_counts
+
+
+def _plot_normalized_time_error(
+    output_dir: Path,
+    frame_rows: list[dict[str, Any]],
+    domain_slug: str,
+    domain_label: str,
+    error_field: str,
+    bins: int = 25,
+) -> None:
+    """Plot per-recording and equally weighted mean MAE over normalized time."""
+    centers, sequence_curves, mean, std, recording_counts = (
+        _normalized_time_error_curves(
+            frame_rows, bins=bins, error_field=error_field
+        )
+    )
+    finite_mean = np.isfinite(mean)
+    if not sequence_curves or not finite_mean.any():
+        return
+
+    curve_rows = [
+        {
+            "normalized_time": float(centers[index]),
+            "mean_mae_cm": float(mean[index]),
+            "std_mae_cm": float(std[index]),
+            "recordings": int(recording_counts[index]),
+        }
+        for index in np.flatnonzero(finite_mean)
+    ]
+    _write_csv(
+        output_dir / f"error_over_normalized_time_{domain_slug}.csv",
+        curve_rows,
+    )
+
+    plt, sns = _setup_seaborn_plotting()
+    figure, axis = plt.subplots(figsize=(11, 6.5))
+    sequence_labels = _sequence_display_map(list(sequence_curves))
+    colors = sns.color_palette("husl", n_colors=max(1, len(sequence_curves)))
+    for color, (sequence, curve) in zip(colors, sequence_curves.items()):
+        finite = np.isfinite(curve)
+        if finite.any():
+            axis.plot(
+                centers[finite],
+                curve[finite],
+                color=color,
+                linewidth=1.0,
+                alpha=0.32,
+                label=sequence_labels[sequence],
+            )
+    axis.plot(
+        centers[finite_mean],
+        mean[finite_mean],
+        color="black",
+        linewidth=2.8,
+        label="Equal-Recording Mean",
+        zorder=10,
+    )
+    axis.set_xlim(0.0, 1.0)
+    axis.set_xlabel("Normalized Recording Time")
+    axis.set_ylabel("Per-Frame MAE [cm]")
+    axis.set_title(f"Depth Error Over Normalized Recording Time: {domain_label}")
+    axis.legend(
+        title="Recording",
+        fontsize=DIAGNOSTIC_LEGEND_FONT_SIZE,
+        title_fontsize=DIAGNOSTIC_LEGEND_TITLE_FONT_SIZE,
+        ncol=2,
+    )
+    figure.tight_layout()
+    figure.savefig(
+        output_dir / f"error_over_normalized_time_{domain_slug}.png",
+        dpi=180,
+    )
+    plt.close(figure)
 
 
 def _write_eval_times(
@@ -1021,43 +1289,95 @@ def _plot_results(
 ) -> None:
     plt, sns = _setup_seaborn_plotting()
 
-    depth = summary["depth_metrics"]
-    figure, axes = plt.subplots(1, 2, figsize=(12, 4.5))
     error_names = ["abs_rel", "sq_rel_m", "mae_m", "rmse_m", "rmse_log"]
-    sns.barplot(
-        x=error_names,
-        y=[depth[name] for name in error_names],
-        ax=axes[0],
-        hue=error_names,
-        palette="Blues_d",
-        legend=False,
-    )
-    axes[0].set_title("Depth errors")
-    axes[0].tick_params(axis="x", rotation=30)
     delta_names = ["delta_1", "delta_2", "delta_3"]
     delta_labels = [r"$\delta<1.25$", r"$\delta<1.25^2$", r"$\delta<1.25^3$"]
-    delta_failure_percentages = [
-        100.0 * (1.0 - float(depth[name])) for name in delta_names
+    for domain_slug, domain_label, _, _ in PER_SEQUENCE_REGION_SPECS:
+        region_key = DOMAIN_SUMMARY_REGION_KEYS[domain_slug]
+        depth = summary["depth_metrics_by_region"][region_key]
+        figure, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+        sns.barplot(
+            x=error_names,
+            y=[depth[name] for name in error_names],
+            ax=axes[0],
+            hue=error_names,
+            palette="Blues_d",
+            legend=False,
+        )
+        axes[0].set_title(f"Depth Errors: {domain_label}")
+        axes[0].tick_params(axis="x", rotation=30)
+        delta_failure_percentages = [
+            100.0 * (1.0 - float(depth[name])) for name in delta_names
+        ]
+        sns.barplot(
+            x=delta_labels,
+            y=delta_failure_percentages,
+            ax=axes[1],
+            hue=delta_labels,
+            palette="Greens_d",
+            legend=False,
+        )
+        _set_inverse_percentage_axis(axes[1], delta_failure_percentages)
+        axes[1].set_ylabel("Pixels Outside Threshold [%]")
+        axes[1].set_title(f"Threshold Failure Rate: {domain_label}")
+        figure.tight_layout()
+        figure.savefig(
+            output_dir / f"depth_metrics_{domain_slug}.png", dpi=180
+        )
+        plt.close(figure)
+
+    region_error_rows = [
+        {
+            "region": row["label"],
+            "metric": metric,
+            "error_cm": 100.0 * float(row[field]),
+        }
+        for row in _depth_region_rows(summary)
+        for metric, field in (("MAE", "mae_m"), ("RMSE", "rmse_m"))
     ]
+    figure, axis = plt.subplots(figsize=(10.5, 5.8))
     sns.barplot(
-        x=delta_labels,
-        y=delta_failure_percentages,
-        ax=axes[1],
-        hue=delta_labels,
-        palette="Greens_d",
+        data=_column_mapping(region_error_rows),
+        x="region",
+        y="error_cm",
+        hue="metric",
+        ax=axis,
+        palette="deep",
+    )
+    axis.set_xlabel("")
+    axis.set_ylabel("Depth Error [cm]")
+    axis.set_title("MAE and RMSE by Evaluation Region")
+    axis.tick_params(axis="x", rotation=12)
+    axis.legend(title="Metric")
+    figure.tight_layout()
+    figure.savefig(output_dir / "mae_rmse_by_region.png", dpi=180)
+    plt.close(figure)
+
+    mae_region_rows = [
+        row for row in region_error_rows if row["metric"] == "MAE"
+    ]
+    figure, axis = plt.subplots(figsize=(9.5, 5.8))
+    sns.barplot(
+        data=_column_mapping(mae_region_rows),
+        x="region",
+        y="error_cm",
+        hue="region",
+        ax=axis,
+        palette="deep",
         legend=False,
     )
-    _set_inverse_percentage_axis(axes[1], delta_failure_percentages)
-    axes[1].set_ylabel("Pixels outside threshold [%]")
-    axes[1].set_title("Threshold failure rate")
+    axis.set_xlabel("")
+    axis.set_ylabel("MAE [cm]")
+    axis.set_title("MAE by Evaluation Region")
+    axis.tick_params(axis="x", rotation=0)
     figure.tight_layout()
-    figure.savefig(output_dir / "depth_metrics.png", dpi=180)
+    figure.savefig(output_dir / "mae_by_region.png", dpi=180)
     plt.close(figure)
 
     boundary = summary["boundary_metrics"]
     mvc = summary["multiview_consistency"]
     figure, axes = plt.subplots(1, 2, figsize=(11, 4.5))
-    boundary_labels = ["Boundary MAE", "Non-boundary MAE"]
+    boundary_labels = ["Boundary MAE", "Non-Boundary MAE"]
     sns.barplot(
         x=boundary_labels,
         y=[boundary["boundary"]["mae_m"], boundary["non_boundary"]["mae_m"]],
@@ -1067,7 +1387,7 @@ def _plot_results(
         legend=False,
     )
     axes[0].set_ylabel("Error [m]")
-    axes[0].set_title("Depth-boundary error")
+    axes[0].set_title("Depth-Boundary Error")
     mvc_labels = ["<1 cm", "<2 cm", "<5 cm"]
     mvc_enabled = summary["evaluation_configuration"].get("mvc_enabled", True)
     if mvc_enabled:
@@ -1084,8 +1404,8 @@ def _plot_results(
             legend=False,
         )
         _set_inverse_percentage_axis(axes[1], mvc_inconsistency_percentages)
-        axes[1].set_ylabel("Inconsistent correspondences [%]")
-        axes[1].set_title("Multi-view inconsistency thresholds")
+        axes[1].set_ylabel("Inconsistent Correspondences [%]")
+        axes[1].set_title("Multi-View Inconsistency Thresholds")
     else:
         axes[1].set_axis_off()
         axes[1].text(
@@ -1100,354 +1420,305 @@ def _plot_results(
     figure.savefig(output_dir / "boundary_and_consistency.png", dpi=180)
     plt.close(figure)
 
-    masked_boundary = summary["boundary_metrics_spatial_mask_plus_1cm"]
-    masked_boundary_labels = ["Boundary", "Non-boundary"]
-    figure, axis = plt.subplots(figsize=(7.5, 5.0))
-    sns.barplot(
-        x=masked_boundary_labels,
-        y=[
-            100.0 * float(masked_boundary["boundary"]["mae_m"]),
-            100.0 * float(masked_boundary["non_boundary"]["mae_m"]),
-        ],
-        ax=axis,
-        hue=masked_boundary_labels,
-        palette="flare",
-        legend=False,
-    )
-    axis.set_ylabel("MAE [cm]")
-    axis.set_title("Depth-boundary error inside +1.5 cm spatial mask")
-    figure.tight_layout()
-    figure.savefig(
-        output_dir / "boundary_error_spatial_mask_plus_1cm.png", dpi=180
-    )
-    plt.close(figure)
+    boundary_metrics_by_region = summary["boundary_metrics_by_region"]
+    for domain_slug, _, _, _ in PER_SEQUENCE_REGION_SPECS:
+        domain_boundary = boundary_metrics_by_region[domain_slug]
+        boundary_labels = ["Boundary", "Non-Boundary"]
+        figure, axis = plt.subplots(figsize=(7.5, 5.0))
+        sns.barplot(
+            x=boundary_labels,
+            y=[
+                100.0 * float(domain_boundary["boundary"]["mae_m"]),
+                100.0 * float(domain_boundary["non_boundary"]["mae_m"]),
+            ],
+            ax=axis,
+            hue=boundary_labels,
+            palette="flare",
+            legend=False,
+        )
+        axis.set_xlabel("Region")
+        axis.set_ylabel("MAE [cm]")
+        figure.tight_layout()
+        figure.savefig(output_dir / f"boundary_error_{domain_slug}.png", dpi=180)
+        plt.close(figure)
 
     if sequence_rows:
-        sequence_names = [str(row["sequence"]) for row in sequence_rows]
-        sequence_mae_cm = [
-            100.0 * float(row["mae_m"]) for row in sequence_rows
-        ]
-        sequence_rmse_cm = [
-            100.0 * float(row["rmse_m"]) for row in sequence_rows
-        ]
-        plot_rows = [
-            {"sequence": seq, "metric": "MAE", "error_cm": mae}
-            for seq, mae in zip(sequence_names, sequence_mae_cm)
-        ] + [
-            {"sequence": seq, "metric": "RMSE", "error_cm": rmse}
-            for seq, rmse in zip(sequence_names, sequence_rmse_cm)
-        ]
+        sequence_labels = _sequence_display_map(
+            [str(row["sequence"]) for row in sequence_rows]
+        )
         figure_width = max(8.0, 0.75 * len(sequence_rows))
+        for filename_region, region_label, mae_field, rmse_field in (
+            PER_SEQUENCE_REGION_SPECS
+        ):
+            plot_rows = []
+            for row in sequence_rows:
+                sequence_name = sequence_labels[str(row["sequence"])]
+                plot_rows.extend(
+                    (
+                        {
+                            "sequence": sequence_name,
+                            "metric": "MAE",
+                            "error_cm": 100.0 * float(row[mae_field]),
+                        },
+                        {
+                            "sequence": sequence_name,
+                            "metric": "RMSE",
+                            "error_cm": 100.0 * float(row[rmse_field]),
+                        },
+                    )
+                )
+            figure, axis = plt.subplots(figsize=(figure_width, 5.5))
+            sns.barplot(
+                data=_column_mapping(plot_rows),
+                x="sequence",
+                y="error_cm",
+                hue="metric",
+                ax=axis,
+                palette="deep",
+            )
+            axis.tick_params(axis="x", rotation=45)
+            axis.set_xlabel("")
+            axis.set_ylabel("Depth Error [cm]")
+            axis.set_title(f"Depth Error per Sequence: {region_label}")
+            axis.legend()
+            figure.tight_layout()
+            figure.savefig(
+                output_dir / f"error_per_sequence_{filename_region}.png",
+                dpi=180,
+            )
+            if filename_region == "whole_frame":
+                figure.savefig(output_dir / "error_per_sequence.png", dpi=180)
+            plt.close(figure)
+
+        all_domain_mae_rows = [
+            {
+                "sequence": sequence_labels[str(row["sequence"])].removeprefix(
+                    "Sequence "
+                ),
+                "domain": region_label,
+                "mae_cm": 100.0 * float(row[mae_field]),
+            }
+            for row in sequence_rows
+            for _, region_label, mae_field, _ in PER_SEQUENCE_REGION_SPECS
+        ]
         figure, axis = plt.subplots(figsize=(figure_width, 5.5))
         sns.barplot(
-            data=_column_mapping(plot_rows),
+            data=_column_mapping(all_domain_mae_rows),
             x="sequence",
-            y="error_cm",
-            hue="metric",
+            y="mae_cm",
+            hue="domain",
+            hue_order=[spec[1] for spec in PER_SEQUENCE_REGION_SPECS],
             ax=axis,
             palette="deep",
         )
-        axis.tick_params(axis="x", rotation=45)
-        axis.set_ylabel("Depth error [cm]")
-        axis.set_title("Depth error per sequence")
-        axis.legend()
+        axis.tick_params(axis="x", rotation=0)
+        axis.set_xlabel("Sequence")
+        axis.set_ylabel("MAE [cm]")
+        axis.set_title("MAE per Sequence Across Evaluation Domains")
+        axis.legend(title="Domain")
         figure.tight_layout()
-        figure.savefig(output_dir / "error_per_sequence.png", dpi=180)
+        figure.savefig(
+            output_dir / "mae_per_sequence_all_domains.png",
+            dpi=180,
+        )
         plt.close(figure)
 
     if frame_rows:
-        mae_cm = [100.0 * float(row["mae_m"]) for row in frame_rows]
-        rmse_cm = [100.0 * float(row["rmse_m"]) for row in frame_rows]
-        figure, axes = plt.subplots(1, 2, figsize=(11, 4.5))
-        sns.histplot(mae_cm, bins=40, ax=axes[0], color=sns.color_palette()[0])
-        axes[0].set_xlabel("Per-frame MAE [cm]")
-        axes[0].set_ylabel("Frames")
-        sns.histplot(rmse_cm, bins=40, ax=axes[1], color=sns.color_palette()[1])
-        axes[1].set_xlabel("Per-frame RMSE [cm]")
-        axes[1].set_ylabel("Frames")
-        figure.tight_layout()
-        figure.savefig(output_dir / "per_frame_error_histograms.png", dpi=180)
-        plt.close(figure)
-
-        activity = np.asarray(
-            [row["cube_event_activity"] for row in frame_rows], dtype=np.float64
-        )
-        mae_m = np.asarray([row["mae_m"] for row in frame_rows], dtype=np.float64)
-        finite = np.isfinite(activity) & np.isfinite(mae_m)
-        if finite.any():
-            activity = activity[finite]
-            mae_m = mae_m[finite]
-            figure, axes = plt.subplots(1, 2, figsize=(16, 6.5))
-            sns.scatterplot(
-                x=activity,
-                y=mae_m,
-                ax=axes[0],
-                s=18,
-                alpha=0.35,
-                linewidth=0,
-            )
-            axes[0].set_xlabel("Event activity at GT-depth pixels inside cube")
-            axes[0].set_ylabel("Whole-frame MAE [m]")
-            axes[0].set_title("Relevant-region activity vs prediction error")
-
-            bins = summary["cube_event_activity_vs_error"]["activity_bins"]
-            sns.lineplot(
-                x=[row["mean_activity"] for row in bins],
-                y=[row["mean_mae_m"] for row in bins],
-                marker="o",
-                ax=axes[1],
-                color=sns.color_palette("flare", 3)[1],
-            )
-            axes[1].set_xlabel("Mean cube-masked event activity")
-            axes[1].set_ylabel("Mean whole-frame MAE [m]")
-            axes[1].set_title("Equal-frame activity bins")
-            figure.tight_layout()
-            figure.savefig(
-                output_dir / "cube_event_activity_vs_error.png", dpi=180
-            )
-            plt.close(figure)
-
-        outside_activity = np.asarray(
-            [row["outside_cube_event_activity"] for row in frame_rows],
-            dtype=np.float64,
-        )
-        mae_m = np.asarray([row["mae_m"] for row in frame_rows], dtype=np.float64)
-        finite = np.isfinite(outside_activity) & np.isfinite(mae_m)
-        if finite.any():
-            outside_activity = outside_activity[finite]
-            mae_m = mae_m[finite]
-            sorted_bins = [
-                indices
-                for indices in np.array_split(
-                    np.argsort(outside_activity), min(8, outside_activity.size)
+        for domain_slug, domain_label, mae_field, rmse_field in (
+            PER_SEQUENCE_REGION_SPECS
+        ):
+            mae_cm = [
+                value
+                for row in frame_rows
+                if math.isfinite(
+                    value := 100.0 * float(row[mae_field])
                 )
-                if indices.size
             ]
-            figure, axes = plt.subplots(1, 2, figsize=(16, 6.5))
-            sns.scatterplot(
-                x=outside_activity,
-                y=mae_m,
-                ax=axes[0],
-                s=18,
-                alpha=0.35,
-                linewidth=0,
+            rmse_cm = [
+                value
+                for row in frame_rows
+                if math.isfinite(
+                    value := 100.0 * float(row[rmse_field])
+                )
+            ]
+            if not mae_cm or not rmse_cm:
+                continue
+            figure, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+            sns.histplot(
+                mae_cm, bins=40, ax=axes[0], color=sns.color_palette()[0]
             )
-            axes[0].set_xlabel(
-                "Event activity at valid GT-depth pixels outside cube"
+            axes[0].set_xlabel("Per-Frame MAE [cm]")
+            axes[0].set_ylabel("Frames")
+            sns.histplot(
+                rmse_cm, bins=40, ax=axes[1], color=sns.color_palette()[1]
             )
-            axes[0].set_ylabel("Whole-frame MAE [m]")
-            axes[0].set_title("Outside-cube activity vs prediction error")
-
-            sns.lineplot(
-                x=[
-                    float(outside_activity[indices].mean())
-                    for indices in sorted_bins
-                ],
-                y=[float(mae_m[indices].mean()) for indices in sorted_bins],
-                marker="o",
-                ax=axes[1],
-                color=sns.color_palette("flare", 3)[1],
-            )
-            axes[1].set_xlabel("Mean outside-cube event activity")
-            axes[1].set_ylabel("Mean whole-frame MAE [m]")
-            axes[1].set_title("Equal-frame activity bins")
+            axes[1].set_xlabel("Per-Frame RMSE [cm]")
+            axes[1].set_ylabel("Frames")
+            figure.suptitle(f"Per-Frame Depth Errors: {domain_label}")
             figure.tight_layout()
             figure.savefig(
-                output_dir / "outside_cube_event_activity_vs_error.png",
+                output_dir / f"per_frame_error_histograms_{domain_slug}.png",
                 dpi=180,
             )
             plt.close(figure)
 
-        pose_fields = (
-            ("pose_x_m", "Position X [m]"),
-            ("pose_y_m", "Position Y [m]"),
-            ("pose_z_m", "Position Z [m]"),
-            ("rotation_x_deg", "Rotation X [deg]"),
-            ("rotation_y_deg", "Rotation Y [deg]"),
-            ("rotation_z_deg", "Rotation Z [deg]"),
-        )
-        if all(field in frame_rows[0] for field, _ in pose_fields):
-            figure, axes = plt.subplots(2, 3, figsize=(15, 9))
-            for axis, (field, label) in zip(axes.flat, pose_fields):
-                x = np.asarray([row[field] for row in frame_rows], dtype=np.float64)
-                error_cm = np.asarray(
-                    [100.0 * row["mae_m"] for row in frame_rows],
-                    dtype=np.float64,
+        def plot_activity_error(
+            activity_field: str,
+            activity_xlabel: str,
+            title_prefix: str,
+            filename_prefix: str,
+        ) -> None:
+            activity = np.asarray(
+                [row[activity_field] for row in frame_rows], dtype=np.float64
+            )
+            for domain_slug, domain_label, mae_field, _ in (
+                PER_SEQUENCE_REGION_SPECS
+            ):
+                mae_m = np.asarray(
+                    [row[mae_field] for row in frame_rows], dtype=np.float64
                 )
-                finite = np.isfinite(x) & np.isfinite(error_cm)
-                x = x[finite]
-                error_cm = error_cm[finite]
+                finite = np.isfinite(activity) & np.isfinite(mae_m)
+                if not finite.any():
+                    continue
+                x = activity[finite]
+                y = 100.0 * mae_m[finite]
+                mean_x, mean_y = _fixed_width_mean_curve(x, y, 500.0)
+                figure, axes = plt.subplots(1, 2, figsize=(16, 6.5))
                 sns.scatterplot(
                     x=x,
-                    y=error_cm,
-                    ax=axis,
-                    s=14,
-                    alpha=0.22,
+                    y=y,
+                    ax=axes[0],
+                    s=18,
+                    alpha=0.35,
                     linewidth=0,
                 )
-                if x.size:
-                    sorted_bins = [
+                axes[0].set_xlabel(activity_xlabel)
+                axes[0].set_ylabel("MAE [cm]")
+                axes[0].set_title(f"{title_prefix}: {domain_label}")
+                sns.lineplot(
+                    x=mean_x,
+                    y=mean_y,
+                    marker="o",
+                    ax=axes[1],
+                    color=sns.color_palette("flare", 3)[1],
+                )
+                axes[1].set_xlabel(activity_xlabel)
+                axes[1].set_ylabel("MAE [cm]")
+                axes[1].set_title("Fixed 500-Activity-Unit Bins")
+                figure.tight_layout()
+                figure.savefig(
+                    output_dir / f"{filename_prefix}_{domain_slug}.png",
+                    dpi=180,
+                )
+                plt.close(figure)
+
+        plot_activity_error(
+            "cube_event_activity",
+            "Event Activity at GT-Depth Pixels Inside Workspace Cube",
+            "Workspace-Cube Activity vs. Prediction Error",
+            "cube_event_activity_vs_error",
+        )
+        plot_activity_error(
+            "outside_cube_event_activity",
+            "Event Activity at Valid GT-Depth Pixels Outside Workspace Cube",
+            "Outside-Cube Activity vs. Prediction Error",
+            "outside_cube_event_activity_vs_error",
+        )
+
+        def plot_scalar_diagnostic(
+            x_field: str,
+            xlabel: str,
+            title_prefix: str,
+            filename_prefix: str,
+            legend_loc: str,
+        ) -> None:
+            if x_field not in frame_rows[0]:
+                return
+            x_all = np.asarray(
+                [row[x_field] for row in frame_rows], dtype=np.float64
+            )
+            for domain_slug, domain_label, mae_field, _ in (
+                PER_SEQUENCE_REGION_SPECS
+            ):
+                error_all = np.asarray(
+                    [100.0 * row[mae_field] for row in frame_rows],
+                    dtype=np.float64,
+                )
+                finite = np.isfinite(x_all) & np.isfinite(error_all)
+                x = x_all[finite]
+                error_cm = error_all[finite]
+                if not x.size:
+                    continue
+                if x_field == "arm_speed_m_s":
+                    mean_x, mean_error_cm = _fixed_width_mean_curve(
+                        x, error_cm, 0.01
+                    )
+                    line_label = "Fixed 0.01 m/s-Bin Mean"
+                else:
+                    groups = [
                         indices
                         for indices in np.array_split(
                             np.argsort(x), min(12, x.size)
                         )
                         if indices.size
                     ]
-                    sns.lineplot(
-                        x=[float(x[indices].mean()) for indices in sorted_bins],
-                        y=[
-                            float(error_cm[indices].mean())
-                            for indices in sorted_bins
-                        ],
-                        marker="o",
-                        ax=axis,
-                        color=sns.color_palette("flare", 3)[1],
+                    mean_x = np.asarray(
+                        [float(x[indices].mean()) for indices in groups]
                     )
-                axis.set_xlabel(label)
-                axis.set_ylabel("Per-frame MAE [cm]")
-            figure.suptitle(
-                "Depth error over end-effector pose\n"
-                "Dots: frames; orange: equal-count bin means",
-                fontsize=13,
-            )
-            figure.tight_layout()
-            figure.savefig(output_dir / "pose_vs_error.png", dpi=180)
-            plt.close(figure)
-
-            if "worst10_mae_m" in frame_rows[0]:
-                figure, axes = plt.subplots(2, 3, figsize=(15, 9))
-                for axis, (field, label) in zip(axes.flat, pose_fields):
-                    x = np.asarray(
-                        [row[field] for row in frame_rows], dtype=np.float64
+                    mean_error_cm = np.asarray(
+                        [float(error_cm[indices].mean()) for indices in groups]
                     )
-                    error_cm = np.asarray(
-                        [100.0 * row["worst10_mae_m"] for row in frame_rows],
-                        dtype=np.float64,
-                    )
-                    finite = np.isfinite(x) & np.isfinite(error_cm)
-                    sns.scatterplot(
-                        x=x[finite],
-                        y=error_cm[finite],
-                        ax=axis,
-                        s=14,
-                        alpha=0.22,
-                        linewidth=0,
-                    )
-                    curve_x, curve_y = _equal_count_mean_curve(
-                        frame_rows,
-                        field,
-                        y_field="worst10_mae_m",
-                        bins=12,
-                        y_scale=100.0,
-                    )
-                    if curve_x.size:
-                        sns.lineplot(
-                            x=curve_x,
-                            y=curve_y,
-                            marker="o",
-                            ax=axis,
-                            color=sns.color_palette("flare", 3)[1],
-                        )
-                    axis.set_xlabel(label)
-                    axis.set_ylabel("Worst-10% pixel MAE [cm]")
-                figure.suptitle(
-                    "Worst-10% pixel error over end-effector pose\n"
-                    "Dots: frames; orange: equal-count bin means",
-                    fontsize=13,
+                    line_label = "Equal-Count-Bin Mean"
+                figure, axis = plt.subplots(figsize=(11, 7))
+                sns.scatterplot(
+                    x=x,
+                    y=error_cm,
+                    ax=axis,
+                    s=18,
+                    alpha=0.25,
+                    linewidth=0,
+                )
+                sns.lineplot(
+                    x=mean_x,
+                    y=mean_error_cm,
+                    marker="o",
+                    ax=axis,
+                    color=sns.color_palette("flare", 3)[1],
+                    label=line_label,
+                )
+                axis.set_xlabel(xlabel)
+                axis.set_ylabel(
+                    "MAE [cm]"
+                    if x_field == "arm_speed_m_s"
+                    else f"{domain_label} Per-Frame MAE [cm]"
+                )
+                axis.set_title(f"{title_prefix}: {domain_label}")
+                axis.legend(
+                    loc=legend_loc,
+                    fontsize=DIAGNOSTIC_LEGEND_FONT_SIZE,
+                    title_fontsize=DIAGNOSTIC_LEGEND_TITLE_FONT_SIZE,
                 )
                 figure.tight_layout()
                 figure.savefig(
-                    output_dir / "pose_vs_worst10_error.png", dpi=180
+                    output_dir / f"{filename_prefix}_{domain_slug}.png",
+                    dpi=180,
                 )
                 plt.close(figure)
 
-        if "arm_speed_m_s" in frame_rows[0]:
-            speed = np.asarray(
-                [row["arm_speed_m_s"] for row in frame_rows], dtype=np.float64
-            )
-            error_cm = np.asarray(
-                [100.0 * row["mae_m"] for row in frame_rows], dtype=np.float64
-            )
-            finite = np.isfinite(speed) & np.isfinite(error_cm)
-            speed = speed[finite]
-            error_cm = error_cm[finite]
-            if speed.size:
-                figure, axis = plt.subplots(figsize=(11, 7))
-                sns.scatterplot(
-                    x=speed,
-                    y=error_cm,
-                    ax=axis,
-                    s=18,
-                    alpha=0.25,
-                    linewidth=0,
-                )
-                sorted_bins = [
-                    indices
-                    for indices in np.array_split(
-                        np.argsort(speed), min(12, speed.size)
-                    )
-                    if indices.size
-                ]
-                sns.lineplot(
-                    x=[float(speed[indices].mean()) for indices in sorted_bins],
-                    y=[float(error_cm[indices].mean()) for indices in sorted_bins],
-                    marker="o",
-                    ax=axis,
-                    color=sns.color_palette("flare", 3)[1],
-                    label="Equal-count bin mean",
-                )
-                axis.set_xlabel("End-effector translational speed [m/s]")
-                axis.set_ylabel("Per-frame MAE [cm]")
-                axis.set_title("Arm speed vs depth error")
-                axis.legend()
-                figure.tight_layout()
-                figure.savefig(output_dir / "arm_speed_vs_error.png", dpi=180)
-                plt.close(figure)
-
-        if "target_distance_m" in frame_rows[0]:
-            distance = np.asarray(
-                [row["target_distance_m"] for row in frame_rows],
-                dtype=np.float64,
-            )
-            error_cm = np.asarray(
-                [100.0 * row["mae_m"] for row in frame_rows],
-                dtype=np.float64,
-            )
-            finite = np.isfinite(distance) & np.isfinite(error_cm)
-            distance = distance[finite]
-            error_cm = error_cm[finite]
-            if distance.size:
-                figure, axis = plt.subplots(figsize=(11, 7))
-                sns.scatterplot(
-                    x=distance,
-                    y=error_cm,
-                    ax=axis,
-                    s=18,
-                    alpha=0.25,
-                    linewidth=0,
-                )
-                sorted_bins = [
-                    indices
-                    for indices in np.array_split(
-                        np.argsort(distance), min(12, distance.size)
-                    )
-                    if indices.size
-                ]
-                sns.lineplot(
-                    x=[float(distance[indices].mean()) for indices in sorted_bins],
-                    y=[float(error_cm[indices].mean()) for indices in sorted_bins],
-                    marker="o",
-                    ax=axis,
-                    color=sns.color_palette("flare", 3)[1],
-                    label="Equal-count bin mean",
-                )
-                axis.set_xlabel("Camera distance to recording target [m]")
-                axis.set_ylabel("Per-frame MAE [cm]")
-                axis.set_title("Target distance vs depth error")
-                axis.legend()
-                figure.tight_layout()
-                figure.savefig(output_dir / "target_distance_vs_error.png", dpi=180)
-                plt.close(figure)
+        plot_scalar_diagnostic(
+            "arm_speed_m_s",
+            "End-Effector Translational Velocity [m/s]",
+            "Velocity vs. Depth Error",
+            "arm_speed_vs_error",
+            "upper right",
+        )
+        plot_scalar_diagnostic(
+            "target_distance_m",
+            "Camera Distance to Recording Target [m]",
+            "Target Distance vs. Depth Error",
+            "target_distance_vs_error",
+            "upper left",
+        )
 
 
 def _write_comparison_results(
@@ -1474,6 +1745,11 @@ def _write_comparison_results(
             {
                 "model": run["label"],
                 **{name: depth[name] for name in DEPTH_METRIC_NAMES},
+                **{
+                    f"{region}_{name}": metrics[name]
+                    for region, metrics in summary["depth_metrics_by_region"].items()
+                    for name in ("valid_pixels", *DEPTH_METRIC_NAMES)
+                },
                 "boundary_mae_m": boundary["boundary"]["mae_m"],
                 "non_boundary_mae_m": boundary["non_boundary"]["mae_m"],
                 "boundary_spatial_mask_plus_1cm_mae_m": masked_boundary[
@@ -1522,49 +1798,129 @@ def _write_comparison_results(
         axis.set_ylabel(ylabel)
         if percentage_values is not None:
             _set_inverse_percentage_axis(axis, percentage_values)
-        axis.legend(title="Model", fontsize=8, title_fontsize=9)
+        axis.legend(
+            title="Model",
+            fontsize=LEGEND_FONT_SIZE,
+            title_fontsize=LEGEND_TITLE_FONT_SIZE,
+        )
 
-    # Global errors and threshold accuracies. Models are adjacent within metric.
+    # Depth metrics for each evaluation domain. Models are adjacent by metric.
     error_names = ["abs_rel", "sq_rel_m", "mae_m", "rmse_m", "rmse_log"]
-    error_rows = [
-        {
-            "metric": metric,
-            "value": float(run["summary"]["depth_metrics"][metric]),
-            "model": run["label"],
-        }
-        for metric in error_names
-        for run in runs
-    ]
     delta_specs = [
         ("delta_1", r"$\delta<1.25$"),
         ("delta_2", r"$\delta<1.25^2$"),
         ("delta_3", r"$\delta<1.25^3$"),
     ]
-    delta_rows = [
+    for domain_slug, domain_label, _, _ in PER_SEQUENCE_REGION_SPECS:
+        region_key = DOMAIN_SUMMARY_REGION_KEYS[domain_slug]
+        error_rows = [
+            {
+                "metric": metric,
+                "value": float(
+                    run["summary"]["depth_metrics_by_region"][region_key][metric]
+                ),
+                "model": run["label"],
+            }
+            for metric in error_names
+            for run in runs
+        ]
+        delta_rows = [
+            {
+                "threshold": label,
+                "failure_percentage": 100.0
+                * (
+                    1.0
+                    - float(
+                        run["summary"]["depth_metrics_by_region"][region_key][
+                            field
+                        ]
+                    )
+                ),
+                "model": run["label"],
+            }
+            for field, label in delta_specs
+            for run in runs
+        ]
+        figure, axes = plt.subplots(1, 2, figsize=(15, 5.2))
+        grouped_bar(
+            axes[0],
+            error_rows,
+            "metric",
+            "value",
+            f"Depth Errors: {domain_label}",
+            "Error",
+        )
+        axes[0].tick_params(axis="x", rotation=30)
+        grouped_bar(
+            axes[1],
+            delta_rows,
+            "threshold",
+            "failure_percentage",
+            f"Threshold Failure Rate: {domain_label}",
+            "Pixels Outside Threshold [%]",
+            [row["failure_percentage"] for row in delta_rows],
+        )
+        figure.tight_layout()
+        figure.savefig(
+            output_dir / f"depth_metrics_{domain_slug}.png", dpi=180
+        )
+        plt.close(figure)
+
+    region_error_rows = [
         {
-            "threshold": label,
-            "failure_percentage": 100.0 * (
-                1.0 - float(run["summary"]["depth_metrics"][field])
-            ),
+            "region": DEPTH_REGION_LABELS[region],
+            "metric": metric,
+            "error_cm": 100.0
+            * float(run["summary"]["depth_metrics_by_region"][region][field]),
             "model": run["label"],
         }
-        for field, label in delta_specs
+        for region in DEPTH_REGION_LABELS
+        for metric, field in (("MAE", "mae_m"), ("RMSE", "rmse_m"))
         for run in runs
     ]
-    figure, axes = plt.subplots(1, 2, figsize=(15, 5.2))
-    grouped_bar(axes[0], error_rows, "metric", "value", "Depth errors", "Error")
-    axes[0].tick_params(axis="x", rotation=30)
-    grouped_bar(
-        axes[1],
-        delta_rows,
-        "threshold",
-        "failure_percentage",
-        "Threshold failure rate",
-        "Pixels outside threshold [%]",
-        [row["failure_percentage"] for row in delta_rows],
+    figure, axes = plt.subplots(1, 2, figsize=(16, 5.8), sharey=True)
+    for axis, metric in zip(axes, ("MAE", "RMSE")):
+        metric_rows = [row for row in region_error_rows if row["metric"] == metric]
+        grouped_bar(
+            axis,
+            metric_rows,
+            "region",
+            "error_cm",
+            f"{metric} by Evaluation Region",
+            "Depth Error [cm]",
+        )
+        axis.set_xlabel("")
+        axis.tick_params(axis="x", rotation=12)
+    figure.tight_layout()
+    figure.savefig(output_dir / "mae_rmse_by_region.png", dpi=180)
+    plt.close(figure)
+
+    mae_region_rows = [
+        row for row in region_error_rows if row["metric"] == "MAE"
+    ]
+    figure, axis = plt.subplots(figsize=(13, 6.2))
+    sns.barplot(
+        data=_column_mapping(mae_region_rows),
+        x="region",
+        y="error_cm",
+        hue="model",
+        order=list(DEPTH_REGION_LABELS.values()),
+        hue_order=[run["label"] for run in runs],
+        ax=axis,
+        palette=palette,
+    )
+    axis.set_xlabel("")
+    axis.set_ylabel("MAE [cm]")
+    axis.set_title("MAE by Model and Evaluation Region")
+    axis.tick_params(axis="x", rotation=0)
+    axis.legend(
+        title="Model",
+        loc="upper left",
+        fontsize=DIAGNOSTIC_LEGEND_FONT_SIZE,
+        title_fontsize=DIAGNOSTIC_LEGEND_TITLE_FONT_SIZE,
     )
     figure.tight_layout()
-    figure.savefig(output_dir / "depth_metrics.png", dpi=180)
+    figure.savefig(output_dir / "mae_by_region.png", dpi=180)
     plt.close(figure)
 
     boundary_rows = []
@@ -1581,7 +1937,7 @@ def _write_comparison_results(
                     "model": label,
                 },
                 {
-                    "region": "Non-boundary",
+                    "region": "Non-Boundary",
                     "mae_cm": 100.0 * float(boundary["non_boundary"]["mae_m"]),
                     "model": label,
                 },
@@ -1607,7 +1963,7 @@ def _write_comparison_results(
         boundary_rows,
         "region",
         "mae_cm",
-        "Depth-boundary error",
+        "Depth-Boundary Error",
         "MAE [cm]",
     )
     if any(math.isfinite(row["percentage"]) for row in mvc_rows):
@@ -1616,8 +1972,8 @@ def _write_comparison_results(
             mvc_rows,
             "threshold",
             "percentage",
-            "Multi-view inconsistency thresholds",
-            "Inconsistent correspondences [%]",
+            "Multi-View Inconsistency Thresholds",
+            "Inconsistent Correspondences [%]",
             [row["percentage"] for row in mvc_rows],
         )
     else:
@@ -1634,80 +1990,228 @@ def _write_comparison_results(
     figure.savefig(output_dir / "boundary_and_consistency.png", dpi=180)
     plt.close(figure)
 
-    masked_boundary_rows = []
-    for run in runs:
-        label = run["label"]
-        masked_boundary = run["summary"][
-            "boundary_metrics_spatial_mask_plus_1cm"
-        ]
-        masked_boundary_rows.extend(
-            [
-                {
-                    "region": "Boundary",
-                    "mae_cm": 100.0
-                    * float(masked_boundary["boundary"]["mae_m"]),
-                    "model": label,
-                },
-                {
-                    "region": "Non-boundary",
-                    "mae_cm": 100.0
-                    * float(masked_boundary["non_boundary"]["mae_m"]),
-                    "model": label,
-                },
+    for domain_slug, _, _, _ in PER_SEQUENCE_REGION_SPECS:
+        domain_boundary_rows = []
+        for run in runs:
+            label = run["label"]
+            domain_boundary = run["summary"]["boundary_metrics_by_region"][
+                domain_slug
             ]
+            domain_boundary_rows.extend(
+                [
+                    {
+                        "region": "Boundary",
+                        "mae_cm": 100.0
+                        * float(domain_boundary["boundary"]["mae_m"]),
+                        "model": label,
+                    },
+                    {
+                        "region": "Non-Boundary",
+                        "mae_cm": 100.0
+                        * float(domain_boundary["non_boundary"]["mae_m"]),
+                        "model": label,
+                    },
+                ]
+            )
+        figure, axis = plt.subplots(figsize=(max(8.0, len(runs) * 2.5), 5.2))
+        grouped_bar(
+            axis,
+            domain_boundary_rows,
+            "region",
+            "mae_cm",
+            "",
+            "MAE [cm]",
         )
-    figure, axis = plt.subplots(figsize=(max(8.0, len(runs) * 2.5), 5.2))
-    grouped_bar(
-        axis,
-        masked_boundary_rows,
-        "region",
-        "mae_cm",
-        "Depth-boundary error inside +1.5 cm spatial mask",
-        "MAE [cm]",
-    )
-    figure.tight_layout()
-    figure.savefig(
-        output_dir / "boundary_error_spatial_mask_plus_1cm.png", dpi=180
-    )
-    plt.close(figure)
+        axis.set_xlabel("Region")
+        figure.tight_layout()
+        figure.savefig(output_dir / f"boundary_error_{domain_slug}.png", dpi=180)
+        plt.close(figure)
 
     # Per-sequence bars use model as hue, with MAE and RMSE in separate panels.
-    sequence_plot_rows = []
-    for run in runs:
-        for row in run["sequence_rows"]:
-            for metric, field in (("MAE", "mae_m"), ("RMSE", "rmse_m")):
-                sequence_plot_rows.append(
-                    {
-                        "sequence": str(row["sequence"]),
-                        "metric": metric,
-                        "error_cm": 100.0 * float(row[field]),
-                        "model": run["label"],
-                    }
-                )
-    if sequence_plot_rows:
-        figure, axes = plt.subplots(2, 1, figsize=(max(10, len(runs) * 2.5), 10))
+    comparison_sequence_labels = _sequence_display_map(
+        [
+            str(row["sequence"])
+            for run in runs
+            for row in run["sequence_rows"]
+        ]
+    )
+    for filename_region, region_label, mae_field, rmse_field in (
+        PER_SEQUENCE_REGION_SPECS
+    ):
+        sequence_plot_rows = []
+        for run in runs:
+            for row in run["sequence_rows"]:
+                for metric, field in (
+                    ("MAE", mae_field),
+                    ("RMSE", rmse_field),
+                ):
+                    sequence_plot_rows.append(
+                        {
+                            "sequence": comparison_sequence_labels[
+                                str(row["sequence"])
+                            ],
+                            "metric": metric,
+                            "error_cm": 100.0 * float(row[field]),
+                            "model": run["label"],
+                        }
+                    )
+        if not sequence_plot_rows:
+            continue
+        figure, axes = plt.subplots(
+            2,
+            1,
+            figsize=(max(10, len(runs) * 2.5), 10),
+        )
         for axis, metric in zip(axes, ("MAE", "RMSE")):
-            metric_rows = [row for row in sequence_plot_rows if row["metric"] == metric]
+            metric_rows = [
+                row
+                for row in sequence_plot_rows
+                if row["metric"] == metric
+            ]
             grouped_bar(
                 axis,
                 metric_rows,
                 "sequence",
                 "error_cm",
-                f"{metric} per sequence",
-                "Depth error [cm]",
+                f"{metric} per Sequence: {region_label}",
+                "Depth Error [cm]",
             )
             axis.tick_params(axis="x", rotation=45)
         figure.tight_layout()
-        figure.savefig(output_dir / "error_per_sequence.png", dpi=180)
+        figure.savefig(
+            output_dir / f"error_per_sequence_{filename_region}.png",
+            dpi=180,
+        )
+        if filename_region == "whole_frame":
+            figure.savefig(output_dir / "error_per_sequence.png", dpi=180)
+        plt.close(figure)
+
+    if any(run["sequence_rows"] for run in runs):
+        figure, axes = plt.subplots(
+            len(runs),
+            1,
+            figsize=(max(10, len(runs) * 2.5), 4.5 * len(runs)),
+            squeeze=False,
+            sharey=True,
+        )
+        for run_index, (axis, run) in enumerate(zip(axes[:, 0], runs)):
+            all_domain_mae_rows = [
+                {
+                    "sequence": comparison_sequence_labels[
+                        str(row["sequence"])
+                    ].removeprefix("Sequence "),
+                    "domain": region_label,
+                    "mae_cm": 100.0 * float(row[mae_field]),
+                }
+                for row in run["sequence_rows"]
+                for _, region_label, mae_field, _ in PER_SEQUENCE_REGION_SPECS
+            ]
+            if not all_domain_mae_rows:
+                axis.set_axis_off()
+                continue
+            sns.barplot(
+                data=_column_mapping(all_domain_mae_rows),
+                x="sequence",
+                y="mae_cm",
+                hue="domain",
+                hue_order=[spec[1] for spec in PER_SEQUENCE_REGION_SPECS],
+                ax=axis,
+                palette="deep",
+            )
+            axis.tick_params(axis="x", rotation=0)
+            axis.set_xlabel("")
+            axis.set_ylabel("MAE [cm]")
+            axis.set_title(run["label"])
+            if run_index == 0:
+                axis.legend(title="Domain")
+            elif axis.get_legend() is not None:
+                axis.get_legend().remove()
+        figure.suptitle("MAE per Sequence Across Evaluation Domains")
+        figure.supxlabel("Sequence")
+        figure.tight_layout()
+        figure.savefig(
+            output_dir / "mae_per_sequence_all_domains.png",
+            dpi=180,
+        )
+        plt.close(figure)
+
+    for domain_slug, domain_label, mae_field, _ in PER_SEQUENCE_REGION_SPECS:
+        normalized_time_rows = []
+        normalized_time_curves = []
+        for run in runs:
+            centers, _sequence_curves, mean, std, recording_counts = (
+                _normalized_time_error_curves(
+                    run["frame_rows"], error_field=mae_field
+                )
+            )
+            normalized_time_curves.append((run["label"], centers, mean, std))
+            for index in np.flatnonzero(np.isfinite(mean)):
+                normalized_time_rows.append(
+                    {
+                        "model": run["label"],
+                        "normalized_time": float(centers[index]),
+                        "mean_mae_cm": float(mean[index]),
+                        "std_mae_cm": float(std[index]),
+                        "recordings": int(recording_counts[index]),
+                    }
+                )
+        if not normalized_time_rows:
+            continue
+        _write_csv(
+            output_dir / f"error_over_normalized_time_{domain_slug}.csv",
+            normalized_time_rows,
+        )
+        figure, axis = plt.subplots(figsize=(12, 7.0))
+        for color, (label, centers, mean, std) in zip(
+            palette, normalized_time_curves
+        ):
+            finite = np.isfinite(mean)
+            if not finite.any():
+                continue
+            axis.plot(
+                centers[finite],
+                mean[finite],
+                color=color,
+                linewidth=2.4,
+                label=label,
+            )
+            axis.fill_between(
+                centers[finite],
+                np.maximum(0.0, mean[finite] - std[finite]),
+                mean[finite] + std[finite],
+                color=color,
+                alpha=0.12,
+                linewidth=0,
+            )
+        axis.set_xlim(0.0, 1.0)
+        axis.set_xlabel("Normalized Recording Time")
+        axis.set_ylabel("Per-Frame MAE [cm]")
+        axis.set_title(
+            f"Depth Error Over Normalized Recording Time: {domain_label}"
+        )
+        axis.legend(
+            title="Model",
+            fontsize=DIAGNOSTIC_LEGEND_FONT_SIZE,
+            title_fontsize=DIAGNOSTIC_LEGEND_TITLE_FONT_SIZE,
+        )
+        figure.tight_layout()
+        figure.savefig(
+            output_dir / f"error_over_normalized_time_{domain_slug}.png",
+            dpi=180,
+        )
         plt.close(figure)
 
     def mean_line_plot(
         filename: str,
         panels: list[tuple[str, str, str]],
         bins: int = 12,
+        fixed_interval: float | None = None,
         y_scale: float = 100.0,
         y_field: str = "mae_m",
-        ylabel: str = "Mean per-frame MAE [cm]",
+        ylabel: str = "Mean Per-Frame MAE [cm]",
+        legend_loc: str = "upper right",
+        legend_fontsize: int = LEGEND_FONT_SIZE,
+        legend_title_fontsize: int = LEGEND_TITLE_FONT_SIZE,
     ) -> None:
         n_panels = len(panels)
         ncols = min(3, n_panels)
@@ -1726,36 +2230,45 @@ def _write_comparison_results(
         )
         for axis, (field, xlabel, title) in zip(axes.flat, panels):
             for color, run in zip(palette, runs):
-                x, y = _equal_count_mean_curve(
-                    run["frame_rows"],
-                    field,
-                    y_field=y_field,
-                    bins=bins,
-                    y_scale=y_scale,
-                )
+                if fixed_interval is None:
+                    x, y = _equal_count_mean_curve(
+                        run["frame_rows"],
+                        field,
+                        y_field=y_field,
+                        bins=bins,
+                        y_scale=y_scale,
+                    )
+                else:
+                    x, y = _fixed_width_mean_curve_from_rows(
+                        run["frame_rows"],
+                        field,
+                        fixed_interval,
+                        y_field=y_field,
+                        y_scale=y_scale,
+                    )
                 if x.size:
                     axis.plot(x, y, linewidth=2.2, color=color, label=run["label"])
             axis.set_xlabel(xlabel)
             axis.set_ylabel(ylabel)
             axis.set_title(title)
             if n_panels != 1:
-                axis.legend(title="Model", fontsize=8, title_fontsize=9)
+                axis.legend(
+                    title="Model",
+                    loc=legend_loc,
+                    fontsize=legend_fontsize,
+                    title_fontsize=legend_title_fontsize,
+                )
         for axis in axes.flat[n_panels:]:
             axis.set_visible(False)
         if n_panels == 1:
-            handles, labels = axes.flat[0].get_legend_handles_labels()
-            figure.legend(
-                handles,
-                labels,
+            axes.flat[0].legend(
                 title="Model",
-                loc="upper center",
-                bbox_to_anchor=(0.5, 0.99),
-                ncol=min(2, len(labels)),
-                fontsize=9,
-                title_fontsize=10,
+                loc=legend_loc,
+                fontsize=legend_fontsize,
+                title_fontsize=legend_title_fontsize,
                 frameon=True,
             )
-            figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.84))
+            figure.tight_layout()
         else:
             figure.tight_layout()
         figure.savefig(output_dir / filename, dpi=180)
@@ -1763,68 +2276,67 @@ def _write_comparison_results(
 
     # Comparison diagnostics intentionally contain only binned mean curves:
     # no per-frame scatter and no markers on the curves.
-    mean_line_plot(
-        "cube_event_activity_vs_error.png",
-        [
+    for domain_slug, domain_label, mae_field, _ in PER_SEQUENCE_REGION_SPECS:
+        diagnostic_specs = (
             (
+                "cube_event_activity_vs_error",
                 "cube_event_activity",
-                "Mean event activity at GT-depth pixels inside cube",
-                "Relevant-region activity vs prediction error",
-            )
-        ],
-        bins=8,
-        y_scale=100.0,
-    )
-    mean_line_plot(
-        "outside_cube_event_activity_vs_error.png",
-        [
+                "Mean Event Activity at GT-Depth Pixels Inside Workspace Cube",
+                "Workspace-Cube Activity vs. Prediction Error",
+                500.0,
+                "upper right",
+            ),
             (
+                "outside_cube_event_activity_vs_error",
                 "outside_cube_event_activity",
-                "Mean event activity at valid GT-depth pixels outside cube",
-                "Outside-cube activity vs prediction error",
-            )
-        ],
-        bins=8,
-        y_scale=100.0,
-    )
-    mean_line_plot(
-        "pose_vs_error.png",
-        [
-            ("pose_x_m", "Position X [m]", "Position X"),
-            ("pose_y_m", "Position Y [m]", "Position Y"),
-            ("pose_z_m", "Position Z [m]", "Position Z"),
-            ("rotation_x_deg", "Rotation X [deg]", "Rotation X"),
-            ("rotation_y_deg", "Rotation Y [deg]", "Rotation Y"),
-            ("rotation_z_deg", "Rotation Z [deg]", "Rotation Z"),
-        ],
-    )
-    mean_line_plot(
-        "pose_vs_worst10_error.png",
-        [
-            ("pose_x_m", "Position X [m]", "Position X"),
-            ("pose_y_m", "Position Y [m]", "Position Y"),
-            ("pose_z_m", "Position Z [m]", "Position Z"),
-            ("rotation_x_deg", "Rotation X [deg]", "Rotation X"),
-            ("rotation_y_deg", "Rotation Y [deg]", "Rotation Y"),
-            ("rotation_z_deg", "Rotation Z [deg]", "Rotation Z"),
-        ],
-        y_field="worst10_mae_m",
-        ylabel="Mean worst-10% pixel MAE [cm]",
-    )
-    mean_line_plot(
-        "arm_speed_vs_error.png",
-        [("arm_speed_m_s", "End-effector translational speed [m/s]", "Arm speed")],
-    )
-    mean_line_plot(
-        "target_distance_vs_error.png",
-        [
+                (
+                    "Mean Event Activity at Valid GT-Depth Pixels Outside "
+                    "Workspace Cube"
+                ),
+                "Outside-Cube Activity vs. Prediction Error",
+                500.0,
+                "upper right",
+            ),
             (
+                "arm_speed_vs_error",
+                "arm_speed_m_s",
+                "End-Effector Translational Velocity [m/s]",
+                "Velocity vs. Depth Error",
+                0.01,
+                "upper right",
+            ),
+            (
+                "target_distance_vs_error",
                 "target_distance_m",
-                "Camera distance to recording target [m]",
-                "Target distance",
+                "Camera Distance to Recording Target [m]",
+                "Target Distance vs. Depth Error",
+                None,
+                "upper left",
+            ),
+        )
+        for filename_prefix, x_field, xlabel, title, fixed_interval, legend_loc in (
+            diagnostic_specs
+        ):
+            mean_line_plot(
+                f"{filename_prefix}_{domain_slug}.png",
+                [(x_field, xlabel, f"{title}: {domain_label}")],
+                bins=12,
+                fixed_interval=fixed_interval,
+                y_field=mae_field,
+                ylabel=(
+                    "MAE [cm]"
+                    if x_field
+                    in {
+                        "cube_event_activity",
+                        "outside_cube_event_activity",
+                        "arm_speed_m_s",
+                    }
+                    else f"Mean {domain_label} Per-Frame MAE [cm]"
+                ),
+                legend_loc=legend_loc,
+                legend_fontsize=DIAGNOSTIC_LEGEND_FONT_SIZE,
+                legend_title_fontsize=DIAGNOSTIC_LEGEND_TITLE_FONT_SIZE,
             )
-        ],
-    )
 
     # Only L1 is included in the spatial-mask sweep, with models side by side.
     offset_rows = []
@@ -1844,10 +2356,10 @@ def _write_comparison_results(
             offset_rows,
             "offset_mm",
             "l1_mm",
-            "L1 depth error under recomputed spatial masks",
-            "L1 error [mm]",
+            "L1 Depth Error Under Recomputed Spatial Masks",
+            "L1 Error [mm]",
         )
-        axis.set_xlabel("Spatial-mask cube-bottom Z offset [mm]")
+        axis.set_xlabel("Spatial-Mask Cube-Bottom Z Offset [mm]")
         figure.tight_layout()
         figure.savefig(output_dir / "spatial_mask_z_offset_metrics.png", dpi=180)
         plt.close(figure)
@@ -1856,14 +2368,19 @@ def _write_comparison_results(
 def _plot_worst_frames(
     output_dir: Path,
     samples: list[dict[str, Any]],
+    domain_slug: str,
+    domain_label: str,
 ) -> None:
-    """Save the highest-MAE frame from each evaluated object/sequence."""
+    """Save each sequence's highest-MAE frame for one evaluation domain."""
     if not samples:
         return
 
     plt, _sns = _setup_seaborn_plotting()
 
     samples = sorted(samples, key=lambda sample: sample["sequence"])
+    sequence_labels = _sequence_display_map(
+        [str(sample["sequence"]) for sample in samples]
+    )
     figure, axes = plt.subplots(
         len(samples),
         4,
@@ -1871,7 +2388,7 @@ def _plot_worst_frames(
         squeeze=False,
     )
     for column, title in enumerate(
-        ("Event activity (shared scale)", "GT depth", "Pred depth", "Abs error")
+        ("Event Activity (Shared Scale)", "GT Depth", "Predicted Depth", "Absolute Error")
     ):
         axes[0, column].set_title(title, fontsize=11, fontweight="bold")
 
@@ -1917,7 +2434,7 @@ def _plot_worst_frames(
             vmax=event_vmax,
         )
         ax_events.set_ylabel(
-            f"{sample['sequence']}\nframe {sample['frame_idx']}",
+            f"{sequence_labels[str(sample['sequence'])]}\nFrame {sample['frame_idx']}",
             fontsize=8,
         )
 
@@ -1939,8 +2456,567 @@ def _plot_worst_frames(
             axis.set_xticks([])
             axis.set_yticks([])
 
-    figure.tight_layout()
-    figure.savefig(output_dir / "worst_error_overview.png", dpi=180)
+    figure.suptitle(f"Worst Per-Sequence Depth Errors: {domain_label}")
+    figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+    figure.savefig(
+        output_dir / f"worst_error_overview_{domain_slug}.png", dpi=180
+    )
+    plt.close(figure)
+
+
+def _plot_qualitative_depth_results(
+    output_dir: Path,
+    samples: list[dict[str, Any]],
+) -> None:
+    """Plot events and workspace-masked depth results for each sequence."""
+    if not samples:
+        return
+
+    plt, _sns = _setup_seaborn_plotting()
+
+    def sequence_sort_key(sample: dict[str, Any]) -> tuple[int, Any]:
+        sequence = str(sample["sequence"])
+        return (0, int(sequence)) if sequence.isdigit() else (1, sequence)
+
+    samples = sorted(samples, key=sequence_sort_key)
+    figure, axes = plt.subplots(
+        4,
+        len(samples),
+        figsize=(max(3.0 * len(samples), 8.0), 10.0),
+        squeeze=False,
+        constrained_layout=True,
+    )
+
+    event_activity_images = [
+        np.abs(sample["events"]).sum(axis=0) for sample in samples
+    ]
+    active_event_values = [
+        activity[activity > 0.0]
+        for activity in event_activity_images
+        if np.any(activity > 0.0)
+    ]
+    event_vmax = (
+        max(
+            float(np.percentile(np.concatenate(active_event_values), 99.0)),
+            1e-6,
+        )
+        if active_event_values
+        else 1.0
+    )
+
+    displayed_depth_values = []
+    for sample in samples:
+        gt_valid = sample["lower_cube_valid"].astype(bool, copy=False)
+        pred_valid = sample["prediction_workspace_mask"].astype(bool, copy=False)
+        displayed_depth_values.extend(
+            (
+                sample["gt"][gt_valid & np.isfinite(sample["gt"])],
+                sample["pred"][pred_valid & np.isfinite(sample["pred"])],
+            )
+        )
+    nonempty_depth_values = [values for values in displayed_depth_values if values.size]
+    if nonempty_depth_values:
+        all_depth_values = np.concatenate(nonempty_depth_values)
+        depth_vmin = float(all_depth_values.min())
+        depth_vmax = float(all_depth_values.max())
+        if depth_vmax <= depth_vmin:
+            depth_vmax = depth_vmin + 1e-3
+    else:
+        depth_vmin, depth_vmax = DEPTH_MIN, D_MAX
+
+    valid_errors = [
+        np.abs(sample["pred"] - sample["gt"])[sample["lower_cube_valid"]]
+        for sample in samples
+        if np.any(sample["lower_cube_valid"])
+    ]
+    if valid_errors:
+        error_vmax = max(
+            float(np.percentile(np.concatenate(valid_errors), 99.0)),
+            1e-3,
+        )
+    else:
+        error_vmax = 0.1
+
+    depth_cmap = plt.get_cmap("turbo").copy()
+    depth_cmap.set_bad("black")
+    error_cmap = plt.get_cmap("magma").copy()
+    error_cmap.set_bad("black")
+
+    depth_image = None
+    error_image = None
+    event_image = None
+    for column, (sample, event_activity) in enumerate(
+        zip(samples, event_activity_images)
+    ):
+        error_valid = sample["lower_cube_valid"].astype(bool, copy=False)
+        prediction_valid = sample["prediction_workspace_mask"].astype(
+            bool, copy=False
+        )
+        gt = np.ma.masked_where(~error_valid, sample["gt"])
+        # Prediction membership is computed from predicted depth, independently
+        # of GT validity, so valid predictions remain visible across GT holes.
+        pred = np.ma.masked_where(~prediction_valid, sample["pred"])
+        error = np.ma.masked_where(
+            ~error_valid,
+            np.abs(sample["pred"] - sample["gt"]),
+        )
+
+        event_image = axes[0, column].imshow(
+            event_activity,
+            cmap="gray",
+            vmin=0.0,
+            vmax=event_vmax,
+        )
+        depth_image = axes[1, column].imshow(
+            gt,
+            cmap=depth_cmap,
+            vmin=depth_vmin,
+            vmax=depth_vmax,
+        )
+        axes[2, column].imshow(
+            pred,
+            cmap=depth_cmap,
+            vmin=depth_vmin,
+            vmax=depth_vmax,
+        )
+        error_image = axes[3, column].imshow(
+            error,
+            cmap=error_cmap,
+            vmin=0.0,
+            vmax=error_vmax,
+        )
+        for row in range(4):
+            axes[row, column].set_xticks([])
+            axes[row, column].set_yticks([])
+
+    if event_image is not None:
+        event_colorbar = figure.colorbar(
+            event_image,
+            ax=axes[0, :].ravel().tolist(),
+            fraction=0.012,
+            pad=0.01,
+            aspect=50,
+            shrink=0.49,
+        )
+        event_colorbar.set_ticks(np.linspace(0.0, event_vmax, 3))
+    if depth_image is not None:
+        depth_colorbar = figure.colorbar(
+            depth_image,
+            ax=axes[1:3, :].ravel().tolist(),
+            fraction=0.014,
+            pad=0.01,
+            aspect=45,
+            shrink=0.54,
+        )
+        depth_colorbar.set_ticks(np.linspace(depth_vmin, depth_vmax, 4))
+    if error_image is not None:
+        error_colorbar = figure.colorbar(
+            error_image,
+            ax=axes[3, :].ravel().tolist(),
+            fraction=0.012,
+            pad=0.01,
+            aspect=50,
+            shrink=0.49,
+        )
+        error_colorbar.set_ticks(np.linspace(0.0, error_vmax, 3))
+
+    figure.savefig(output_dir / "qualitative_depth_results.png", dpi=220)
+    plt.close(figure)
+
+
+def _plot_selected_frames_overview(
+    output_dir: Path,
+    samples: list[dict[str, Any]],
+    include_error: bool = True,
+) -> None:
+    """Plot the selected-frame modalities for each requested frame."""
+    if not samples:
+        return
+
+    plt, _sns = _setup_seaborn_plotting()
+    if include_error:
+        depth_cmap = plt.get_cmap("turbo").copy()
+        depth_cmap.set_bad("black")
+        error_cmap = plt.get_cmap("magma").copy()
+        error_cmap.set_bad("black")
+
+        displayed_depth_values = []
+        for sample in samples:
+            gt_valid = sample["lower_cube_valid"].astype(bool, copy=False)
+            prediction_valid = sample["prediction_workspace_mask"].astype(
+                bool, copy=False
+            )
+            displayed_depth_values.extend(
+                (
+                    sample["gt"][gt_valid & np.isfinite(sample["gt"])],
+                    sample["pred"][
+                        prediction_valid & np.isfinite(sample["pred"])
+                    ],
+                )
+            )
+        displayed_depth_values = [
+            values for values in displayed_depth_values if values.size
+        ]
+        if displayed_depth_values:
+            all_depth_values_cm = 100.0 * np.concatenate(displayed_depth_values)
+            depth_vmin_cm = float(math.floor(all_depth_values_cm.min()))
+            depth_vmax_cm = float(math.ceil(all_depth_values_cm.max()))
+        else:
+            depth_vmin_cm = float(math.floor(100.0 * DEPTH_MIN))
+            depth_vmax_cm = float(math.ceil(100.0 * D_MAX))
+        if depth_vmax_cm <= depth_vmin_cm:
+            depth_vmax_cm = depth_vmin_cm + 1.0
+
+        figure, axes = plt.subplots(
+            2 * len(samples),
+            2,
+            figsize=(10.0, 7.0 * len(samples)),
+            squeeze=False,
+            constrained_layout=True,
+        )
+
+        for sample_index, sample in enumerate(samples):
+            top_row = 2 * sample_index
+            bottom_row = top_row + 1
+            event_axis = axes[top_row, 0]
+            gt_axis = axes[top_row, 1]
+            prediction_axis = axes[bottom_row, 0]
+            error_axis = axes[bottom_row, 1]
+
+            event_activity = np.abs(sample["events"]).sum(axis=0)
+            active_values = event_activity[event_activity > 0.0]
+            event_vmax = (
+                max(float(np.percentile(active_values, 99.0)), 1e-6)
+                if active_values.size
+                else 1.0
+            )
+            event_axis.imshow(
+                event_activity,
+                cmap="gray",
+                vmin=0.0,
+                vmax=event_vmax,
+            )
+
+            gt_valid = sample["lower_cube_valid"].astype(bool, copy=False)
+            prediction_valid = sample["prediction_workspace_mask"].astype(
+                bool, copy=False
+            )
+            gt_cm = np.ma.masked_where(~gt_valid, 100.0 * sample["gt"])
+            prediction_cm = np.ma.masked_where(
+                ~prediction_valid,
+                100.0 * sample["pred"],
+            )
+            depth_image = gt_axis.imshow(
+                gt_cm,
+                cmap=depth_cmap,
+                vmin=depth_vmin_cm,
+                vmax=depth_vmax_cm,
+            )
+            prediction_axis.imshow(
+                prediction_cm,
+                cmap=depth_cmap,
+                vmin=depth_vmin_cm,
+                vmax=depth_vmax_cm,
+            )
+
+            absolute_error_cm = 100.0 * np.abs(
+                sample["pred"] - sample["gt"]
+            )
+            error_cm = np.ma.masked_where(~gt_valid, absolute_error_cm)
+            valid_error_values_cm = absolute_error_cm[gt_valid]
+            raw_error_vmax_cm = (
+                max(
+                    float(np.percentile(valid_error_values_cm, 99.0)),
+                    0.1,
+                )
+                if valid_error_values_cm.size
+                else 10.0
+            )
+            error_vmax_cm = math.ceil(10.0 * raw_error_vmax_cm) / 10.0
+            error_image = error_axis.imshow(
+                error_cm,
+                cmap=error_cmap,
+                vmin=0.0,
+                vmax=error_vmax_cm,
+            )
+
+            for axis in (
+                event_axis,
+                gt_axis,
+                prediction_axis,
+                error_axis,
+            ):
+                axis.set_xticks([])
+                axis.set_yticks([])
+                axis.set_facecolor("black")
+
+            depth_colorbar = figure.colorbar(
+                depth_image,
+                ax=gt_axis,
+                orientation="vertical",
+                location="right",
+                fraction=0.046,
+                pad=0.025,
+                aspect=25,
+                shrink=0.75,
+            )
+            depth_colorbar.set_ticks(
+                np.linspace(depth_vmin_cm, depth_vmax_cm, 3)
+            )
+
+            error_colorbar = figure.colorbar(
+                error_image,
+                ax=error_axis,
+                orientation="vertical",
+                location="right",
+                fraction=0.046,
+                pad=0.025,
+                aspect=25,
+                shrink=0.75,
+            )
+            error_colorbar.set_ticks(np.linspace(0.0, error_vmax_cm, 3))
+
+        figure.savefig(
+            output_dir / "selected_frames_overview.png",
+            dpi=220,
+        )
+        plt.close(figure)
+        return
+
+    column_count = 4 if include_error else 3
+    figure, axes = plt.subplots(
+        len(samples),
+        column_count,
+        figsize=((15.5 if include_error else 11.8), 4.4 * len(samples)),
+        squeeze=False,
+        constrained_layout=True,
+    )
+
+    depth_cmap = plt.get_cmap("turbo").copy()
+    depth_cmap.set_bad("black")
+    error_cmap = plt.get_cmap("magma").copy()
+    error_cmap.set_bad("black")
+
+    displayed_depth_values = []
+    for sample in samples:
+        gt_valid = sample["lower_cube_valid"].astype(bool, copy=False)
+        prediction_valid = sample["prediction_workspace_mask"].astype(
+            bool, copy=False
+        )
+        displayed_depth_values.extend(
+            (
+                sample["gt"][gt_valid & np.isfinite(sample["gt"])],
+                sample["pred"][prediction_valid & np.isfinite(sample["pred"])],
+            )
+        )
+    displayed_depth_values = [
+        values for values in displayed_depth_values if values.size
+    ]
+    if displayed_depth_values:
+        all_depth_values = np.concatenate(displayed_depth_values)
+        depth_vmin = float(all_depth_values.min())
+        depth_vmax = float(all_depth_values.max())
+        if depth_vmax <= depth_vmin:
+            depth_vmax = depth_vmin + 1e-3
+    else:
+        depth_vmin, depth_vmax = DEPTH_MIN, D_MAX
+
+    for row, sample in enumerate(samples):
+        event_activity = np.abs(sample["events"]).sum(axis=0)
+        active_values = event_activity[event_activity > 0.0]
+        event_vmax = (
+            max(float(np.percentile(active_values, 99.0)), 1e-6)
+            if active_values.size
+            else 1.0
+        )
+        event_image = axes[row, 0].imshow(
+            event_activity,
+            cmap="gray",
+            vmin=0.0,
+            vmax=event_vmax,
+        )
+
+        gt_valid = sample["lower_cube_valid"].astype(bool, copy=False)
+        prediction_valid = sample["prediction_workspace_mask"].astype(
+            bool, copy=False
+        )
+        gt = np.ma.masked_where(~gt_valid, sample["gt"])
+        prediction = np.ma.masked_where(~prediction_valid, sample["pred"])
+
+        depth_image = axes[row, 1].imshow(
+            gt,
+            cmap=depth_cmap,
+            vmin=depth_vmin,
+            vmax=depth_vmax,
+        )
+        axes[row, 2].imshow(
+            prediction,
+            cmap=depth_cmap,
+            vmin=depth_vmin,
+            vmax=depth_vmax,
+        )
+        if include_error:
+            absolute_error = np.abs(sample["pred"] - sample["gt"])
+            error = np.ma.masked_where(~gt_valid, absolute_error)
+            valid_error_values = absolute_error[gt_valid]
+            error_vmax = (
+                max(float(np.percentile(valid_error_values, 99.0)), 1e-3)
+                if valid_error_values.size
+                else 0.1
+            )
+            error_image = axes[row, 3].imshow(
+                error,
+                cmap=error_cmap,
+                vmin=0.0,
+                vmax=error_vmax,
+            )
+        for axis in axes[row]:
+            axis.set_xticks([])
+            axis.set_yticks([])
+            axis.set_facecolor("black")
+
+        event_colorbar = figure.colorbar(
+            event_image,
+            ax=axes[row, 0],
+            orientation="horizontal",
+            location="bottom",
+            fraction=0.0675,
+            pad=0.04,
+            aspect=30,
+            shrink=0.75,
+        )
+        event_colorbar.set_ticks(np.linspace(0.0, event_vmax, 3))
+        depth_colorbar = figure.colorbar(
+            depth_image,
+            ax=axes[row, 1:3].tolist(),
+            orientation="horizontal",
+            location="bottom",
+            fraction=0.0675,
+            pad=0.04,
+            aspect=55,
+            shrink=0.75,
+        )
+        depth_colorbar.set_ticks(np.linspace(depth_vmin, depth_vmax, 4))
+        if include_error:
+            error_colorbar = figure.colorbar(
+                error_image,
+                ax=axes[row, 3],
+                orientation="horizontal",
+                location="bottom",
+                fraction=0.0675,
+                pad=0.04,
+                aspect=30,
+                shrink=0.75,
+            )
+            error_colorbar.set_ticks(np.linspace(0.0, error_vmax, 3))
+
+    output_name = (
+        "selected_frames_overview.png"
+        if include_error
+        else "selected_frames_only_depth.png"
+    )
+    figure.savefig(output_dir / output_name, dpi=220)
+    plt.close(figure)
+
+
+def _plot_error_maps_by_region(
+    output_dir: Path,
+    samples: list[dict[str, Any]],
+) -> None:
+    """Plot whole-frame, workspace-cube, and raised-cube error maps."""
+    if not samples:
+        return
+
+    plt, _sns = _setup_seaborn_plotting()
+
+    def sequence_sort_key(sample: dict[str, Any]) -> tuple[int, Any]:
+        sequence = str(sample["sequence"])
+        return (0, int(sequence)) if sequence.isdigit() else (1, sequence)
+
+    samples = sorted(samples, key=sequence_sort_key)
+    sequence_labels = _sequence_display_map(
+        [str(sample["sequence"]) for sample in samples]
+    )
+    region_specs = (
+        ("valid", "Whole Frame"),
+        ("lower_cube_valid", "Workspace Cube"),
+        ("upper_cube_valid", "Raised Cube"),
+    )
+    figure, axes = plt.subplots(
+        len(region_specs),
+        len(samples),
+        figsize=(max(3.0 * len(samples), 8.0), 8.0),
+        squeeze=False,
+        constrained_layout=True,
+    )
+
+    whole_image_errors = [
+        np.abs(sample["pred"] - sample["gt"])[sample["valid"]]
+        for sample in samples
+        if np.any(sample["valid"])
+    ]
+    if whole_image_errors:
+        error_vmax = max(
+            float(np.percentile(np.concatenate(whole_image_errors), 99.0)),
+            1e-3,
+        )
+    else:
+        error_vmax = 0.1
+
+    error_image = None
+    for column, sample in enumerate(samples):
+        absolute_error = np.abs(sample["pred"] - sample["gt"])
+        axes[0, column].set_title(
+            f"{sequence_labels[str(sample['sequence'])]}\nFrame {sample['frame_idx']}",
+            fontsize=9,
+        )
+        for row, (mask_key, region_label) in enumerate(region_specs):
+            axis = axes[row, column]
+            region_valid = sample[mask_key].astype(bool, copy=False)
+            displayed_error = np.ma.masked_where(~region_valid, absolute_error)
+            error_image = axis.imshow(
+                displayed_error,
+                cmap="magma",
+                vmin=0.0,
+                vmax=error_vmax,
+            )
+            axis.set_facecolor("#282828")
+            mae_cm = (
+                100.0 * float(absolute_error[region_valid].mean())
+                if np.any(region_valid)
+                else math.nan
+            )
+            mae_label = f"MAE {mae_cm:.2f} cm" if math.isfinite(mae_cm) else "MAE N/A"
+            axis.text(
+                0.03,
+                0.06,
+                mae_label,
+                transform=axis.transAxes,
+                ha="left",
+                va="bottom",
+                fontsize=9,
+                color="black",
+                bbox={
+                    "boxstyle": "round,pad=0.25",
+                    "facecolor": "white",
+                    "edgecolor": "0.65",
+                    "alpha": 0.9,
+                },
+            )
+            axis.set_xticks([])
+            axis.set_yticks([])
+            if column == 0:
+                axis.set_ylabel(region_label, fontsize=10, fontweight="bold")
+
+    if error_image is not None:
+        figure.colorbar(
+            error_image,
+            ax=axes.ravel().tolist(),
+            label="Absolute Error [m] (Shared 99th-Percentile Scale)",
+            fraction=0.02,
+            pad=0.015,
+        )
+    figure.savefig(output_dir / "error_maps_by_region.png", dpi=220)
     plt.close(figure)
 
 
@@ -1958,6 +3034,9 @@ def _plot_masked_boundary_regions(
     samples = sorted(
         samples,
         key=lambda sample: (sample["sequence"], sample["frame_idx"]),
+    )
+    sequence_labels = _sequence_display_map(
+        [str(sample["sequence"]) for sample in samples]
     )
     figure, axes = plt.subplots(
         len(samples),
@@ -1991,7 +3070,7 @@ def _plot_masked_boundary_regions(
         overlay[..., 3] = np.where(spatial_mask, 0.0, 0.72)
         depth_axis.imshow(overlay)
         depth_axis.set_ylabel(
-            f"{sample['sequence']}\nframe {sample['frame_idx']}",
+            f"{sequence_labels[str(sample['sequence'])]}\nFrame {sample['frame_idx']}",
             fontsize=9,
         )
 
@@ -2006,13 +3085,13 @@ def _plot_masked_boundary_regions(
             axis.set_xticks([])
             axis.set_yticks([])
 
-    axes[0, 0].set_title("GT depth inside +1.5 cm spatial mask")
-    axes[0, 1].set_title("Pixels used by boundary metric")
+    axes[0, 0].set_title("GT Depth Inside +1.5 cm Spatial Mask")
+    axes[0, 1].set_title("Pixels Used by Boundary Metric")
     if depth_image is not None:
         figure.colorbar(
             depth_image,
             ax=axes[:, 0].tolist(),
-            label="GT depth [m]",
+            label="GT Depth [m]",
             fraction=0.025,
             pad=0.02,
         )
@@ -2021,15 +3100,15 @@ def _plot_masked_boundary_regions(
             Patch(color=region_colors["boundary"] / 255.0, label="Boundary"),
             Patch(
                 color=region_colors["non_boundary"] / 255.0,
-                label="Non-boundary",
+                label="Non-Boundary",
             ),
             Patch(
                 color=region_colors["inside_excluded"] / 255.0,
-                label="Inside mask, invalid prediction",
+                label="Inside Mask, Invalid Prediction",
             ),
             Patch(
                 color=region_colors["outside"] / 255.0,
-                label="Outside +1.5 cm mask",
+                label="Outside +1.5 cm Mask",
             ),
         ],
         loc="lower center",
@@ -2038,7 +3117,7 @@ def _plot_masked_boundary_regions(
         frameon=True,
     )
     figure.suptitle(
-        "Depth-boundary evaluation regions inside the +1.5 cm spatial mask",
+        "Depth-Boundary Evaluation Regions Inside the +1.5 cm Spatial Mask",
         fontsize=14,
         fontweight="bold",
     )
@@ -2075,9 +3154,9 @@ def _plot_spatial_mask_offset_metrics(
         ax=axis,
         color=sns.color_palette("deep")[0],
     )
-    axis.set_xlabel("Spatial-mask cube-bottom Z offset [mm]")
-    axis.set_ylabel("Depth error [mm]")
-    axis.set_title("L1 depth error under recomputed spatial masks")
+    axis.set_xlabel("Spatial-Mask Cube-Bottom Z Offset [mm]")
+    axis.set_ylabel("Depth Error [mm]")
+    axis.set_title("L1 Depth Error Under Recomputed Spatial Masks")
     figure.tight_layout()
     figure.savefig(output_dir / "spatial_mask_z_offset_metrics.png", dpi=180)
     plt.close(figure)
@@ -2095,6 +3174,9 @@ def _plot_spatial_mask_offset_overview(
     plt, _sns = _setup_seaborn_plotting()
 
     samples = sorted(samples, key=lambda sample: sample["sequence"])
+    sequence_labels = _sequence_display_map(
+        [str(sample["sequence"]) for sample in samples]
+    )
     n_rows = len(samples)
     n_cols = len(z_offsets_m)
     figure, axes = plt.subplots(
@@ -2151,12 +3233,12 @@ def _plot_spatial_mask_offset_overview(
                 )
             if col == 0:
                 axis.set_ylabel(
-                    f"{sample['sequence']}\nframe {sample['frame_idx']}",
+                    f"{sequence_labels[str(sample['sequence'])]}\nFrame {sample['frame_idx']}",
                     fontsize=9,
                 )
 
     figure.suptitle(
-        "Spatial mask Z-offset sweep: GT depth with recomputed mask overlay",
+        "Spatial Mask Z-Offset Sweep: GT Depth With Recomputed Mask Overlay",
         fontsize=12,
     )
     figure.tight_layout()
@@ -2168,6 +3250,7 @@ def _evaluate_checkpoint(
     checkpoint_path: Path,
     args: argparse.Namespace,
     device: torch.device,
+    comparison_label: str,
 ) -> dict[str, Any]:
     print(f"\nLoading checkpoint: {checkpoint_path}", flush=True)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -2195,6 +3278,7 @@ def _evaluate_checkpoint(
     num_views = int(metadata.get("num_views", 1)) if unet_model else int(
         _required_metadata(metadata, "num_views", 5)
     )
+    model_display_name = _model_display_name(unet_model, num_views)
     pose_channels = bool(metadata.get("pose_channels", False)) if unet_model else False
     recurrent_enrollment_range = int(metadata.get("recurrent_enrollment_range", 0))
     view_interval = int(_required_metadata(metadata, "view_interval", 5))
@@ -2202,6 +3286,28 @@ def _evaluate_checkpoint(
     pose_move_threshold = float(
         _required_metadata(metadata, "pose_move_threshold", 0.01)
     )
+    allow_unbalanced_pose_views = bool(
+        metadata.get(
+            "allow_fewer_pose_views",
+            metadata.get("allow_unbalanced_pose_views", False),
+        )
+    )
+    if args.pose_layout_override is not None:
+        allow_unbalanced_pose_views = args.pose_layout_override
+    if pose_view_selection:
+        policy_source = (
+            "CLI override" if args.pose_layout_override is not None else "checkpoint"
+        )
+        print(
+            "Pose-view layouts: "
+            + (
+                "up to four sources per side; missing boundary views masked"
+                if allow_unbalanced_pose_views
+                else "strictly balanced"
+            )
+            + f" ({policy_source})",
+            flush=True,
+        )
     coarse_depths = int(_required_metadata(metadata, "coarse_depths", 32))
     linear_depth_candidates = bool(
         _required_metadata(metadata, "linear_depth_candidates", False)
@@ -2213,25 +3319,70 @@ def _evaluate_checkpoint(
         raise RuntimeError(
             f"No valid sequences found at or directly under {evaluation_root}"
         )
+    selected_example_requests: list[tuple[str, int]] = []
+    if args.example_sequence is not None:
+        raw_sequence_names = [sequence_dir.name for sequence_dir in sequence_dirs]
+        display_to_raw = {
+            display.removeprefix("Sequence "): raw
+            for raw, display in _sequence_display_map(raw_sequence_names).items()
+        }
+        for requested_sequence, requested_frame in zip(
+            args.example_sequence, args.example_frame
+        ):
+            requested_sequence = str(requested_sequence)
+            if requested_sequence in raw_sequence_names:
+                resolved_sequence = requested_sequence
+            elif requested_sequence in display_to_raw:
+                resolved_sequence = display_to_raw[requested_sequence]
+            else:
+                raise ValueError(
+                    f"Unknown --example_sequence {requested_sequence!r}; use a raw "
+                    f"sequence name or a displayed index from 1 to {len(sequence_dirs)}"
+                )
+            selected_example_requests.append(
+                (resolved_sequence, int(requested_frame))
+            )
+    selected_example_request_set = set(selected_example_requests)
+    selected_frames_by_sequence: dict[str, list[int]] = {}
+    for sequence_name, frame_index in selected_example_requests:
+        selected_frames_by_sequence.setdefault(sequence_name, []).append(frame_index)
 
-    output_dir = args.results_folder / checkpoint_path.stem
+    pose_layout_indicator = _pose_layout_directory_indicator(
+        allow_unbalanced_pose_views
+    )
+    output_dir = args.results_folder / (
+        f"{pose_layout_indicator}_{checkpoint_path.stem}"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     calib = _load_event_calibration()
     depth_total = DepthAccumulator()
-    boundary_total = ErrorAccumulator()
-    non_boundary_total = ErrorAccumulator()
-    masked_boundary_total = ErrorAccumulator()
-    masked_non_boundary_total = ErrorAccumulator()
+    lower_cube_depth_total = DepthAccumulator()
+    upper_cube_depth_total = DepthAccumulator()
+    boundary_totals_by_region = {
+        domain_slug: {
+            "boundary": ErrorAccumulator(),
+            "non_boundary": ErrorAccumulator(),
+        }
+        for domain_slug, _, _, _ in PER_SEQUENCE_REGION_SPECS
+    }
     mvc_total = MVCAccumulator()
     frame_rows: list[dict[str, Any]] = []
     sequence_rows: list[dict[str, Any]] = []
-    worst_frame_by_sequence: dict[str, dict[str, Any]] = {}
+    worst_frame_by_domain = {
+        domain_slug: {}
+        for domain_slug, _, _, _ in PER_SEQUENCE_REGION_SPECS
+    }
+    qualitative_sample_by_sequence: dict[str, dict[str, Any]] = {}
+    qualitative_frames_seen: dict[str, int] = {}
+    qualitative_rng = np.random.default_rng(QUALITATIVE_RANDOM_SEED)
+    selected_example_samples: dict[tuple[str, int], dict[str, Any]] = {}
     spatial_mask_offset_samples: dict[str, dict[str, Any]] = {}
-    uncertainty_samples: list[float] = []
-    uncertainty_error_samples: list[float] = []
+    uncertainty_samples_by_domain = {
+        domain_slug: {"uncertainty": [], "error": [], "seen": 0}
+        for domain_slug, _, _, _ in PER_SEQUENCE_REGION_SPECS
+    }
     uncertainty_rng = np.random.default_rng(20260812)
-    uncertainty_seen = 0
     boundary_region_samples: list[dict[str, Any]] = []
     boundary_region_frames_seen = 0
     boundary_region_rng = np.random.default_rng(
@@ -2291,6 +3442,7 @@ def _evaluate_checkpoint(
             view_interval=view_interval,
             pose_view_selection=pose_view_selection,
             pose_move_threshold=pose_move_threshold,
+            allow_unbalanced_pose_views=allow_unbalanced_pose_views,
             coarse_depths=coarse_depths,
             linear_depth_candidates=linear_depth_candidates,
             fill_invalid=args.fill_invalid,
@@ -2301,10 +3453,23 @@ def _evaluate_checkpoint(
             crop_then_resize=args.crop_then_resize,
         )
         available_frames = len(dataset)
+        all_valid_indices = dataset.valid_indices.copy()
         if args.fast_mode > 1:
             dataset.valid_indices = dataset.valid_indices[
                 dataset.valid_indices % args.fast_mode == 0
             ]
+        requested_frames = selected_frames_by_sequence.get(sequence_dir.name, [])
+        for requested_frame in requested_frames:
+            if requested_frame not in all_valid_indices:
+                raise ValueError(
+                    f"Requested example frame {requested_frame} is not a valid "
+                    f"target for sequence {sequence_dir.name} and this checkpoint"
+                )
+        if requested_frames:
+            dataset.valid_indices = np.unique(
+                np.append(dataset.valid_indices, requested_frames)
+            )
+        if args.fast_mode > 1:
             if len(dataset) == 0:
                 print(
                     f"[{sequence_number}/{len(sequence_dirs)}] {sequence_dir.name}: "
@@ -2321,6 +3486,8 @@ def _evaluate_checkpoint(
             persistent_workers=args.workers > 0,
         )
         sequence_depth = DepthAccumulator()
+        sequence_lower_cube_depth = DepthAccumulator()
+        sequence_upper_cube_depth = DepthAccumulator()
         sequence_boundary = ErrorAccumulator()
         sequence_non_boundary = ErrorAccumulator()
         sequence_mvc = MVCAccumulator()
@@ -2361,6 +3528,9 @@ def _evaluate_checkpoint(
                 cam_mats = batch["cam_mats"].to(device, non_blocking=True)
                 K = batch["K"].to(device, non_blocking=True)
                 depth_values = batch["depth_values"].to(device, non_blocking=True)
+                view_valid_mask = batch["view_valid_mask"].to(
+                    device, non_blocking=True
+                )
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
                 timers.add("device_transfer", time.perf_counter() - t_transfer)
@@ -2370,11 +3540,22 @@ def _evaluate_checkpoint(
                 inference_start = time.perf_counter()
                 if evaluates_confidence:
                     model_output = model(
-                        imgs, cam_mats, K, depth_values, return_uncertainty=True
+                        imgs,
+                        cam_mats,
+                        K,
+                        depth_values,
+                        return_uncertainty=True,
+                        view_valid_mask=view_valid_mask,
                     )
                     prediction_norm, confidence = model_output
                 else:
-                    prediction_norm = model(imgs, cam_mats, K, depth_values)
+                    prediction_norm = model(
+                        imgs,
+                        cam_mats,
+                        K,
+                        depth_values,
+                        view_valid_mask=view_valid_mask,
+                    )
                     confidence = None
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
@@ -2398,31 +3579,6 @@ def _evaluate_checkpoint(
 
                 gt_batch = batch["dep_t"].float()
                 mask_batch = batch["mask_t"] > 0.5
-                if uncertainty_batch is not None:
-                    uncertainty_valid = (
-                        mask_batch
-                        & torch.isfinite(gt_batch)
-                        & torch.isfinite(prediction)
-                        & (gt_batch > 0.0)
-                        & (prediction > 0.0)
-                    )
-                    unc_np = uncertainty_batch[uncertainty_valid].numpy()
-                    err_np = torch.abs(prediction - gt_batch)[uncertainty_valid].numpy()
-                    if unc_np.size > 4096:
-                        selected = uncertainty_rng.choice(unc_np.size, size=4096, replace=False)
-                        unc_np, err_np = unc_np[selected], err_np[selected]
-                    for uncertainty_value, error_value in zip(unc_np, err_np):
-                        if not np.isfinite(uncertainty_value) or not np.isfinite(error_value):
-                            continue
-                        uncertainty_seen += 1
-                        if len(uncertainty_samples) < 20000:
-                            uncertainty_samples.append(float(uncertainty_value))
-                            uncertainty_error_samples.append(float(error_value))
-                        else:
-                            replacement = int(uncertainty_rng.integers(0, uncertainty_seen))
-                            if replacement < 20000:
-                                uncertainty_samples[replacement] = float(uncertainty_value)
-                                uncertainty_error_samples[replacement] = float(error_value)
                 ref_indices = batch["ref_idx"].tolist()
                 cam_batch = batch["cam_mats"][:, 0].float().numpy()
                 K_batch = batch["K"].float().numpy()
@@ -2462,6 +3618,13 @@ def _evaluate_checkpoint(
                     boundary_spatial_mask = computed_offset_masks[
                         boundary_mask_offset_index
                     ]
+                    cube_mask = depth_cube_mask(
+                        gt_np,
+                        cam_batch[index_in_batch],
+                        K_batch[index_in_batch],
+                        cube_center,
+                        cube_half_side,
+                    )
                     if sequence_dir.name not in spatial_mask_offset_samples:
                         spatial_mask_offset_samples[sequence_dir.name] = {
                             "sequence": sequence_dir.name,
@@ -2485,17 +3648,45 @@ def _evaluate_checkpoint(
 
                     depth_total.add(pred_np[valid_np], gt_np[valid_np])
                     sequence_depth.add(pred_np[valid_np], gt_np[valid_np])
+                    lower_cube_valid = valid_np & cube_mask
+                    upper_cube_valid = valid_np & boundary_spatial_mask
+                    lower_cube_depth_total.add(
+                        pred_np[lower_cube_valid], gt_np[lower_cube_valid]
+                    )
+                    upper_cube_depth_total.add(
+                        pred_np[upper_cube_valid], gt_np[upper_cube_valid]
+                    )
+                    sequence_lower_cube_depth.add(
+                        pred_np[lower_cube_valid], gt_np[lower_cube_valid]
+                    )
+                    sequence_upper_cube_depth.add(
+                        pred_np[upper_cube_valid], gt_np[upper_cube_valid]
+                    )
+                    if uncertainty_batch is not None:
+                        uncertainty_np = uncertainty_batch[
+                            index_in_batch, 0
+                        ].numpy()
+                        for domain_slug, domain_valid in (
+                            ("whole_frame", valid_np),
+                            ("workspace_cube", lower_cube_valid),
+                            ("raised_cube", upper_cube_valid),
+                        ):
+                            _add_uncertainty_reservoir_samples(
+                                uncertainty_samples_by_domain[domain_slug],
+                                uncertainty_np[domain_valid],
+                                absolute_error[domain_valid],
+                                uncertainty_rng,
+                            )
                     frame_metrics = _frame_depth_metrics(pred_np, gt_np, valid_np)
+                    lower_cube_frame_metrics = _frame_depth_metrics(
+                        pred_np, gt_np, lower_cube_valid
+                    )
+                    upper_cube_frame_metrics = _frame_depth_metrics(
+                        pred_np, gt_np, upper_cube_valid
+                    )
                     frame_mae = float(frame_metrics["mae_m"])
                     frame_worst10_mae = _worst_fraction_l1(
                         absolute_error[valid_np]
-                    )
-                    cube_mask = depth_cube_mask(
-                        gt_np,
-                        cam_batch[index_in_batch],
-                        K_batch[index_in_batch],
-                        cube_center,
-                        cube_half_side,
                     )
                     target_events = (
                         batch["imgs"][index_in_batch, 0, :NUM_BINS]
@@ -2512,60 +3703,72 @@ def _evaluate_checkpoint(
                         event_activity_image[outside_cube_mask].sum()
                     )
 
-                    previous_worst = worst_frame_by_sequence.get(sequence_dir.name)
-                    if (
-                        math.isfinite(frame_mae)
-                        and (
-                            previous_worst is None
-                            or frame_mae > previous_worst["mae_m"]
-                        )
+                    for domain_slug, domain_mae, domain_valid in (
+                        ("whole_frame", frame_mae, valid_np),
+                        (
+                            "workspace_cube",
+                            float(lower_cube_frame_metrics["mae_m"]),
+                            lower_cube_valid,
+                        ),
+                        (
+                            "raised_cube",
+                            float(upper_cube_frame_metrics["mae_m"]),
+                            upper_cube_valid,
+                        ),
                     ):
-                        worst_frame_by_sequence[sequence_dir.name] = {
+                        domain_worst = worst_frame_by_domain[domain_slug]
+                        previous_worst = domain_worst.get(sequence_dir.name)
+                        if not math.isfinite(domain_mae) or (
+                            previous_worst is not None
+                            and domain_mae <= previous_worst["mae_m"]
+                        ):
+                            continue
+                        domain_worst[sequence_dir.name] = {
                             "sequence": sequence_dir.name,
                             "frame_idx": int(ref_indices[index_in_batch]),
-                            "mae_m": frame_mae,
-                            "events": (
-                                batch["imgs"][index_in_batch, 0, :NUM_BINS]
-                                .float()
-                                .numpy()
-                                .copy()
-                            ),
+                            "mae_m": domain_mae,
+                            "events": target_events.copy(),
                             "gt": gt_np.copy(),
                             "pred": pred_np.copy(),
-                            "valid": valid_np.copy(),
+                            "valid": domain_valid.copy(),
                         }
 
-                    gt_defined_t = torch.isfinite(gt_t) & (gt_t > 0.0)
-                    boundary_mask, non_boundary_mask = _boundary_masks(
-                        gt_defined_t,
-                        valid_t,
-                        dilation_px=args.boundary_dilation,
-                    )
                     error_np = np.abs(pred_np - gt_np)
-                    boundary_np = boundary_mask.numpy()
-                    non_boundary_np = non_boundary_mask.numpy()
-                    boundary_total.add(error_np[boundary_np])
-                    non_boundary_total.add(error_np[non_boundary_np])
+                    boundary_masks_by_region: dict[
+                        str, tuple[np.ndarray, np.ndarray]
+                    ] = {}
+                    for domain_slug, domain_valid in (
+                        ("whole_frame", valid_np),
+                        ("workspace_cube", lower_cube_valid),
+                        ("raised_cube", upper_cube_valid),
+                    ):
+                        domain_valid_t = torch.from_numpy(domain_valid)
+                        boundary_mask, non_boundary_mask = _boundary_masks(
+                            domain_valid_t,
+                            domain_valid_t,
+                            dilation_px=args.boundary_dilation,
+                        )
+                        boundary_np = boundary_mask.numpy()
+                        non_boundary_np = non_boundary_mask.numpy()
+                        boundary_masks_by_region[domain_slug] = (
+                            boundary_np,
+                            non_boundary_np,
+                        )
+                        boundary_totals_by_region[domain_slug]["boundary"].add(
+                            error_np[boundary_np]
+                        )
+                        boundary_totals_by_region[domain_slug]["non_boundary"].add(
+                            error_np[non_boundary_np]
+                        )
+
+                    boundary_np, non_boundary_np = boundary_masks_by_region[
+                        "whole_frame"
+                    ]
                     sequence_boundary.add(error_np[boundary_np])
                     sequence_non_boundary.add(error_np[non_boundary_np])
 
-                    masked_valid_t = torch.from_numpy(
-                        measured_prediction_valid & boundary_spatial_mask
-                    )
-                    masked_domain_t = torch.from_numpy(
-                        (np.isfinite(gt_np) & (gt_np > 0.0))
-                        & boundary_spatial_mask
-                    )
-                    masked_boundary_mask, masked_non_boundary_mask = _boundary_masks(
-                        masked_domain_t,
-                        masked_valid_t,
-                        dilation_px=args.boundary_dilation,
-                    )
-                    masked_boundary_np = masked_boundary_mask.numpy()
-                    masked_non_boundary_np = masked_non_boundary_mask.numpy()
-                    masked_boundary_total.add(error_np[masked_boundary_np])
-                    masked_non_boundary_total.add(
-                        error_np[masked_non_boundary_np]
+                    masked_boundary_np, masked_non_boundary_np = (
+                        boundary_masks_by_region["raised_cube"]
                     )
 
                     boundary_region_frames_seen += 1
@@ -2632,10 +3835,65 @@ def _evaluate_checkpoint(
                         position = pose_motion["position_m"][pose_idx]
                         rotation = pose_motion["rotation_xyz_deg"][pose_idx]
                         arm_speed = float(pose_motion["speed_m_s"][pose_idx])
+                        normalized_time = float(
+                            pose_motion["normalized_time"][pose_idx]
+                        )
                     else:
                         position = np.full(3, np.nan, dtype=np.float64)
                         rotation = np.full(3, np.nan, dtype=np.float64)
                         arm_speed = math.nan
+                        normalized_time = (
+                            pose_idx / (dataset.n_frames - 1)
+                            if dataset.n_frames > 1
+                            else 0.0
+                        )
+
+                    # Reservoir sampling selects one evaluated frame uniformly
+                    # at random for each sequence without retaining all frames.
+                    qualitative_frames_seen[sequence_dir.name] = (
+                        qualitative_frames_seen.get(sequence_dir.name, 0) + 1
+                    )
+                    if qualitative_rng.integers(
+                        0, qualitative_frames_seen[sequence_dir.name]
+                    ) == 0:
+                        qualitative_sample_by_sequence[sequence_dir.name] = {
+                            "sequence": sequence_dir.name,
+                            "frame_idx": current.frame_idx,
+                            "normalized_time": normalized_time,
+                            "events": target_events.copy(),
+                            "gt": gt_np.copy(),
+                            "pred": pred_np.copy(),
+                            "valid": valid_np.copy(),
+                            "prediction_workspace_mask": depth_cube_mask(
+                                pred_np,
+                                cam_batch[index_in_batch],
+                                K_batch[index_in_batch],
+                                cube_center,
+                                cube_half_side,
+                            ),
+                            "lower_cube_valid": lower_cube_valid.copy(),
+                            "upper_cube_valid": upper_cube_valid.copy(),
+                        }
+                    selected_example_key = (
+                        sequence_dir.name,
+                        current.frame_idx,
+                    )
+                    if selected_example_key in selected_example_request_set:
+                        selected_example_samples[selected_example_key] = {
+                            "sequence": sequence_dir.name,
+                            "frame_idx": current.frame_idx,
+                            "events": target_events.copy(),
+                            "gt": gt_np.copy(),
+                            "pred": pred_np.copy(),
+                            "prediction_workspace_mask": depth_cube_mask(
+                                pred_np,
+                                cam_batch[index_in_batch],
+                                K_batch[index_in_batch],
+                                cube_center,
+                                cube_half_side,
+                            ),
+                            "lower_cube_valid": lower_cube_valid.copy(),
+                        }
                     T_world_from_cam = np.linalg.inv(
                         current.T_cam_from_world.astype(np.float64)
                     )
@@ -2648,7 +3906,17 @@ def _evaluate_checkpoint(
                         {
                             "sequence": sequence_dir.name,
                             "frame_idx": current.frame_idx,
+                            "normalized_time": normalized_time,
+                            "recording_frames": dataset.n_frames,
                             **frame_metrics,
+                            **{
+                                f"lower_cube_{name}": value
+                                for name, value in lower_cube_frame_metrics.items()
+                            },
+                            **{
+                                f"upper_cube_{name}": value
+                                for name, value in upper_cube_frame_metrics.items()
+                            },
                             "worst10_mae_m": frame_worst10_mae,
                             "boundary_pixels": int(boundary_np.sum()),
                             "boundary_mae_m": (
@@ -2711,6 +3979,8 @@ def _evaluate_checkpoint(
                     )
 
         sequence_metrics = sequence_depth.metrics()
+        sequence_lower_cube_metrics = sequence_lower_cube_depth.metrics()
+        sequence_upper_cube_metrics = sequence_upper_cube_depth.metrics()
         sequence_frame_rows = [
             row for row in frame_rows if row["sequence"] == sequence_dir.name
         ]
@@ -2725,6 +3995,14 @@ def _evaluate_checkpoint(
                 "sequence": sequence_dir.name,
                 "frames": len(dataset),
                 **sequence_metrics,
+                **{
+                    f"lower_cube_{name}": value
+                    for name, value in sequence_lower_cube_metrics.items()
+                },
+                **{
+                    f"upper_cube_{name}": value
+                    for name, value in sequence_upper_cube_metrics.items()
+                },
                 "boundary_mae_m": sequence_boundary.metrics()["mae_m"],
                 "boundary_rmse_m": sequence_boundary.metrics()["rmse_m"],
                 "non_boundary_mae_m": sequence_non_boundary.metrics()["mae_m"],
@@ -2802,11 +4080,17 @@ def _evaluate_checkpoint(
             ),
         },
         "model_configuration": {
+            "checkpoint": str(checkpoint_path),
+            "comparison_label": comparison_label,
+            "architecture_label": model_display_name,
             "model_arch": model_arch,
             "num_views": num_views,
             "view_interval": view_interval,
             "pose_view_selection": pose_view_selection,
             "pose_move_threshold_m": pose_move_threshold,
+            "allow_unbalanced_pose_views": allow_unbalanced_pose_views,
+            "allow_fewer_pose_views": allow_unbalanced_pose_views,
+            "pose_layout_cli_override": args.pose_layout_override,
             "coarse_depths": coarse_depths,
             "linear_depth_candidates": linear_depth_candidates,
             "fine_depths": metadata.get("fine_depths"),
@@ -2842,6 +4126,26 @@ def _evaluate_checkpoint(
             ),
             "cube_center_world_m": cube_center.tolist(),
             "cube_side_m": args.cube_side,
+            "depth_metric_regions": {
+                "whole_image": "all valid evaluated depth pixels",
+                "lower_cube": {
+                    "description": "table and object",
+                    "center_world_m": cube_center.tolist(),
+                    "bottom_z_m": float(cube_center[2] - cube_half_side),
+                    "side_m": args.cube_side,
+                },
+                "upper_cube": {
+                    "description": "object only; raised to exclude the table",
+                    "center_world_m": [
+                        args.target_x,
+                        args.target_y,
+                        float(BOUNDARY_SPATIAL_MASK_OFFSET_M + cube_half_side),
+                    ],
+                    "bottom_z_m": BOUNDARY_SPATIAL_MASK_OFFSET_M,
+                    "side_m": args.cube_side,
+                },
+                "mask_source": "measured GT depth backprojected to world coordinates",
+            },
             "spatial_mask_offset_min_m": float(spatial_mask_z_offsets_m[0]),
             "spatial_mask_offset_max_m": float(spatial_mask_z_offsets_m[-1]),
             "spatial_mask_offset_steps": args.spatial_mask_offset_steps,
@@ -2853,16 +4157,37 @@ def _evaluate_checkpoint(
             ),
             "spatial_mask_vertical_shift_m": SPATIAL_MASK_VERTICAL_SHIFT_M,
         },
+        # Keep the historical whole-image key for downstream compatibility.
         "depth_metrics": depth_total.metrics(),
+        "depth_metrics_by_region": {
+            "whole_image": depth_total.metrics(),
+            "lower_cube": lower_cube_depth_total.metrics(),
+            "upper_cube": upper_cube_depth_total.metrics(),
+        },
+        "boundary_metrics_by_region": {
+            domain_slug: {
+                region: accumulator.metrics()
+                for region, accumulator in region_accumulators.items()
+            }
+            for domain_slug, region_accumulators in (
+                boundary_totals_by_region.items()
+            )
+        },
         "boundary_metrics": {
-            "boundary": boundary_total.metrics(),
-            "non_boundary": non_boundary_total.metrics(),
+            region: accumulator.metrics()
+            for region, accumulator in boundary_totals_by_region[
+                "whole_frame"
+            ].items()
         },
         "boundary_metrics_spatial_mask_plus_1cm": {
             "z_offset_m": BOUNDARY_SPATIAL_MASK_OFFSET_M,
             "offset_definition": "world-frame cube-bottom Z",
-            "boundary": masked_boundary_total.metrics(),
-            "non_boundary": masked_non_boundary_total.metrics(),
+            "boundary": boundary_totals_by_region["raised_cube"][
+                "boundary"
+            ].metrics(),
+            "non_boundary": boundary_totals_by_region["raised_cube"][
+                "non_boundary"
+            ].metrics(),
         },
         "multiview_consistency": mvc_total.metrics(),
         "cube_event_activity_vs_error": activity_summary,
@@ -2872,6 +4197,7 @@ def _evaluate_checkpoint(
     t_output_writing = time.perf_counter()
     _write_csv(output_dir / "per_frame_metrics.csv", frame_rows)
     _write_csv(output_dir / "per_sequence_metrics.csv", sequence_rows)
+    _write_csv(output_dir / "depth_metrics_by_region.csv", _depth_region_rows(summary))
     _write_csv(
         output_dir / "spatial_mask_z_offset_metrics.csv",
         spatial_mask_offset_rows,
@@ -2884,6 +4210,14 @@ def _evaluate_checkpoint(
 
     t_plotting = time.perf_counter()
     _plot_results(output_dir, summary, frame_rows, sequence_rows)
+    for domain_slug, domain_label, mae_field, _ in PER_SEQUENCE_REGION_SPECS:
+        _plot_normalized_time_error(
+            output_dir,
+            frame_rows,
+            domain_slug,
+            domain_label,
+            mae_field,
+        )
     _plot_spatial_mask_offset_metrics(output_dir, spatial_mask_offset_rows)
     _plot_spatial_mask_offset_overview(
         output_dir,
@@ -2891,26 +4225,88 @@ def _evaluate_checkpoint(
         spatial_mask_z_offsets_m,
     )
     _plot_masked_boundary_regions(output_dir, boundary_region_samples)
-    _plot_uncertainty_vs_prediction_error(
-        output_dir, uncertainty_samples, uncertainty_error_samples
+    for domain_slug, domain_label, _, _ in PER_SEQUENCE_REGION_SPECS:
+        domain_samples = uncertainty_samples_by_domain[domain_slug]
+        _plot_uncertainty_vs_prediction_error(
+            output_dir,
+            domain_samples["uncertainty"],
+            domain_samples["error"],
+            domain_slug,
+            domain_label,
+        )
+    qualitative_samples = list(qualitative_sample_by_sequence.values())
+    _plot_qualitative_depth_results(output_dir, qualitative_samples)
+    missing_example_requests = [
+        request
+        for request in selected_example_requests
+        if request not in selected_example_samples
+    ]
+    if missing_example_requests:
+        raise RuntimeError(
+            "Selected sequence/frame pairs were not captured during evaluation: "
+            f"{missing_example_requests}"
+        )
+    selected_example_rows = [
+        selected_example_samples[request]
+        for request in selected_example_requests
+        if request in selected_example_samples
+    ]
+    _plot_selected_frames_overview(output_dir, selected_example_rows)
+    _plot_selected_frames_overview(
+        output_dir,
+        selected_example_rows,
+        include_error=False,
     )
-    worst_frame_samples = list(worst_frame_by_sequence.values())
-    _plot_worst_frames(output_dir, worst_frame_samples)
+    _plot_error_maps_by_region(output_dir, qualitative_samples)
+    worst_frame_samples_by_domain = {}
+    for domain_slug, domain_label, _, _ in PER_SEQUENCE_REGION_SPECS:
+        domain_samples = list(worst_frame_by_domain[domain_slug].values())
+        worst_frame_samples_by_domain[domain_slug] = domain_samples
+        _plot_worst_frames(
+            output_dir,
+            domain_samples,
+            domain_slug,
+            domain_label,
+        )
     timers.add("plotting", time.perf_counter() - t_plotting)
     eval_time_rows = timers.rows(frame_count)
     _write_eval_times(output_dir, eval_time_rows, frame_count)
 
     print((output_dir / "summary.txt").read_text(encoding="utf-8"), end="")
-    if worst_frame_samples:
+    for domain_slug, domain_label, _, _ in PER_SEQUENCE_REGION_SPECS:
+        if worst_frame_samples_by_domain[domain_slug]:
+            print(
+                f"Worst-frame overview ({domain_label}): "
+                f"{(output_dir / f'worst_error_overview_{domain_slug}.png').resolve()}",
+                flush=True,
+            )
+    if qualitative_samples:
         print(
-            f"Worst-frame overview: "
-            f"{(output_dir / 'worst_error_overview.png').resolve()}",
+            f"Qualitative depth results: "
+            f"{(output_dir / 'qualitative_depth_results.png').resolve()}",
+            flush=True,
+        )
+        print(
+            f"Regional error maps: "
+            f"{(output_dir / 'error_maps_by_region.png').resolve()}",
+            flush=True,
+        )
+    if selected_example_rows:
+        print(
+            f"Selected-frames overview: "
+            f"{(output_dir / 'selected_frames_overview.png').resolve()}",
+            flush=True,
+        )
+        print(
+            f"Selected-frames depth-only overview: "
+            f"{(output_dir / 'selected_frames_only_depth.png').resolve()}",
             flush=True,
         )
     print(f"Evaluation timing: {(output_dir / 'eval_times.txt').resolve()}", flush=True)
     print(f"Results written to: {output_dir.resolve()}", flush=True)
     return {
-        "label": checkpoint_path.stem,
+        "label": comparison_label,
+        "allow_unbalanced_pose_views": allow_unbalanced_pose_views,
         "summary": summary,
         "frame_rows": frame_rows,
         "sequence_rows": sequence_rows,
@@ -2929,6 +4325,18 @@ def _parse_args() -> argparse.Namespace:
         help="One or more supported depth-model checkpoints.",
     )
     parser.add_argument(
+        "--checkpoint_label",
+        "--checkpoint-label",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional display labels paired positionally with --checkpoint. "
+            "By default, each checkpoint's full filename is used, keeping "
+            "different MVS pipelines distinct in comparison tables and plots."
+        ),
+    )
+    parser.add_argument(
         "--data_dir",
         type=Path,
         default=Path("../data/real/eval"),
@@ -2941,7 +4349,19 @@ def _parse_args() -> argparse.Namespace:
         "--results_folder",
         type=Path,
         default=Path("results"),
-        help="Root output directory. Each checkpoint gets its own subdirectory.",
+        help=(
+            "Root output directory. Each checkpoint gets a policy-prefixed "
+            "subdirectory."
+        ),
+    )
+    parser.add_argument(
+        "--comparison_name",
+        type=str,
+        default="",
+        help=(
+            "Optional folder name for multi-checkpoint comparison results. "
+            "An empty value uses the policy-derived default name."
+        ),
     )
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--workers", type=int, default=4)
@@ -2953,6 +4373,26 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Evaluate only target frames whose original frame index is divisible "
             "by N; source views required by each selected target are still loaded."
+        ),
+    )
+    parser.add_argument(
+        "--example_sequence",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Sequences used for selected_frames_overview.png. Each entry accepts "
+            "either a raw sequence-directory name or its displayed 1-based index."
+        ),
+    )
+    parser.add_argument(
+        "--example_frame",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "Original frame indices paired positionally with --example_sequence. "
+            "Selected frames are evaluated even when --fast_mode would omit them."
         ),
     )
     parser.add_argument(
@@ -2970,6 +4410,26 @@ def _parse_args() -> argparse.Namespace:
         "--crop_then_resize", "--crop-then-resize", action="store_true",
         help="Evaluate data precomputed with native crop followed by resize.",
     )
+    pose_layout_group = parser.add_mutually_exclusive_group()
+    pose_layout_group.add_argument(
+        "--allow_fewer_pose_views",
+        "--allow-fewer-pose-views",
+        "--allow_unbalanced_pose_views",
+        "--allow-unbalanced-pose-views",
+        dest="pose_layout_override",
+        action="store_const",
+        const=True,
+        help="Override the checkpoint and allow fewer masked source views at boundaries.",
+    )
+    pose_layout_group.add_argument(
+        "--strict_balanced_pose_views",
+        "--strict-balanced-pose-views",
+        dest="pose_layout_override",
+        action="store_const",
+        const=False,
+        help="Override the checkpoint and require balanced pose-view layouts.",
+    )
+    parser.set_defaults(pose_layout_override=None)
     parser.add_argument(
         "--boundary_threshold",
         type=float,
@@ -3052,6 +4512,18 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--workers must be >= 0")
     if args.fast_mode <= 0:
         parser.error("--fast_mode must be > 0")
+    if (args.example_sequence is None) != (args.example_frame is None):
+        parser.error(
+            "--example_sequence and --example_frame must be provided together"
+        )
+    if args.example_sequence is not None:
+        if len(args.example_sequence) != len(args.example_frame):
+            parser.error(
+                "--example_sequence and --example_frame must contain the same "
+                "number of entries"
+            )
+        if any(frame < 0 for frame in args.example_frame):
+            parser.error("all --example_frame values must be >= 0")
     if args.boundary_dilation < 0:
         parser.error("--boundary_dilation must be >= 0")
     if args.mvc_frame_offset <= 0:
@@ -3069,6 +4541,21 @@ def _parse_args() -> argparse.Namespace:
     for checkpoint in args.checkpoint:
         if not checkpoint.is_file():
             parser.error(f"Checkpoint does not exist: {checkpoint}")
+    if args.checkpoint_label is not None:
+        if len(args.checkpoint_label) != len(args.checkpoint):
+            parser.error(
+                "--checkpoint_label must contain exactly one label per --checkpoint"
+            )
+        if any(not label.strip() for label in args.checkpoint_label):
+            parser.error("--checkpoint_label entries must not be empty")
+        if len(set(args.checkpoint_label)) != len(args.checkpoint_label):
+            parser.error("--checkpoint_label entries must be unique")
+    if args.comparison_name:
+        comparison_name = Path(args.comparison_name)
+        if comparison_name.is_absolute() or len(comparison_name.parts) != 1:
+            parser.error("--comparison_name must be a single folder name")
+        if args.comparison_name in {".", ".."}:
+            parser.error("--comparison_name must not be '.' or '..'")
     return args
 
 
@@ -3083,12 +4570,35 @@ def main() -> None:
 
     args.results_folder.mkdir(parents=True, exist_ok=True)
     print(f"Device: {device}")
+    comparison_labels = (
+        args.checkpoint_label
+        if args.checkpoint_label is not None
+        else [checkpoint_path.name for checkpoint_path in args.checkpoint]
+    )
+    if len(set(comparison_labels)) != len(comparison_labels):
+        raise RuntimeError(
+            "Checkpoint filenames are not unique. Use --checkpoint_label to "
+            "supply distinct labels for this comparison."
+        )
     runs = [
-        _evaluate_checkpoint(checkpoint_path, args, device)
-        for checkpoint_path in args.checkpoint
+        _evaluate_checkpoint(checkpoint_path, args, device, comparison_label)
+        for checkpoint_path, comparison_label in zip(
+            args.checkpoint, comparison_labels
+        )
     ]
     if len(runs) > 1:
-        comparison_dir = args.results_folder / "comparison"
+        comparison_policies = {
+            bool(run["allow_unbalanced_pose_views"]) for run in runs
+        }
+        if len(comparison_policies) == 1:
+            comparison_indicator = _pose_layout_directory_indicator(
+                comparison_policies.pop()
+            )
+        else:
+            comparison_indicator = "unbalanced_pose_views_mixed"
+        comparison_dir = args.results_folder / (
+            args.comparison_name or f"{comparison_indicator}_comparison"
+        )
         _write_comparison_results(comparison_dir, runs)
         print(f"Comparison written to: {comparison_dir.resolve()}", flush=True)
 

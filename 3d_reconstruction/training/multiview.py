@@ -58,6 +58,7 @@ from tensorboard_helper import (
     VizLogger,
 )
 from preprocessing_geometry import transform_intrinsics, transform_name
+from view_selection import build_pose_view_ids, pose_layout_counts
 
 _CAM_DATA = _SCRIPT_DIR.parent / "camera_data"
 
@@ -267,6 +268,7 @@ class MultiViewTableDataset(Dataset):
         view_interval: int = 5,
         pose_view_selection: bool = False,
         pose_move_threshold: float = 0.01,
+        allow_unbalanced_pose_views: bool = True,
         coarse_depths: int = 32,
         linear_depth_candidates: bool = False,
         fill_invalid: bool = False,
@@ -299,6 +301,7 @@ class MultiViewTableDataset(Dataset):
         self.view_interval = view_interval
         self.pose_view_selection = pose_view_selection
         self.pose_move_threshold = float(pose_move_threshold)
+        self.allow_unbalanced_pose_views = bool(allow_unbalanced_pose_views)
         self.fill_invalid = fill_invalid
         self.pose_channels = bool(pose_channels)
         self.recurrent = bool(recurrent)
@@ -443,37 +446,14 @@ class MultiViewTableDataset(Dataset):
         t = T_cam_from_world[:, :3, 3]
         return -np.einsum("nij,nj->ni", np.transpose(R, (0, 2, 1)), t).astype(np.float32)
 
-    def _find_pose_neighbours(
-        self,
-        idx: int,
-        direction: int,
-        per_direction: int,
-        move_threshold: float,
-    ) -> list[int] | None:
-        neighbours: list[int] = []
-        anchor = idx
-        cursor = idx + direction
-        while 0 <= cursor < self.n_frames and len(neighbours) < per_direction:
-            moved = np.linalg.norm(self.cam_centers_world[cursor] - self.cam_centers_world[anchor])
-            if moved >= move_threshold:
-                neighbours.append(cursor)
-                anchor = cursor
-            cursor += direction
-        if len(neighbours) != per_direction:
-            return None
-        return neighbours
-
     def _make_pose_view_ids(self, num_views: int, move_threshold: float) -> np.ndarray:
-        per_direction = (num_views - 1) // 2
-        valid: list[int] = []
-        for idx in range(self.n_frames):
-            before = self._find_pose_neighbours(idx, -1, per_direction, move_threshold)
-            after = self._find_pose_neighbours(idx, 1, per_direction, move_threshold)
-            if before is None or after is None:
-                continue
-            self.pose_view_ids[idx] = [idx] + before + after
-            valid.append(idx)
-        return np.array(valid, dtype=np.int64)
+        self.pose_view_ids, valid = build_pose_view_ids(
+            self.cam_centers_world,
+            num_views,
+            move_threshold,
+            self.allow_unbalanced_pose_views,
+        )
+        return valid
 
     def _open(self) -> None:
         import h5py
@@ -523,13 +503,20 @@ class MultiViewTableDataset(Dataset):
         eye = torch.eye(3, dtype=axis_angle.dtype, device=axis_angle.device)
         return eye + torch.sin(theta) * K + (1.0 - torch.cos(theta)) * (K @ K)
 
-    def _apply_source_view_dropout(self, imgs: torch.Tensor) -> torch.Tensor:
+    def _apply_source_view_dropout(
+        self,
+        imgs: torch.Tensor,
+        view_valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
         if imgs.shape[0] <= 1:
             return imgs
         p = self.aug.source_view_dropout_prob
-        drop = torch.rand(imgs.shape[0] - 1) < p
-        if len(drop) > 1 and drop.all():
-            drop[torch.randint(0, len(drop), (1,)).item()] = False
+        source_valid = view_valid_mask[1:].bool()
+        drop = (torch.rand(imgs.shape[0] - 1) < p) & source_valid
+        valid_indices = torch.nonzero(source_valid, as_tuple=False).flatten()
+        if len(valid_indices) > 0 and drop[source_valid].all():
+            keep_idx = valid_indices[torch.randint(0, len(valid_indices), (1,)).item()]
+            drop[keep_idx] = False
         # Drop only source event measurements.  The table-plane channel is a
         # deterministic geometric input and should not disappear with events.
         source_events = imgs[1:, :NUM_BINS]
@@ -587,13 +574,14 @@ class MultiViewTableDataset(Dataset):
         self,
         imgs: torch.Tensor,
         cam_mats: torch.Tensor,
+        view_valid_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.aug.enabled:
             return imgs, cam_mats
         imgs = imgs.clone()
         cam_mats = cam_mats.clone()
         if self.aug.source_view_dropout:
-            imgs = self._apply_source_view_dropout(imgs)
+            imgs = self._apply_source_view_dropout(imgs, view_valid_mask)
         if self.aug.pose_noise:
             cam_mats = self._apply_pose_noise(cam_mats)
         if self.aug.event_noise_per_view:
@@ -616,7 +604,19 @@ class MultiViewTableDataset(Dataset):
         else:
             view_ids = [idx] + [idx + o for o in self.src_offsets]
 
-        imgs = torch.stack([self._load_input(i) for i in view_ids], dim=0)
+        target_input = self._load_input(idx)
+        imgs = torch.stack(
+            [
+                target_input if view_idx == idx else
+                self._load_input(view_idx) if view_idx >= 0 else
+                torch.zeros_like(target_input)
+                for view_idx in view_ids
+            ],
+            dim=0,
+        )
+        view_valid_mask = torch.tensor(
+            [view_idx >= 0 for view_idx in view_ids], dtype=torch.bool
+        )
         _, _, h, w = imgs.shape
 
         dep = self._dep[idx].astype(np.float32)
@@ -635,8 +635,16 @@ class MultiViewTableDataset(Dataset):
             dep_t = torch.where(msk_t > 0.5, dep_t, tbl_m)
             msk_t = torch.ones_like(msk_t)
 
-        cam_mats = torch.from_numpy(np.stack([self.T_cam_from_world[i] for i in view_ids]))
-        imgs, cam_mats = self._apply_augmentations(imgs, cam_mats)
+        cam_mats = torch.from_numpy(
+            np.stack([
+                self.T_cam_from_world[view_idx]
+                if view_idx >= 0 else self.T_cam_from_world[idx]
+                for view_idx in view_ids
+            ])
+        )
+        imgs, cam_mats = self._apply_augmentations(
+            imgs, cam_mats, view_valid_mask
+        )
         return {
             "imgs": imgs,
             "cam_mats": cam_mats,
@@ -646,6 +654,7 @@ class MultiViewTableDataset(Dataset):
             "mask_t": msk_t,
             "ref_idx": torch.tensor(idx, dtype=torch.long),
             "view_ids": torch.tensor(view_ids, dtype=torch.long),
+            "view_valid_mask": view_valid_mask,
         }
 
 
@@ -755,6 +764,7 @@ class FeaturePyramid(nn.Module):
         drop_path: float = 0.0,
         middle_feature_ch: int = 0,
         fine_feature_ch: int = 0,
+        lateral_convolutions: bool = True,
     ):
         super().__init__()
         self.feature_ch = feature_ch
@@ -762,6 +772,7 @@ class FeaturePyramid(nn.Module):
             raise ValueError("FPN feature-channel overrides must be >= 0")
         self.middle_ch = middle_feature_ch or max(16, feature_ch // 2)
         self.fine_ch = fine_feature_ch or max(8, feature_ch // 4)
+        self.lateral_convolutions = bool(lateral_convolutions)
 
         # Bottom-up residual hierarchy (H/2, H/4, H/8), followed by
         # lateral/top-down fusion. Each map drives one cascade stage.
@@ -775,21 +786,44 @@ class FeaturePyramid(nn.Module):
         self.casmvs_half = _residual2d_stage(c0, c1, 3, stride=2)
         self.casmvs_quarter = _residual2d_stage(c1, c2, 4, stride=2)
         self.casmvs_eighth = _residual2d_stage(c2, c3, 6, stride=2)
-        self.casmvs_lateral_quarter = nn.Conv2d(c2, c3, 1, bias=False)
-        self.casmvs_lateral_half = nn.Conv2d(c1, c2, 1, bias=False)
+
+        if self.lateral_convolutions:
+            # Original FPN: project the lateral maps up to the coarser width.
+            self.casmvs_lateral_quarter = nn.Conv2d(c2, c3, 1, bias=False)
+            self.casmvs_lateral_half = nn.Conv2d(c1, c2, 1, bias=False)
+            self.casmvs_middle_reduce = nn.Identity()
+            middle_fused_ch = c3
+            self.casmvs_fine_reduce = nn.Conv2d(c3, c2, 1, bias=False)
+            fine_fused_ch = c2
+        else:
+            # Reduced-width FPN: preserve the lateral maps and project only
+            # the top-down path before element-wise addition.
+            if self.middle_ch != c2 or self.fine_ch != c1:
+                raise ValueError(
+                    "--no_fpn_lateral_convolutions requires the middle and "
+                    f"fine feature widths to match the bottom-up hierarchy "
+                    f"({c2} and {c1} channels), but received "
+                    f"{self.middle_ch} and {self.fine_ch}"
+                )
+            self.casmvs_lateral_quarter = nn.Identity()
+            self.casmvs_lateral_half = nn.Identity()
+            self.casmvs_middle_reduce = nn.Conv2d(c3, c2, 1, bias=False)
+            middle_fused_ch = c2
+            self.casmvs_fine_reduce = nn.Conv2d(c2, c1, 1, bias=False)
+            fine_fused_ch = c1
+
         self.casmvs_coarse_out = nn.Sequential(
             nn.Conv2d(c3, feature_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(feature_ch),
             nn.ReLU(inplace=True),
         )
         self.casmvs_middle_out = nn.Sequential(
-            nn.Conv2d(c3, self.middle_ch, 3, padding=1, bias=False),
+            nn.Conv2d(middle_fused_ch, self.middle_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(self.middle_ch),
             nn.ReLU(inplace=True),
         )
-        self.casmvs_fine_reduce = nn.Conv2d(c3, c2, 1, bias=False)
         self.casmvs_fine_out = nn.Sequential(
-            nn.Conv2d(c2, self.fine_ch, 3, padding=1, bias=False),
+            nn.Conv2d(fine_fused_ch, self.fine_ch, 3, padding=1, bias=False),
             nn.BatchNorm2d(self.fine_ch),
             nn.ReLU(inplace=True),
         )
@@ -804,7 +838,12 @@ class FeaturePyramid(nn.Module):
         quarter = self.casmvs_quarter(half)
         eighth = self.casmvs_eighth(quarter)
         quarter_fused = self.casmvs_lateral_quarter(quarter) + self.fusion_drop_path(
-            F.interpolate(eighth, size=quarter.shape[-2:], mode="bilinear", align_corners=False)
+            F.interpolate(
+                self.casmvs_middle_reduce(eighth),
+                size=quarter.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
         )
         half_fused = self.casmvs_lateral_half(half) + self.fusion_drop_path(
             F.interpolate(
@@ -962,6 +1001,7 @@ class ModernMVSNet(nn.Module):
         middle_hourglass_levels: int = 2,
         middle_feature_channels: int = 0,
         fine_feature_channels: int = 0,
+        fpn_lateral_convolutions: bool = True,
         refiner_reference_input: bool = True,
         no_2d_refinement: bool = False,
     ):
@@ -1012,6 +1052,7 @@ class ModernMVSNet(nn.Module):
             drop_path=drop_path_rate,
             middle_feature_ch=middle_feature_channels,
             fine_feature_ch=fine_feature_channels,
+            lateral_convolutions=fpn_lateral_convolutions,
         )
         if self.no_2d_refinement and not self.refiner_reference_input:
             raise ValueError(
@@ -1090,6 +1131,7 @@ class ModernMVSNet(nn.Module):
             f"/{middle_cost_base}"
             f"/{fine_cost_base}  "
             f"geometry_scales={geometry_scales}  "
+            f"fpn_lateral_convolutions={self.feature.lateral_convolutions}  "
             f"refiner={refiner_summary}  "
             f"hourglass_levels_coarse/middle/fine={self.coarse_hourglass_levels}"
             f"/{self.middle_hourglass_levels}"
@@ -1137,6 +1179,7 @@ class ModernMVSNet(nn.Module):
         K: torch.Tensor,
         depth_values: torch.Tensor,
         reference_projection: nn.Module | None,
+        view_valid_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """MVSNet feature variance, including the reference as one observation."""
         B, V, C, H, W = feats.shape
@@ -1148,6 +1191,15 @@ class ModernMVSNet(nn.Module):
             (B, 1, D, H, W), device=feats.device, dtype=feats.dtype
         )
         geometric_valid_sum = torch.zeros_like(observation_count)
+        if view_valid_mask is None:
+            view_valid_mask = torch.ones(
+                (B, V), device=feats.device, dtype=torch.bool
+            )
+        elif view_valid_mask.shape != (B, V):
+            raise ValueError(
+                f"Expected view_valid_mask with shape {(B, V)}, got "
+                f"{tuple(view_valid_mask.shape)}"
+            )
 
         for view in range(1, V):
             warped, valid = homo_warp_features(
@@ -1158,6 +1210,10 @@ class ModernMVSNet(nn.Module):
                 depth_values,
                 return_valid_mask=True,
             )
+            sample_valid = view_valid_mask[:, view].to(valid.dtype).view(
+                B, 1, 1, 1, 1
+            )
+            valid = valid * sample_valid
             # Invalid samples must not be treated as zero-valued observations.
             feature_sum = feature_sum + warped * valid
             feature_sq_sum = feature_sq_sum + warped.square() * valid
@@ -1168,7 +1224,8 @@ class ModernMVSNet(nn.Module):
         feature_variance = (
             feature_sq_sum / observation_count - mean.square()
         ).clamp_min(0.0)
-        valid_ratio = geometric_valid_sum / max(V - 1, 1)
+        source_count = view_valid_mask[:, 1:].sum(dim=1).clamp_min(1).to(feats.dtype)
+        valid_ratio = geometric_valid_sum / source_count[:, None, None, None, None]
         volume_parts = [feature_variance]
         if reference_projection is not None:
             reference = reference_projection(feats[:, 0])
@@ -1243,8 +1300,18 @@ class ModernMVSNet(nn.Module):
         K: torch.Tensor,
         depth_values: torch.Tensor,
         return_uncertainty: bool = False,
+        view_valid_mask: torch.Tensor | None = None,
+        detach_confidence_inputs: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         B, V, C, H, W = imgs.shape
+        if view_valid_mask is None:
+            view_valid_mask = torch.ones(
+                (B, V), device=imgs.device, dtype=torch.bool
+            )
+        else:
+            view_valid_mask = view_valid_mask.to(device=imgs.device, dtype=torch.bool)
+        if not torch.all(view_valid_mask[:, 0]):
+            raise ValueError("The reference view must be valid for every sample")
         if depth_values.dim() == 1:
             depth_values = depth_values.unsqueeze(0).expand(B, -1)
         elif depth_values.dim() != 2:
@@ -1252,7 +1319,16 @@ class ModernMVSNet(nn.Module):
                 f"Expected global depth_values with shape (D,) or (B,D), got "
                 f"{tuple(depth_values.shape)}"
             )
-        feature_levels = self.feature(imgs.reshape(B * V, C, H, W))
+        flat_images = imgs.reshape(B * V, C, H, W)
+        flat_valid = view_valid_mask.reshape(B * V)
+        valid_indices = torch.nonzero(flat_valid, as_tuple=False).flatten()
+        valid_feature_levels = self.feature(flat_images[flat_valid])
+        feature_levels = tuple(
+            valid_features.new_zeros(
+                (B * V, *valid_features.shape[1:])
+            ).index_copy(0, valid_indices, valid_features)
+            for valid_features in valid_feature_levels
+        )
         coarse_flat, middle_flat, fine_flat = feature_levels
         middle = middle_flat.view(B, V, *middle_flat.shape[1:])
         coarse = coarse_flat.view(B, V, *coarse_flat.shape[1:])
@@ -1270,6 +1346,7 @@ class ModernMVSNet(nn.Module):
             K_coarse,
             coarse_values,
             self.coarse_reference,
+            view_valid_mask,
         )
         coarse_logits = self.coarse_cost(coarse_volume)
         coarse_prob = F.softmax(-coarse_logits.float(), dim=1).to(coarse_logits.dtype)
@@ -1290,6 +1367,7 @@ class ModernMVSNet(nn.Module):
             K_middle,
             middle_values,
             self.middle_reference,
+            view_valid_mask,
         )
         middle_logits = self.middle_cost(middle_volume)
         middle_prob = F.softmax(-middle_logits.float(), dim=1).to(
@@ -1307,6 +1385,7 @@ class ModernMVSNet(nn.Module):
             K_fine,
             fine_values,
             self.fine_reference,
+            view_valid_mask,
         )
         fine_logits = self.fine_cost(fine_volume)
         fine_prob = F.softmax(-fine_logits.float(), dim=1).to(fine_logits.dtype)
@@ -1348,6 +1427,9 @@ class ModernMVSNet(nn.Module):
             diagnostics = F.interpolate(
                 diagnostics, size=(H, W), mode="bilinear", align_corners=False
             )
+            if detach_confidence_inputs:
+                refinement_features = refinement_features.detach()
+                diagnostics = diagnostics.detach()
             confidence = torch.sigmoid(
                 self.confidence_head(
                     torch.cat([refinement_features, diagnostics], dim=1)
@@ -1379,6 +1461,7 @@ def run_epoch(
     lambda_confidence: float = 0.1,
     confidence_abs_tolerance: float = 0.01,
     confidence_rel_tolerance: float = 0.01,
+    detach_confidence_inputs: bool = False,
     ema_model=None,
 ) -> tuple[float, float, float, float]:
     is_train = optimizer is not None
@@ -1403,6 +1486,7 @@ def run_epoch(
             depth_values = batch["depth_values"].to(device, non_blocking=True)
             dep_t = batch["dep_t"].to(device, non_blocking=True)
             mask_t = batch["mask_t"].to(device, non_blocking=True)
+            view_valid_mask = batch["view_valid_mask"].to(device, non_blocking=True)
 
             dep_norm = ((dep_t - DEPTH_MIN) / (D_MAX - DEPTH_MIN)).clamp(0.0, 1.0)
             model_out = model(
@@ -1411,6 +1495,8 @@ def run_epoch(
                 K,
                 depth_values,
                 return_uncertainty=uncertainty,
+                view_valid_mask=view_valid_mask,
+                detach_confidence_inputs=detach_confidence_inputs,
             )
             pred_unc = None
             if uncertainty:
@@ -1882,6 +1968,15 @@ def main() -> None:
     parser.add_argument("--fine_feature_channels", type=int, default=0,
                         help="Three-stage FPN only: final-stage output channels; "
                              "0 uses feature_channels/4")
+    parser.add_argument(
+        "--no_fpn_lateral_convolutions",
+        action="store_true",
+        help=(
+            "Keep the H/4 and H/2 bottom-up FPN branches unchanged and "
+            "project only the top-down path before addition. The requested "
+            "middle/fine feature widths must match the bottom-up widths."
+        ),
+    )
     parser.add_argument("--fpn_dropout", type=float, default=0.0,
                         help="Dropout2d probability on FPN outputs")
     parser.add_argument("--reference_dropout", type=float, default=0.0,
@@ -1896,6 +1991,27 @@ def main() -> None:
                         help="Select balanced before/after source views by camera motion instead of fixed frame offsets")
     parser.add_argument("--pose_move_threshold", type=float, default=0.01,
                         help="Minimum camera-center translation in metres between consecutive selected pose views")
+    pose_layout_group = parser.add_mutually_exclusive_group()
+    pose_layout_group.add_argument(
+        "--allow_fewer_pose_views",
+        "--allow-fewer-pose-views",
+        "--allow_unbalanced_pose_views",
+        "--allow-unbalanced-pose-views",
+        dest="allow_unbalanced_pose_views",
+        action="store_true",
+        help=(
+            "Allow pose-selected targets near sequence boundaries to use fewer "
+            "sources; missing past/future slots are masked (default)"
+        ),
+    )
+    pose_layout_group.add_argument(
+        "--strict_balanced_pose_views",
+        "--strict-balanced-pose-views",
+        dest="allow_unbalanced_pose_views",
+        action="store_false",
+        help="Require equal numbers of pose-selected sources before and after every target",
+    )
+    parser.set_defaults(allow_unbalanced_pose_views=True)
     parser.add_argument("--coarse_depths", type=int, default=32,
                         help="Number of global/coarse depth planes between DEPTH_MIN and D_MAX")
     parser.add_argument(
@@ -1930,6 +2046,14 @@ def main() -> None:
                         help="Absolute safe-to-fuse confidence tolerance in metres")
     parser.add_argument("--confidence_rel_tolerance", type=float, default=0.01,
                         help="Relative safe-to-fuse confidence tolerance as a fraction of GT depth")
+    parser.add_argument(
+        "--detach_confidence_inputs",
+        action="store_true",
+        help=(
+            "Stop confidence-loss gradients at the confidence-head inputs so "
+            "confidence training cannot alter the shared depth network"
+        ),
+    )
     parser.add_argument("--out_dir", type=Path,
                         default=_SCRIPT_DIR / "checkpoints" / "multiview")
     parser.add_argument("--seed", type=int, default=42)
@@ -2090,6 +2214,7 @@ def main() -> None:
         view_interval=args.view_interval,
         pose_view_selection=args.pose_view_selection,
         pose_move_threshold=args.pose_move_threshold,
+        allow_unbalanced_pose_views=args.allow_unbalanced_pose_views,
         coarse_depths=args.coarse_depths,
         linear_depth_candidates=args.linear_depth_candidates,
         fill_invalid=args.fill_invalid,
@@ -2111,7 +2236,42 @@ def main() -> None:
 
     train_ds = ConcatDataset(train_sets) if len(train_sets) > 1 else train_sets[0]
     val_ds = ConcatDataset(val_sets) if len(val_sets) > 1 else val_sets[0]
-    print(f"  Train samples: {len(train_ds)},  Val samples: {len(val_ds)}")
+    train_total_frames = sum(ds.n_frames for ds in train_sets)
+    val_total_frames = sum(ds.n_frames for ds in val_sets)
+    print("  Train target-frame usage by sequence:")
+    for sequence, dataset in zip(train_seqs, train_sets):
+        layout = pose_layout_counts(dataset.pose_view_ids)
+        layout_text = (
+            f"; layouts balanced={layout['balanced']}, "
+            f"asymmetric={layout['asymmetric']}, one-sided={layout['one_sided']}, "
+            f"reference-only={layout['reference_only']}"
+            if dataset.pose_view_selection else ""
+        )
+        print(
+            f"    {sequence.name}: {len(dataset)}/{dataset.n_frames} "
+            f"({100.0 * len(dataset) / dataset.n_frames:.1f}%){layout_text}"
+        )
+    print("  Val target-frame usage by sequence:")
+    for sequence, dataset in zip(val_seqs, val_sets):
+        layout = pose_layout_counts(dataset.pose_view_ids)
+        layout_text = (
+            f"; layouts balanced={layout['balanced']}, "
+            f"asymmetric={layout['asymmetric']}, one-sided={layout['one_sided']}, "
+            f"reference-only={layout['reference_only']}"
+            if dataset.pose_view_selection else ""
+        )
+        print(
+            f"    {sequence.name}: {len(dataset)}/{dataset.n_frames} "
+            f"({100.0 * len(dataset) / dataset.n_frames:.1f}%){layout_text}"
+        )
+    print(
+        f"  Train target frames used: {len(train_ds)}/{train_total_frames} "
+        f"({100.0 * len(train_ds) / train_total_frames:.1f}%)"
+    )
+    print(
+        f"  Val target frames used: {len(val_ds)}/{val_total_frames} "
+        f"({100.0 * len(val_ds) / val_total_frames:.1f}%)"
+    )
     if args.train_frame_fraction < 1.0:
         sampled_per_epoch = sum(
             min(len(ds), max(1, int(round(len(ds) * args.train_frame_fraction))))
@@ -2133,7 +2293,8 @@ def main() -> None:
     )
     if args.pose_view_selection:
         print(
-            f"  View selection: pose-based, balanced before/after, "
+            f"  View selection: pose-based, "
+            f"{'up to four sources per side; missing boundary views masked' if args.allow_unbalanced_pose_views else 'strictly balanced before/after'}, "
             f"translation threshold={args.pose_move_threshold:g} m"
         )
     else:
@@ -2149,7 +2310,8 @@ def main() -> None:
         f"l1_loss_only={args.l1_loss_only}, "
         f"confidence={args.lambda_confidence:g} "
         f"(abs_tol={args.confidence_abs_tolerance:g} m, "
-        f"rel_tol={args.confidence_rel_tolerance:g}), "
+        f"rel_tol={args.confidence_rel_tolerance:g}, "
+        f"detached={args.detach_confidence_inputs}), "
         "final-stage supervision only\n"
     )
     min_lr = args.min_lr if args.min_lr is not None else args.lr * 1e-2
@@ -2241,6 +2403,7 @@ def main() -> None:
         middle_hourglass_levels=args.middle_hourglass_levels,
         middle_feature_channels=args.middle_feature_channels,
         fine_feature_channels=args.fine_feature_channels,
+        fpn_lateral_convolutions=not args.no_fpn_lateral_convolutions,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -2322,6 +2485,7 @@ def main() -> None:
             lambda_confidence=args.lambda_confidence,
             confidence_abs_tolerance=args.confidence_abs_tolerance,
             confidence_rel_tolerance=args.confidence_rel_tolerance,
+            detach_confidence_inputs=args.detach_confidence_inputs,
             ema_model=ema,
         )
         validation_model = ema.model if ema is not None else model
@@ -2338,6 +2502,7 @@ def main() -> None:
             lambda_confidence=args.lambda_confidence,
             confidence_abs_tolerance=args.confidence_abs_tolerance,
             confidence_rel_tolerance=args.confidence_rel_tolerance,
+            detach_confidence_inputs=args.detach_confidence_inputs,
         )
         if scheduler is not None and epoch > args.warmup_epochs:
             if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -2408,6 +2573,7 @@ def main() -> None:
             "fine_hourglass_levels": args.fine_hourglass_levels,
             "middle_feature_channels": args.middle_feature_channels,
             "fine_feature_channels": args.fine_feature_channels,
+            "no_fpn_lateral_convolutions": args.no_fpn_lateral_convolutions,
             "fpn_dropout": args.fpn_dropout,
             "reference_dropout": args.reference_dropout,
             "hourglass_dropout": args.hourglass_dropout,
@@ -2419,6 +2585,8 @@ def main() -> None:
             "view_interval": args.view_interval,
             "pose_view_selection": args.pose_view_selection,
             "pose_move_threshold": args.pose_move_threshold,
+            "allow_unbalanced_pose_views": args.allow_unbalanced_pose_views,
+            "allow_fewer_pose_views": args.allow_unbalanced_pose_views,
             "coarse_depths": args.coarse_depths,
             "linear_depth_candidates": args.linear_depth_candidates,
             "middle_depths": args.middle_depths,
@@ -2445,6 +2613,7 @@ def main() -> None:
             "lambda_confidence": args.lambda_confidence,
             "confidence_abs_tolerance": args.confidence_abs_tolerance,
             "confidence_rel_tolerance": args.confidence_rel_tolerance,
+            "detach_confidence_inputs": args.detach_confidence_inputs,
             "l1_loss_only": args.l1_loss_only,
             "augmentation": {
                 "enabled": train_aug.enabled,

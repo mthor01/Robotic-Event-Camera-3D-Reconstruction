@@ -22,6 +22,12 @@ training/results/<checkpoint_name>/ (or to --out_dir):
   tsdf_metrics.txt/.json/.png  — surface and held-out rendered-depth metrics
 
 Usage:
+    # Compare several checkpoints using identical uniform-TSDF settings.
+    python3 reconstruction.py \\
+        --checkpoint model_single.pth model_early_fusion.pth model_mvs.pth \\
+        --data_dir data/new/eval \\
+        --out_dir training/results/reconstruction_model_comparison
+
     python3 reconstruction.py \\
         --checkpoint training/checkpoints/unet_table/best_myrun.pth \\
         --data_dir   data/new/eval/1
@@ -69,6 +75,7 @@ from config import (
     SPATIAL_CUBE_SIDE, SPATIAL_TARGET_X, SPATIAL_TARGET_Y, SPATIAL_TARGET_Z,
 )
 from preprocessing_geometry import transform_intrinsics, transform_name
+from view_selection import select_pose_views
 from spatial_mask import depth_cube_mask, points_in_cube
 from train_unet import RecurrentUNet, UNet
 from multiview import (
@@ -79,7 +86,7 @@ from multiview import (
 
 CALIB_DIR = _HERE / _CALIB_DIR
 CROP_THEN_RESIZE_MODE = False
-PLUS_1CM_BOTTOM_Z_M = 0.01
+RAISED_OBJECT_BOTTOM_Z_M = 0.015
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -192,14 +199,28 @@ def load_model(ckpt_path: Path, device: torch.device):
         model_arch = _infer_multiview_model_arch(ckpt)
         if model_arch != "ModernMVSNet":
             raise ValueError(f"Unsupported multiview checkpoint architecture: {model_arch}")
+        fine_window = float(ckpt.get("fine_window", 0.08))
+        fine_offset_radius = float(ckpt.get("fine_offset_radius", 2.0))
         model = ModernMVSNet(
             in_ch=ckpt.get("in_ch", NUM_BINS + 1),
             base=ckpt.get("base", ckpt.get("base_channels_arg", 32)),
             feature_ch=ckpt.get("feature_channels", None),
             cost_base=ckpt.get("cost_channels", None),
             fine_depths=ckpt.get("fine_depths", 5),
-            fine_window=ckpt.get("fine_window", 0.08),
-            fine_offset_radius=ckpt.get("fine_offset_radius", 2.0),
+            fine_window=fine_window,
+            fine_offset_radius=fine_offset_radius,
+            fine_window_min=float(
+                ckpt.get(
+                    "fine_window_min",
+                    0.25 * fine_window * fine_offset_radius,
+                )
+            ),
+            fine_window_max=float(
+                ckpt.get(
+                    "fine_window_max",
+                    fine_window * fine_offset_radius,
+                )
+            ),
             learned_fine_window=ckpt.get("learned_fine_window", False),
             reference_channels=ckpt.get("reference_channels", 0),
             coarse_cost_channels=ckpt.get("coarse_cost_channels", 0),
@@ -222,6 +243,9 @@ def load_model(ckpt_path: Path, device: torch.device):
             middle_hourglass_levels=ckpt.get("middle_hourglass_levels", 2),
             middle_feature_channels=ckpt.get("middle_feature_channels", 0),
             fine_feature_channels=ckpt.get("fine_feature_channels", 0),
+            fpn_lateral_convolutions=not ckpt.get(
+                "no_fpn_lateral_convolutions", False
+            ),
         ).to(device)
         incompatible = model.load_state_dict(ckpt["model"], strict=False)
         unexpected = list(incompatible.unexpected_keys)
@@ -452,7 +476,25 @@ def _infer_early_fusion_unet(
         )
 
     view_inputs = []
+    target_vox = _preprocess_voxels(
+        vox_ds[frame_idx].astype(np.float32), resize_hw, crop_hw
+    )
+    target_tbl = tbl_ds[frame_idx].astype(np.float32)
+    target_pose_values = None
+    if use_pose_channels:
+        target_pose_values = _pose_channels_from_base_event(
+            np.linalg.inv(T_cam_from_world[frame_idx]).astype(np.float32)
+        )
+    target_input = _unet_input_np(
+        target_vox, target_tbl, pose_values=target_pose_values
+    )
     for view_idx in view_ids:
+        if view_idx < 0:
+            view_inputs.append(np.zeros_like(target_input))
+            continue
+        if view_idx == frame_idx:
+            view_inputs.append(target_input)
+            continue
         vox_np = _preprocess_voxels(
             vox_ds[view_idx].astype(np.float32), resize_hw, crop_hw
         )
@@ -527,26 +569,6 @@ def _camera_centers_world(T_cam_from_world: np.ndarray) -> np.ndarray:
     return -np.einsum("nij,nj->ni", np.transpose(R, (0, 2, 1)), t).astype(np.float32)
 
 
-def _pose_neighbours(
-    centers: np.ndarray,
-    idx: int,
-    direction: int,
-    per_direction: int,
-    move_threshold: float,
-) -> List[int]:
-    neighbours: List[int] = []
-    anchor = idx
-    cursor = idx + direction
-    n_frames = len(centers)
-    while 0 <= cursor < n_frames and len(neighbours) < per_direction:
-        moved = np.linalg.norm(centers[cursor] - centers[anchor])
-        if moved >= move_threshold:
-            neighbours.append(cursor)
-            anchor = cursor
-        cursor += direction
-    return neighbours
-
-
 def _multiview_view_ids(
     frame_idx: int,
     n_frames: int,
@@ -561,11 +583,20 @@ def _multiview_view_ids(
     """
     num_views = int(ckpt.get("num_views", 5))
     if ckpt.get("pose_view_selection", False) and centers_world is not None:
-        per_direction = (num_views - 1) // 2
         threshold = float(ckpt.get("pose_move_threshold", 0.01))
-        before = _pose_neighbours(centers_world, frame_idx, -1, per_direction, threshold)
-        after = _pose_neighbours(centers_world, frame_idx, 1, per_direction, threshold)
-        view_ids = [frame_idx] + before + after
+        selected = select_pose_views(
+            centers_world,
+            frame_idx,
+            num_views,
+            threshold,
+            bool(
+                ckpt.get(
+                    "allow_fewer_pose_views",
+                    ckpt.get("allow_unbalanced_pose_views", False),
+                )
+            ),
+        )
+        view_ids = selected or [frame_idx]
     else:
         interval = int(ckpt.get("view_interval", 5))
         view_ids = [frame_idx] + [
@@ -618,11 +649,27 @@ def _infer_multiview(
     return_uncertainty: bool = False,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     view_ids = _multiview_view_ids(frame_idx, len(T_cam_from_world), ckpt, centers_world)
-    imgs = torch.stack([
-        _multiview_input(vox_ds, tbl_ds, i, resize_hw, crop_hw)
-        for i in view_ids
-    ], dim=0).unsqueeze(0).to(device)
-    cam_mats = torch.from_numpy(np.stack([T_cam_from_world[i] for i in view_ids])).unsqueeze(0).to(device)
+    target_input = _multiview_input(
+        vox_ds, tbl_ds, frame_idx, resize_hw, crop_hw
+    )
+    imgs = torch.stack(
+        [
+            target_input if i == frame_idx else
+            _multiview_input(vox_ds, tbl_ds, i, resize_hw, crop_hw) if i >= 0 else
+            torch.zeros_like(target_input)
+            for i in view_ids
+        ],
+        dim=0,
+    ).unsqueeze(0).to(device)
+    cam_mats = torch.from_numpy(
+        np.stack([
+            T_cam_from_world[i] if i >= 0 else T_cam_from_world[frame_idx]
+            for i in view_ids
+        ])
+    ).unsqueeze(0).to(device)
+    view_valid_mask = torch.tensor(
+        [[i >= 0 for i in view_ids]], dtype=torch.bool, device=device
+    )
     K_t = torch.from_numpy(K.astype(np.float32)).unsqueeze(0).to(device)
     candidate_fn = (
         _linear_depth_candidates
@@ -642,6 +689,7 @@ def _infer_multiview(
         K_t,
         depth_values,
         return_uncertainty=return_uncertainty,
+        view_valid_mask=view_valid_mask,
     )
     if return_uncertainty:
         pred, confidence = out
@@ -1034,6 +1082,57 @@ def tsdf_fuse(
     return n_v > 0 and n_t > 0
 
 
+def save_largest_connected_surface(source_path: Path) -> Path:
+    """Write a copy of a triangle mesh containing only its largest component."""
+    try:
+        import open3d as o3d
+    except ImportError as exc:
+        raise RuntimeError(
+            "--save_largest_connected_surface requires Open3D"
+        ) from exc
+
+    mesh = o3d.io.read_triangle_mesh(str(source_path))
+    triangle_count = len(np.asarray(mesh.triangles))
+    if triangle_count == 0:
+        raise RuntimeError(
+            f"Cannot clean {source_path}: mesh has no triangles"
+        )
+
+    triangle_clusters, cluster_sizes, _ = mesh.cluster_connected_triangles()
+    triangle_clusters = np.asarray(triangle_clusters, dtype=np.int64)
+    cluster_sizes = np.asarray(cluster_sizes, dtype=np.int64)
+    if cluster_sizes.size == 0:
+        raise RuntimeError(
+            f"Cannot clean {source_path}: no connected surface was found"
+        )
+
+    largest_cluster = int(np.argmax(cluster_sizes))
+    keep = triangle_clusters == largest_cluster
+    mesh.remove_triangles_by_mask(~keep)
+    mesh.remove_unreferenced_vertices()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_duplicated_vertices()
+    mesh.compute_vertex_normals()
+
+    cleaned_path = source_path.with_name(
+        f"{source_path.stem}_largest_component{source_path.suffix}"
+    )
+    write_normals = source_path.suffix.lower() != ".ply"
+    if not o3d.io.write_triangle_mesh(
+        str(cleaned_path), mesh, write_vertex_normals=write_normals
+    ):
+        raise RuntimeError(f"Failed to write cleaned mesh: {cleaned_path}")
+
+    kept_triangles = len(np.asarray(mesh.triangles))
+    kept_vertices = len(np.asarray(mesh.vertices))
+    print(
+        f"  Largest surface → {cleaned_path} "
+        f"({kept_vertices:,} verts, {kept_triangles:,}/{triangle_count:,} triangles)"
+    )
+    return cleaned_path
+
+
 def _nearest_distances_and_indices(
     src: np.ndarray,
     dst: np.ndarray,
@@ -1089,10 +1188,16 @@ def evaluate_tsdf_meshes(
     pred_mesh.compute_vertex_normals()
     gt_mesh.compute_vertex_normals()
     sample_count = max(1000, int(surface_samples))
+    # Use identical deterministic surface samples across reconstruction
+    # variants so comparison differences come from fusion, not sampling noise.
+    if hasattr(o3d.utility, "random"):
+        o3d.utility.random.seed(0)
     pred_cloud = pred_mesh.sample_points_uniformly(
         number_of_points=sample_count,
         use_triangle_normal=True,
     )
+    if hasattr(o3d.utility, "random"):
+        o3d.utility.random.seed(1)
     gt_cloud = gt_mesh.sample_points_uniformly(
         number_of_points=sample_count,
         use_triangle_normal=True,
@@ -1254,12 +1359,13 @@ def write_tsdf_metric_outputs(
     out_dir: Path,
     surface_metrics: Optional[dict],
     rendered_metrics: Optional[dict],
+    file_stem: str = "tsdf_metrics",
 ) -> None:
     payload = {
         "surface_metrics": surface_metrics,
         "rendered_depth_metrics": rendered_metrics,
     }
-    (out_dir / "tsdf_metrics.json").write_text(
+    (out_dir / f"{file_stem}.json").write_text(
         json.dumps(payload, indent=2) + "\n",
         encoding="utf-8",
     )
@@ -1296,7 +1402,7 @@ def write_tsdf_metric_outputs(
             f"  RMSE                : {rendered_metrics['rmse_m']:.6f} m",
             f"  AbsRel              : {rendered_metrics['abs_rel']:.6f}",
         ])
-    (out_dir / "tsdf_metrics.txt").write_text(
+    (out_dir / f"{file_stem}.txt").write_text(
         "\n".join(lines) + "\n",
         encoding="utf-8",
     )
@@ -1360,7 +1466,7 @@ def write_tsdf_metric_outputs(
     for axis in axes:
         axis.grid(axis="y", alpha=0.25)
     fig.tight_layout()
-    fig.savefig(out_dir / "tsdf_metrics.png", dpi=180)
+    fig.savefig(out_dir / f"{file_stem}.png", dpi=180)
     plt.close(fig)
 
 
@@ -1471,6 +1577,442 @@ def _set_cli_option(argv: list[str], option: str, value: str) -> list[str]:
     return updated
 
 
+def _remove_cli_flag(argv: list[str], option: str) -> list[str]:
+    """Remove a boolean CLI flag, including its ``--flag=value`` form."""
+    return [
+        token
+        for token in argv
+        if token != option and not token.startswith(option + "=")
+    ]
+
+
+def _set_cli_values(argv: list[str], option: str, values: list[str]) -> list[str]:
+    """Replace a CLI option that accepts one or more consecutive values."""
+    updated: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == option:
+            index += 1
+            while index < len(argv) and not argv[index].startswith("--"):
+                index += 1
+            continue
+        if token.startswith(option + "="):
+            index += 1
+            continue
+        updated.append(token)
+        index += 1
+    updated.extend([option, *values])
+    return updated
+
+
+def _load_reconstruction_run_summary(output_dir: Path) -> dict:
+    """Load an aggregate summary or normalize a single-sequence result."""
+    aggregate_path = output_dir / "reconstruction_summary.json"
+    if aggregate_path.is_file():
+        return json.loads(aggregate_path.read_text(encoding="utf-8"))
+
+    sequence_path = output_dir / "reconstruction_metrics.json"
+    if not sequence_path.is_file():
+        raise FileNotFoundError(
+            f"No reconstruction summary found below {output_dir}"
+        )
+    payload = json.loads(sequence_path.read_text(encoding="utf-8"))
+    return {
+        "object_count": 1,
+        "objects": [output_dir.name],
+        "surface_selection": payload.get("surface_selection", "all_surfaces"),
+        "cases": payload.get("cases", {}),
+    }
+
+
+def _write_model_comparison_summary(
+    output_root: Path,
+    model_runs: list[tuple[str, Path]],
+) -> None:
+    """Write aggregate metrics and plots for a multi-checkpoint run."""
+    summaries = {
+        model_name: _load_reconstruction_run_summary(model_dir)
+        for model_name, model_dir in model_runs
+    }
+    surface_selections = {
+        summary.get("surface_selection", "all_surfaces")
+        for summary in summaries.values()
+    }
+    if len(surface_selections) != 1:
+        raise ValueError(
+            "Cannot compare checkpoints reconstructed with different surface "
+            f"selection policies: {sorted(surface_selections)}"
+        )
+    surface_selection = next(iter(surface_selections))
+    reference_objects: Optional[list[str]] = None
+    for model_name, summary in summaries.items():
+        objects = summary.get("objects")
+        if not isinstance(objects, list):
+            continue
+        if reference_objects is None:
+            reference_objects = objects
+        elif objects != reference_objects:
+            raise ValueError(
+                "Cannot compare reconstruction runs evaluated on different "
+                f"object sets; mismatch found for {model_name}"
+            )
+    cases = (
+        ("current_mask", "Workspace cube"),
+        ("raised_object_cube", "Raised cube"),
+    )
+    metrics = (
+        ("chamfer_mean_m", "Chamfer distance [cm]", 100.0),
+        ("normal_consistency_symmetric", "Normal consistency", 1.0),
+        ("fscore_1cm", "F@1 cm [%]", 100.0),
+    )
+
+    comparison: dict[str, dict] = {}
+    lines = [
+        "Reconstruction comparison across checkpoints",
+        "Values are unweighted means across reconstructed objects.",
+        f"Surface selection: {surface_selection}",
+        "",
+    ]
+    for model_name, summary in summaries.items():
+        comparison[model_name] = {
+            "object_count": summary.get("object_count"),
+            "cases": {},
+        }
+        lines.append(
+            f"{model_name} (objects={summary.get('object_count', 'N/A')})"
+        )
+        for case_name, case_label in cases:
+            surface = (
+                summary.get("cases", {})
+                .get(case_name, {})
+                .get("surface_metrics", {})
+                or {}
+            )
+            case_values = {}
+            lines.append(f"  {case_label}")
+            for metric_name, _, _ in metrics:
+                value = surface.get(metric_name)
+                if isinstance(value, (int, float)) and np.isfinite(value):
+                    case_values[metric_name] = float(value)
+                    lines.append(f"    {metric_name}: {float(value):.6f}")
+            comparison[model_name]["cases"][case_name] = case_values
+        lines.append("")
+
+    payload = {
+        "description": "reconstruction comparison across checkpoints",
+        "surface_selection": surface_selection,
+        "models": comparison,
+    }
+    (output_root / "model_comparison_summary.txt").write_text(
+        "\n".join(lines), encoding="utf-8"
+    )
+    (output_root / "model_comparison_summary.json").write_text(
+        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+    )
+
+    model_names = list(summaries)
+    x = np.arange(len(model_names))
+    width = 0.36
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5.2))
+    for ax, (metric_name, title, scale) in zip(axes, metrics):
+        for offset, (case_name, case_label) in zip(
+            (-width / 2, width / 2), cases
+        ):
+            values = []
+            for model_name in model_names:
+                surface = (
+                    summaries[model_name]
+                    .get("cases", {})
+                    .get(case_name, {})
+                    .get("surface_metrics", {})
+                    or {}
+                )
+                value = surface.get(metric_name, np.nan)
+                values.append(float(value) * scale if value is not None else np.nan)
+            ax.bar(x + offset, values, width, label=case_label)
+        ax.set_xticks(x, model_names, rotation=25, ha="right")
+        ax.set_title(title)
+        ax.grid(axis="y", alpha=0.25)
+    axes[0].set_ylabel("cm")
+    axes[1].set_ylim(0.0, 1.0)
+    axes[2].set_ylabel("Percent")
+    axes[2].set_ylim(0.0, 100.0)
+    axes[0].legend()
+    fig.suptitle("Three-dimensional reconstruction comparison")
+    fig.tight_layout()
+    fig.savefig(output_root / "model_reconstruction_comparison.png", dpi=180)
+    plt.close(fig)
+
+
+def _checkpoint_comparison_label(checkpoint: Path) -> str:
+    """Return a concise plot label for known comparison checkpoint names."""
+    name = checkpoint.stem.lower()
+    if "baseline_1_view" in name:
+        return "Single-view U-Net"
+    if "baseline_9_views" in name:
+        return "Nine-view early-fusion U-Net"
+    if "multiview" in name:
+        return "Geometry-based multiview"
+    return checkpoint.stem
+
+
+def _supports_learned_uncertainty(checkpoint: Path) -> tuple[bool, str]:
+    """Return whether a checkpoint can produce learned confidence weights."""
+    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if _detect_table_ckpt_type(ckpt) != "multiview":
+        return False, "model is not a geometric multiview checkpoint"
+    if not bool(ckpt.get("uncertainty", False)):
+        return False, "checkpoint was not trained with uncertainty"
+    if not any(
+        key.startswith("confidence_head.") for key in ckpt.get("model", {})
+    ):
+        return False, "checkpoint has no confidence-head weights"
+    return True, ""
+
+
+def _run_checkpoint_comparison(args: argparse.Namespace) -> bool:
+    """Run reconstruction independently for every supplied checkpoint."""
+    checkpoints = [Path(path) for path in args.checkpoint]
+    if len(checkpoints) <= 1:
+        return False
+
+    output_root = (
+        Path(args.out_dir)
+        if args.out_dir is not None
+        else _HERE / "training" / "results" / "reconstruction_model_comparison"
+    )
+    output_root.mkdir(parents=True, exist_ok=True)
+    stems = [checkpoint.stem for checkpoint in checkpoints]
+    if len(set(stems)) != len(stems):
+        raise ValueError(
+            "Multi-checkpoint reconstruction requires unique checkpoint filenames"
+        )
+
+    model_runs: list[tuple[str, Path]] = []
+    for checkpoint_number, checkpoint in enumerate(checkpoints, start=1):
+        model_dir = output_root / checkpoint.stem
+        comparison_label = _checkpoint_comparison_label(checkpoint)
+        child_args = _set_cli_values(
+            sys.argv[1:], "--checkpoint", [str(checkpoint)]
+        )
+        child_args = _set_cli_option(child_args, "--out_dir", str(model_dir))
+        comparison_dir = model_dir
+        uncertainty_requested = bool(
+            args.uncertainty_weighted_tsdf or args.compare_uncertainty_tsdf
+        )
+        if uncertainty_requested:
+            supports_uncertainty, reason = _supports_learned_uncertainty(checkpoint)
+            if not supports_uncertainty:
+                child_args = _remove_cli_flag(
+                    child_args, "--uncertainty_weighted_tsdf"
+                )
+                child_args = _remove_cli_flag(
+                    child_args, "--compare_uncertainty_tsdf"
+                )
+                child_args = _remove_cli_flag(
+                    child_args, "--compare-uncertainty-tsdf"
+                )
+                print(
+                    f"\n[{checkpoint_number}/{len(checkpoints)}] "
+                    f"Ignoring uncertainty TSDF for {checkpoint.name}: {reason}.",
+                    flush=True,
+                )
+            elif args.compare_uncertainty_tsdf:
+                # Report the confidence-weighted MVS reconstruction in the
+                # cross-model summary. Both variants and their direct
+                # comparison remain available below model_dir.
+                comparison_dir = model_dir / "uncertainty_weighted_tsdf"
+                comparison_label += " (uncertainty-weighted TSDF)"
+        command = [sys.executable, str(Path(__file__).resolve()), *child_args]
+        print(
+            f"\n[{checkpoint_number}/{len(checkpoints)}] "
+            f"Reconstructing checkpoint: {checkpoint.name}",
+            flush=True,
+        )
+        result = subprocess.run(command, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Reconstruction failed for {checkpoint} with exit code "
+                f"{result.returncode}"
+            )
+        model_runs.append((comparison_label, comparison_dir))
+
+    _write_model_comparison_summary(output_root, model_runs)
+    print(
+        f"\nModel comparison written to: {output_root.resolve()}", flush=True
+    )
+    return True
+
+
+def _write_uncertainty_comparison_summary(
+    output_root: Path,
+    uniform_dir: Path,
+    weighted_dir: Path,
+) -> None:
+    """Compare aggregate metrics from uniform and confidence-weighted TSDF.
+
+    Each comparison includes the signed difference and weighted/uniform ratio.
+    """
+    uniform = _load_reconstruction_run_summary(uniform_dir)
+    weighted = _load_reconstruction_run_summary(weighted_dir)
+    uniform_surface_selection = uniform.get("surface_selection", "all_surfaces")
+    weighted_surface_selection = weighted.get("surface_selection", "all_surfaces")
+    if uniform_surface_selection != weighted_surface_selection:
+        raise ValueError(
+            "Cannot compare uniform and uncertainty-weighted runs with "
+            "different surface selection policies: "
+            f"{uniform_surface_selection!r} versus "
+            f"{weighted_surface_selection!r}"
+        )
+    variant_payloads = {
+        "uniform_tsdf": uniform,
+        "uncertainty_weighted_tsdf": weighted,
+    }
+    comparison: dict[str, dict] = {}
+    lines = [
+        "Reconstruction comparison: uniform vs uncertainty-weighted TSDF",
+        f"Uniform objects: {uniform.get('object_count', 'N/A')}",
+        f"Weighted objects: {weighted.get('object_count', 'N/A')}",
+        f"Surface selection: {uniform_surface_selection}",
+        "Difference is uncertainty-weighted minus uniform.",
+        (
+            "Factor is uncertainty-weighted divided by uniform; for error "
+            "metrics, values below 1 indicate a reduction and values above 1 "
+            "an increase."
+        ),
+        "",
+    ]
+
+    case_names = list(
+        dict.fromkeys(
+            list(uniform.get("cases", {})) + list(weighted.get("cases", {}))
+        )
+    )
+    for case_name in case_names:
+        lines.append(case_name)
+        comparison[case_name] = {}
+        uniform_case = uniform.get("cases", {}).get(case_name, {}) or {}
+        weighted_case = weighted.get("cases", {}).get(case_name, {}) or {}
+        section_names = list(
+            dict.fromkeys(list(uniform_case) + list(weighted_case))
+        )
+        for section_name in section_names:
+            uniform_section = uniform_case.get(section_name) or {}
+            weighted_section = weighted_case.get(section_name) or {}
+            if not isinstance(uniform_section, dict) or not isinstance(
+                weighted_section, dict
+            ):
+                continue
+            metric_names = list(
+                dict.fromkeys(list(uniform_section) + list(weighted_section))
+            )
+            section_comparison = {}
+            section_lines = []
+            for metric_name in metric_names:
+                uniform_value = uniform_section.get(metric_name)
+                weighted_value = weighted_section.get(metric_name)
+                if not isinstance(uniform_value, (int, float)) or not isinstance(
+                    weighted_value, (int, float)
+                ):
+                    continue
+                uniform_value = float(uniform_value)
+                weighted_value = float(weighted_value)
+                if not np.isfinite(uniform_value) or not np.isfinite(weighted_value):
+                    continue
+                difference = weighted_value - uniform_value
+                factor = (
+                    weighted_value / uniform_value
+                    if uniform_value != 0.0
+                    else None
+                )
+                section_comparison[metric_name] = {
+                    "uniform": uniform_value,
+                    "uncertainty_weighted": weighted_value,
+                    "difference": difference,
+                    "weighted_over_uniform_factor": factor,
+                }
+                factor_text = (
+                    f"{factor:.6f}x"
+                    if factor is not None
+                    else "undefined (uniform=0)"
+                )
+                section_lines.append(
+                    f"    {metric_name}: uniform={uniform_value:.6f}, "
+                    f"weighted={weighted_value:.6f}, difference={difference:+.6f}, "
+                    f"factor={factor_text}"
+                )
+            if section_comparison:
+                comparison[case_name][section_name] = section_comparison
+                lines.append(f"  {section_name}")
+                lines.extend(section_lines)
+        lines.append("")
+
+    summary_json = {
+        "description": (
+            "uncertainty-weighted versus uniform TSDF comparison; includes "
+            "weighted-minus-uniform differences and weighted/uniform factors"
+        ),
+        "surface_selection": uniform_surface_selection,
+        "variants": variant_payloads,
+        "comparison": comparison,
+    }
+    (output_root / "reconstruction_summary.txt").write_text(
+        "\n".join(lines), encoding="utf-8"
+    )
+    (output_root / "reconstruction_summary.json").write_text(
+        json.dumps(summary_json, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def _run_uncertainty_tsdf_comparison(args: argparse.Namespace) -> bool:
+    """Run uniform and uncertainty-weighted reconstruction variants."""
+    if not args.compare_uncertainty_tsdf:
+        return False
+
+    checkpoint_stem = Path(args.checkpoint).stem
+    output_root = (
+        Path(args.out_dir)
+        if args.out_dir is not None
+        else _HERE / "training" / "results" / checkpoint_stem
+    )
+    output_root.mkdir(parents=True, exist_ok=True)
+    base_args = _remove_cli_flag(
+        sys.argv[1:], "--compare_uncertainty_tsdf"
+    )
+    base_args = _remove_cli_flag(base_args, "--compare-uncertainty-tsdf")
+    base_args = _remove_cli_flag(base_args, "--uncertainty_weighted_tsdf")
+    variants = (
+        ("uniform_tsdf", False),
+        ("uncertainty_weighted_tsdf", True),
+    )
+    for variant_name, weighted in variants:
+        variant_dir = output_root / variant_name
+        child_args = _set_cli_option(base_args, "--out_dir", str(variant_dir))
+        if weighted:
+            child_args.append("--uncertainty_weighted_tsdf")
+        command = [sys.executable, str(Path(__file__).resolve()), *child_args]
+        print(f"\nRunning reconstruction variant: {variant_name}", flush=True)
+        result = subprocess.run(command, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Reconstruction variant {variant_name} failed with exit "
+                f"code {result.returncode}"
+            )
+
+    _write_uncertainty_comparison_summary(
+        output_root,
+        output_root / "uniform_tsdf",
+        output_root / "uncertainty_weighted_tsdf",
+    )
+    print(
+        f"\nTSDF comparison summary: "
+        f"{output_root / 'reconstruction_summary.txt'}",
+        flush=True,
+    )
+    return True
+
+
 def _write_reconstruction_summary(output_root: Path, sequence_dirs: list[Path]) -> None:
     """Aggregate per-sequence two-mask metrics and write plots/mean values."""
     runs = []
@@ -1480,6 +2022,17 @@ def _write_reconstruction_summary(output_root: Path, sequence_dirs: list[Path]) 
             runs.append((sequence_dir.name, json.loads(path.read_text(encoding="utf-8"))))
     if not runs:
         return
+
+    surface_selections = {
+        payload.get("surface_selection", "all_surfaces")
+        for _, payload in runs
+    }
+    if len(surface_selections) != 1:
+        raise ValueError(
+            "Cannot aggregate reconstruction runs with different surface "
+            f"selection policies: {sorted(surface_selections)}"
+        )
+    surface_selection = next(iter(surface_selections))
 
     def values(case: str, section: str, metric: str) -> list[float]:
         result = []
@@ -1492,7 +2045,7 @@ def _write_reconstruction_summary(output_root: Path, sequence_dirs: list[Path]) 
     cases = (
         ("full_scale", "Full scale"),
         ("current_mask", "Current mask"),
-        ("plus_1cm", "+1 cm bottom"),
+        ("raised_object_cube", "Raised object cube (+1.5 cm)"),
     )
     sections = {
         "depth_metrics": ("mae_m", "rmse_m", "max_m"),
@@ -1507,11 +2060,27 @@ def _write_reconstruction_summary(output_root: Path, sequence_dirs: list[Path]) 
             "fscore_1cm", "precision_2cm", "recall_2cm", "fscore_2cm",
             "precision_5cm", "recall_5cm", "fscore_5cm",
         ),
+        "original_depth_surface_metrics": (
+            "accuracy_mean_m", "accuracy_median_m", "completeness_mean_m",
+            "completeness_median_m", "chamfer_mean_m", "chamfer_median_m",
+            "normal_consistency_symmetric", "precision_1cm", "recall_1cm",
+            "fscore_1cm", "precision_2cm", "recall_2cm", "fscore_2cm",
+            "precision_5cm", "recall_5cm", "fscore_5cm",
+        ),
         "rendered_depth_metrics": ("mae_m", "rmse_m", "abs_rel", "valid_render_percentage"),
     }
-    lines = ["Reconstruction summary (unweighted mean across objects)",
-             f"Objects: {len(runs)} ({', '.join(name for name, _ in runs)})", ""]
-    summary_json = {"object_count": len(runs), "objects": [name for name, _ in runs], "cases": {}}
+    lines = [
+        "Reconstruction summary (unweighted mean across objects)",
+        f"Surface selection: {surface_selection}",
+        f"Objects: {len(runs)} ({', '.join(name for name, _ in runs)})",
+        "",
+    ]
+    summary_json = {
+        "object_count": len(runs),
+        "objects": [name for name, _ in runs],
+        "surface_selection": surface_selection,
+        "cases": {},
+    }
     for case, label in cases:
         lines.append(label)
         summary_json["cases"][case] = {}
@@ -1535,8 +2104,9 @@ def _write_reconstruction_summary(output_root: Path, sequence_dirs: list[Path]) 
     names = [name for name, _ in runs]
     x = np.arange(len(names))
     width = 0.38
+    plotted_cases = cases[1:]
     fig, ax = plt.subplots(figsize=(max(8, 1.35 * len(names)), 5))
-    for offset, (case, label) in zip((-width / 2, width / 2), cases):
+    for offset, (case, label) in zip((-width / 2, width / 2), plotted_cases):
         vals = [
             100.0 * float(((payload["cases"].get(case, {}).get("surface_metrics") or {}).get("chamfer_mean_m", np.nan)))
             for _, payload in runs
@@ -1558,7 +2128,9 @@ def _write_reconstruction_summary(output_root: Path, sequence_dirs: list[Path]) 
         ("rendered_depth_metrics", "mae_m", "Rendered-depth MAE [cm]"),
     )
     for ax, (section, metric, title) in zip(axes, panels):
-        for offset, (case, label) in zip((-width / 2, width / 2), cases):
+        for offset, (case, label) in zip(
+            (-width / 2, width / 2), plotted_cases
+        ):
             vals = [100.0 * float(((payload["cases"].get(case, {}).get(section) or {}).get(metric, np.nan))) for _, payload in runs]
             ax.bar(x + offset, vals, width, label=label)
         ax.set_xticks(x, names, rotation=35, ha="right")
@@ -1643,8 +2215,16 @@ def main() -> None:
         description="Depth-map, point-cloud, and TSDF reconstruction from trained depth models.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--checkpoint", type=str, required=True,
-                        help="Path to a table-prior checkpoint (.pth)")
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        nargs="+",
+        required=True,
+        help=(
+            "One or more table-prior checkpoints (.pth). Multiple checkpoints "
+            "are reconstructed independently and compared under --out_dir."
+        ),
+    )
     parser.add_argument(
         "--data_dir",
         type=str,
@@ -1678,6 +2258,26 @@ def main() -> None:
     parser.add_argument("--crop_then_resize", "--crop-then-resize", action="store_true",
                         help="Use native center-crop followed by resize, with "
                              "CROP_THEN_RESIZE_* settings from config.py")
+    pose_layout_group = parser.add_mutually_exclusive_group()
+    pose_layout_group.add_argument(
+        "--allow_fewer_pose_views",
+        "--allow-fewer-pose-views",
+        "--allow_unbalanced_pose_views",
+        "--allow-unbalanced-pose-views",
+        dest="pose_layout_override",
+        action="store_const",
+        const=True,
+        help="Override the checkpoint and allow fewer masked source views at boundaries",
+    )
+    pose_layout_group.add_argument(
+        "--strict_balanced_pose_views",
+        "--strict-balanced-pose-views",
+        dest="pose_layout_override",
+        action="store_const",
+        const=False,
+        help="Override the checkpoint and require balanced pose-view layouts",
+    )
+    parser.set_defaults(pose_layout_override=None)
     parser.add_argument("--voxel_size",        type=float, default=TSDF_VOXEL_SIZE)
     parser.add_argument("--sdf_trunc_factor",  type=float, default=TSDF_SDF_TRUNC_FACTOR)
     parser.add_argument(
@@ -1686,6 +2286,16 @@ def main() -> None:
         help=(
             "Weight predicted TSDF updates with the checkpoint's learned "
             "per-pixel confidence; does not affect GT TSDF fusion"
+        ),
+    )
+    parser.add_argument(
+        "--compare_uncertainty_tsdf",
+        "--compare-uncertainty-tsdf",
+        action="store_true",
+        help=(
+            "Run both uniform and uncertainty-weighted TSDF reconstruction "
+            "with identical settings, then compare their metrics in the root "
+            "reconstruction summary"
         ),
     )
     parser.add_argument(
@@ -1702,6 +2312,18 @@ def main() -> None:
     )
     parser.add_argument("--skip_gt_mesh", action="store_true",
                         help="Do not fuse gt_mesh.obj; useful for faster iteration")
+    parser.add_argument(
+        "--save_largest_connected_surface",
+        "--save-largest-connected-surface",
+        "--save_largest_connected_component",
+        action="store_true",
+        help=(
+            "Write largest-connected-surface copies of the predicted and GT "
+            "TSDF meshes and use those copies for all primary surface and "
+            "rendered-depth metrics, including uncertainty and checkpoint "
+            "comparisons"
+        ),
+    )
     parser.add_argument(
         "--evaluate_full_scale",
         "--evaluate-full-scale",
@@ -1728,6 +2350,15 @@ def main() -> None:
             "without projecting them into the event-camera plane"
         ),
     )
+    parser.add_argument(
+        "--evaluate_original_depth_mesh",
+        action="store_true",
+        help=(
+            "Create the native-resolution RealSense depth TSDF mesh and use "
+            "it as an additional reference for surface evaluation of the "
+            "predicted workspace mesh"
+        ),
+    )
     parser.add_argument("--error_stride", type=int, default=4,
                         help="Pixel stride for reconstruction-level point-cloud error")
     parser.add_argument("--error_max_points", type=int, default=5000,
@@ -1741,6 +2372,9 @@ def main() -> None:
     parser.add_argument("--target_y", type=float, default=SPATIAL_TARGET_Y)
     parser.add_argument("--target_z", type=float, default=SPATIAL_TARGET_Z)
     args = parser.parse_args()
+    use_original_depth_mesh = bool(
+        args.save_original_depth_mesh or args.evaluate_original_depth_mesh
+    )
     if args.mesh_frame_count <= 0:
         parser.error("--mesh_frame_count must be > 0")
     if args.tsdf_confidence_levels <= 0:
@@ -1753,6 +2387,17 @@ def main() -> None:
         parser.error("--surface_samples must be > 0")
     if args.render_eval_frames < 0:
         parser.error("--render_eval_frames must be >= 0")
+    for checkpoint in args.checkpoint:
+        if not checkpoint.is_file():
+            parser.error(f"Checkpoint does not exist: {checkpoint}")
+    if _run_checkpoint_comparison(args):
+        return
+
+    # All existing single-checkpoint reconstruction code uses a scalar path.
+    args.checkpoint = args.checkpoint[0]
+
+    if _run_uncertainty_tsdf_comparison(args):
+        return
 
     if _run_sequence_directory(args):
         return
@@ -1761,8 +2406,8 @@ def main() -> None:
     data_dir       = Path(args.data_dir)
     cube_center    = np.array([args.target_x, args.target_y, args.target_z], dtype=np.float64)
     cube_half_side = args.cube_side / 2.0
-    plus_1cm_center = np.array(
-        [args.target_x, args.target_y, PLUS_1CM_BOTTOM_Z_M + cube_half_side],
+    raised_object_center = np.array(
+        [args.target_x, args.target_y, RAISED_OBJECT_BOTTOM_Z_M + cube_half_side],
         dtype=np.float64,
     )
 
@@ -1806,10 +2451,10 @@ def main() -> None:
             "Regenerate it with data_precomputation/precompute_table_plane.py "
             "--overwrite."
         )
-    if args.save_original_depth_mesh and not realsense_h5_path.exists():
+    if use_original_depth_mesh and not realsense_h5_path.exists():
         raise FileNotFoundError(
             f"Missing: {realsense_h5_path}\n"
-            "--save_original_depth_mesh requires the raw RealSense depth file."
+            "Native-depth mesh creation requires the raw RealSense depth file."
         )
     if args.color_mesh and not rgb_h5_path.exists():
         raise FileNotFoundError(
@@ -1823,7 +2468,7 @@ def main() -> None:
         CALIB_DIR, resize_hw, crop_hw, args.crop_then_resize
     )
     print(f"Input resolution : {out_W}×{out_H}")
-    if args.save_original_depth_mesh:
+    if use_original_depth_mesh:
         K_depth, T_ee_from_depth, original_depth_scale = load_original_depth_calibration(CALIB_DIR)
         print("Original depth   : native RealSense depth enabled")
     else:
@@ -1836,6 +2481,9 @@ def main() -> None:
 
     # ── Model ─────────────────────────────────────────────────────
     model, ckpt, ckpt_type = load_model(ckpt_path, device)
+    if args.pose_layout_override is not None:
+        ckpt["allow_unbalanced_pose_views"] = args.pose_layout_override
+        ckpt["allow_fewer_pose_views"] = args.pose_layout_override
     expected_transform = transform_name(args.crop_then_resize)
     checkpoint_transform = ckpt.get("intrinsics_transform", "resize_center_crop")
     if checkpoint_transform != expected_transform:
@@ -1872,12 +2520,36 @@ def main() -> None:
         print(f"  coarse_depths  : {ckpt.get('coarse_depths', 32)}")
         print(f"  view_interval  : {ckpt.get('view_interval', 5)}")
         print(f"  pose selection : {ckpt.get('pose_view_selection', False)}")
+        if ckpt.get("pose_view_selection", False):
+            print(
+                "  pose layouts   : "
+                + (
+                    "fewer masked boundary views allowed"
+                    if ckpt.get(
+                        "allow_fewer_pose_views",
+                        ckpt.get("allow_unbalanced_pose_views", False),
+                    )
+                    else "strictly balanced targets only"
+                )
+            )
         print("  feature encoder: deep_fpn")
         print(f"  uncertainty    : {bool(ckpt.get('uncertainty', False))}")
     if ckpt_type == "unet_table":
         print(f"  num_views      : {ckpt.get('num_views', 1)}")
         print(f"  view_interval  : {ckpt.get('view_interval', 5)}")
         print(f"  pose selection : {bool(ckpt.get('pose_view_selection', False))}")
+        if ckpt.get("pose_view_selection", False):
+            print(
+                "  pose layouts   : "
+                + (
+                    "fewer masked boundary views allowed"
+                    if ckpt.get(
+                        "allow_fewer_pose_views",
+                        ckpt.get("allow_unbalanced_pose_views", False),
+                    )
+                    else "strictly balanced targets only"
+                )
+            )
         print(f"  pose channels  : {bool(ckpt.get('pose_channels', False))}")
     table_z_msg = (
         f"{table_z} m"
@@ -1919,10 +2591,10 @@ def main() -> None:
             "This checkpoint requires camera poses for view selection, pose "
             "channels, or geometric source-view warping."
         )
-    if args.save_original_depth_mesh and not use_poses:
+    if use_original_depth_mesh and not use_poses:
         raise FileNotFoundError(
             f"Missing: {poses_h5_path}\n"
-            "--save_original_depth_mesh requires poses for native depth-camera TSDF fusion."
+            "Native-depth mesh creation requires poses for depth-camera TSDF fusion."
         )
 
     T_cam_from_world = None
@@ -1947,7 +2619,7 @@ def main() -> None:
             n_rgb = f["rgb"].shape[0]
     else:
         n_rgb = n_total
-    if args.save_original_depth_mesh:
+    if use_original_depth_mesh:
         with h5py.File(realsense_h5_path, "r") as f:
             n_rs = f["depth"].shape[0]
         n_total = min(n_total, n_rs)
@@ -1959,22 +2631,58 @@ def main() -> None:
     frame_end = n_total - 1
     region_count = frame_end - frame_start + 1
 
+    eligible_frames = list(range(frame_start, frame_end + 1))
+    allow_fewer_pose_views = bool(
+        ckpt.get(
+            "allow_fewer_pose_views",
+            ckpt.get("allow_unbalanced_pose_views", False),
+        )
+    )
+    if (
+        ckpt.get("pose_view_selection", False)
+        and cam_centers_world is not None
+        and not allow_fewer_pose_views
+    ):
+        num_views = int(ckpt.get("num_views", 1))
+        threshold = float(ckpt.get("pose_move_threshold", 0.01))
+        eligible_frames = [
+            frame_idx
+            for frame_idx in eligible_frames
+            if select_pose_views(
+                cam_centers_world,
+                frame_idx,
+                num_views,
+                threshold,
+                False,
+            ) is not None
+        ]
+        if not eligible_frames:
+            raise RuntimeError(
+                "No target frame has the strictly balanced pose-view layout "
+                "required by the active reconstruction policy."
+            )
+
     # ── Frame selection ────────────────────────────────────────────
     if args.frame_step is not None:
         step = max(1, args.frame_step)
-        mesh_frames = list(range(frame_start, frame_end + 1, step))
+        mesh_frames = [frame for frame in eligible_frames if frame % step == 0]
+        if not mesh_frames:
+            mesh_frames = [eligible_frames[0]]
     else:
-        n_mesh = min(region_count, max(1, args.mesh_frame_count))
-        mesh_frames = np.round(np.linspace(frame_start, frame_end, n_mesh)).astype(int).tolist()
-        mesh_frames = sorted(set(mesh_frames))
+        n_mesh = min(len(eligible_frames), max(1, args.mesh_frame_count))
+        positions = np.round(
+            np.linspace(0, len(eligible_frames) - 1, n_mesh)
+        ).astype(int)
+        mesh_frames = sorted({eligible_frames[position] for position in positions})
         step = None
 
     if not args.save_frame_visualizations:
         viz_frames = []
     elif args.indices is not None:
+        eligible_set = set(eligible_frames)
         viz_frames = sorted([
             int(i) for i in args.indices
-            if frame_start <= int(i) <= frame_end
+            if int(i) in eligible_set
         ])
     else:
         if len(mesh_frames) <= args.n_frames:
@@ -1987,6 +2695,11 @@ def main() -> None:
 
     print(f"Total frames     : {n_total}")
     print(f"Index range      : {frame_start}..{frame_end} ({region_count} frames)")
+    if len(eligible_frames) != region_count:
+        print(
+            f"Eligible targets : {len(eligible_frames)}/{region_count} "
+            "under strict balanced pose-view selection"
+        )
     if step is None:
         print(
             f"Prediction frames: {len(mesh_frames)} evenly spaced "
@@ -2029,7 +2742,7 @@ def main() -> None:
     depth_error_total = {"n": 0, "abs_sum": 0.0, "sq_sum": 0.0, "max_abs": 0.0}
     depth_error_by_case = {
         "current_mask": {"n": 0, "abs_sum": 0.0, "sq_sum": 0.0, "max_abs": 0.0},
-        "plus_1cm": {"n": 0, "abs_sum": 0.0, "sq_sum": 0.0, "max_abs": 0.0},
+        "raised_object_cube": {"n": 0, "abs_sum": 0.0, "sq_sum": 0.0, "max_abs": 0.0},
     }
 
     try:
@@ -2124,7 +2837,7 @@ def main() -> None:
                 T_event_from_base = np.linalg.inv(T_base_from_event)
                 for case_name, case_center in (
                     ("current_mask", cube_center),
-                    ("plus_1cm", plus_1cm_center),
+                    ("raised_object_cube", raised_object_center),
                 ):
                     spatial = depth_cube_mask(
                         gt, T_event_from_base, K, case_center, cube_half_side
@@ -2241,7 +2954,7 @@ def main() -> None:
             )
             for case_name, case_center in (
                 ("current_mask", cube_center),
-                ("plus_1cm", plus_1cm_center),
+                ("raised_object_cube", raised_object_center),
             ):
                 recon_by_case[case_name] = reconstruction_error_stats(
                     mesh_data, gt_mesh_data, K,
@@ -2268,7 +2981,7 @@ def main() -> None:
         print("Recon error      : no pose-aligned TSDF frames available")
 
     write_error_report(out_dir / "error_report.txt", depth_summary, recon_summary)
-    for case_name in ("current_mask", "plus_1cm"):
+    for case_name in ("current_mask", "raised_object_cube"):
         write_error_report(
             out_dir / f"error_report_{case_name}.txt",
             depth_by_case.get(case_name),
@@ -2279,6 +2992,7 @@ def main() -> None:
     # ── TSDF mesh ─────────────────────────────────────────────────
     pred_mesh_created = False
     gt_mesh_created = False
+    original_depth_mesh_created = False
     if args.best_mae_frames is not None:
         frame_selection_name = "best_mae"
     else:
@@ -2298,17 +3012,23 @@ def main() -> None:
     full_gt_mesh_path = out_dir / (
         f"{sequence_name}_{frame_selection_name}_full_gt_mesh.obj"
     )
-    plus_1cm_pred_mesh_path = out_dir / (
-        f"{sequence_name}_{frame_selection_name}_plus_1cm_mesh{pred_mesh_ext}"
+    raised_object_pred_mesh_path = out_dir / (
+        f"{sequence_name}_{frame_selection_name}_raised_object_mesh{pred_mesh_ext}"
     )
-    plus_1cm_gt_mesh_path = out_dir / (
-        f"{sequence_name}_{frame_selection_name}_plus_1cm_gt_mesh.obj"
+    raised_object_gt_mesh_path = out_dir / (
+        f"{sequence_name}_{frame_selection_name}_raised_object_gt_mesh.obj"
     )
     original_depth_mesh_path = (
         out_dir / f"{sequence_name}_{frame_selection_name}_original_depth_mesh.obj"
     )
+    evaluation_pred_mesh_path = pred_mesh_path
+    evaluation_gt_mesh_path = gt_mesh_path
+    evaluation_full_pred_mesh_path = full_pred_mesh_path
+    evaluation_full_gt_mesh_path = full_gt_mesh_path
+    evaluation_raised_pred_mesh_path = raised_object_pred_mesh_path
+    evaluation_raised_gt_mesh_path = raised_object_gt_mesh_path
     original_depth_mesh_data = []
-    if args.save_original_depth_mesh:
+    if use_original_depth_mesh:
         if not final_mesh_frame_ids:
             print("  Original depth : no final TSDF frames available")
         else:
@@ -2381,7 +3101,7 @@ def main() -> None:
             confidence_levels=confidence_levels,
             min_confidence=args.tsdf_min_confidence,
             use_color=args.color_mesh,
-            additional_crops=[(plus_1cm_pred_mesh_path, plus_1cm_center)],
+            additional_crops=[(raised_object_pred_mesh_path, raised_object_center)],
             full_mesh_path=(full_pred_mesh_path if args.evaluate_full_scale else None),
         )
         print(f"  Pred TSDF time : {time.perf_counter() - t_tsdf0:.1f}s")
@@ -2396,12 +3116,33 @@ def main() -> None:
             depth_max=depth_max,
             cube_center=cube_center,
             cube_half_side=cube_half_side,
-            additional_crops=[(plus_1cm_gt_mesh_path, plus_1cm_center)],
+            additional_crops=[(raised_object_gt_mesh_path, raised_object_center)],
             full_mesh_path=(full_gt_mesh_path if args.evaluate_full_scale else None),
         )
         print(f"  GT TSDF time   : {time.perf_counter() - t_tsdf0:.1f}s")
     elif gt_mesh_data:
         print("  GT TSDF        : skipped (--skip_gt_mesh)")
+    if args.save_largest_connected_surface:
+        if pred_mesh_created:
+            evaluation_pred_mesh_path = save_largest_connected_surface(
+                pred_mesh_path
+            )
+            evaluation_raised_pred_mesh_path = save_largest_connected_surface(
+                raised_object_pred_mesh_path
+            )
+            if args.evaluate_full_scale:
+                evaluation_full_pred_mesh_path = save_largest_connected_surface(
+                    full_pred_mesh_path
+                )
+        if gt_mesh_created:
+            evaluation_gt_mesh_path = save_largest_connected_surface(gt_mesh_path)
+            evaluation_raised_gt_mesh_path = save_largest_connected_surface(
+                raised_object_gt_mesh_path
+            )
+            if args.evaluate_full_scale:
+                evaluation_full_gt_mesh_path = save_largest_connected_surface(
+                    full_gt_mesh_path
+                )
     if original_depth_mesh_data:
         t_tsdf0 = time.perf_counter()
         original_depth_mesh_created = tsdf_fuse(
@@ -2421,26 +3162,27 @@ def main() -> None:
     # ── Post-TSDF reconstruction evaluation ──────────────────────
     full_surface_metrics = None
     surface_metrics = None
-    plus_1cm_surface_metrics = None
+    raised_object_surface_metrics = None
+    original_depth_surface_metrics = None
     rendered_metrics = None
-    plus_1cm_rendered_metrics = None
+    raised_object_rendered_metrics = None
     if pred_mesh_created and gt_mesh_created:
         t_metric0 = time.perf_counter()
         try:
             if args.evaluate_full_scale:
                 full_surface_metrics = evaluate_tsdf_meshes(
-                    full_pred_mesh_path,
-                    full_gt_mesh_path,
+                    evaluation_full_pred_mesh_path,
+                    evaluation_full_gt_mesh_path,
                     surface_samples=args.surface_samples,
                 )
             surface_metrics = evaluate_tsdf_meshes(
-                pred_mesh_path,
-                gt_mesh_path,
+                evaluation_pred_mesh_path,
+                evaluation_gt_mesh_path,
                 surface_samples=args.surface_samples,
             )
-            plus_1cm_surface_metrics = evaluate_tsdf_meshes(
-                plus_1cm_pred_mesh_path,
-                plus_1cm_gt_mesh_path,
+            raised_object_surface_metrics = evaluate_tsdf_meshes(
+                evaluation_raised_pred_mesh_path,
+                evaluation_raised_gt_mesh_path,
                 surface_samples=args.surface_samples,
             )
         except RuntimeError as exc:
@@ -2461,14 +3203,45 @@ def main() -> None:
                 f"Chamfer={full_surface_metrics['chamfer_mean_m'] * 100:.2f} cm, "
                 f"normal={full_surface_metrics['normal_consistency_symmetric']:.3f}"
             )
-        if plus_1cm_surface_metrics is not None:
+        if raised_object_surface_metrics is not None:
             print(
-                f"  Surface +1 cm : F@1cm={plus_1cm_surface_metrics['fscore_1cm']:.1%}, "
-                f"Chamfer={plus_1cm_surface_metrics['chamfer_mean_m'] * 100:.2f} cm, "
-                f"normal={plus_1cm_surface_metrics['normal_consistency_symmetric']:.3f}"
+                f"  Surface raised object: F@1cm={raised_object_surface_metrics['fscore_1cm']:.1%}, "
+                f"Chamfer={raised_object_surface_metrics['chamfer_mean_m'] * 100:.2f} cm, "
+                f"normal={raised_object_surface_metrics['normal_consistency_symmetric']:.3f}"
             )
     elif args.skip_gt_mesh:
         print("  Surface metrics: unavailable because --skip_gt_mesh was used")
+
+    if (
+        args.evaluate_original_depth_mesh
+        and pred_mesh_created
+        and original_depth_mesh_created
+    ):
+        try:
+            original_depth_surface_metrics = evaluate_tsdf_meshes(
+                evaluation_pred_mesh_path,
+                original_depth_mesh_path,
+                surface_samples=args.surface_samples,
+            )
+        except RuntimeError as exc:
+            print(f"  Native-depth surface metrics: skipped ({exc})")
+        if original_depth_surface_metrics is not None:
+            print(
+                "  Surface vs native depth: "
+                f"F@1/2/5cm="
+                f"{original_depth_surface_metrics['fscore_1cm']:.1%}/"
+                f"{original_depth_surface_metrics['fscore_2cm']:.1%}/"
+                f"{original_depth_surface_metrics['fscore_5cm']:.1%}, "
+                f"Chamfer="
+                f"{original_depth_surface_metrics['chamfer_mean_m'] * 100:.2f} cm, "
+                f"normal="
+                f"{original_depth_surface_metrics['normal_consistency_symmetric']:.3f}"
+            )
+    elif args.evaluate_original_depth_mesh:
+        print(
+            "  Native-depth surface metrics: unavailable because the predicted "
+            "or native-depth mesh was not created"
+        )
 
     full_rendered_metrics = None
     if pred_mesh_created and use_poses and args.render_eval_frames > 0:
@@ -2486,7 +3259,7 @@ def main() -> None:
             t_render0 = time.perf_counter()
             if args.evaluate_full_scale:
                 full_rendered_metrics = evaluate_rendered_depth(
-                    full_pred_mesh_path,
+                    evaluation_full_pred_mesh_path,
                     held_out_frames,
                     depth_h5_path,
                     ee_T_all,
@@ -2498,7 +3271,7 @@ def main() -> None:
                     depth_max,
                 )
             rendered_metrics = evaluate_rendered_depth(
-                pred_mesh_path,
+                evaluation_pred_mesh_path,
                 held_out_frames,
                 depth_h5_path,
                 ee_T_all,
@@ -2509,8 +3282,8 @@ def main() -> None:
                 depth_min,
                 depth_max,
             )
-            plus_1cm_rendered_metrics = evaluate_rendered_depth(
-                plus_1cm_pred_mesh_path,
+            raised_object_rendered_metrics = evaluate_rendered_depth(
+                evaluation_raised_pred_mesh_path,
                 held_out_frames,
                 depth_h5_path,
                 ee_T_all,
@@ -2535,10 +3308,15 @@ def main() -> None:
 
     write_tsdf_metric_outputs(out_dir, surface_metrics, rendered_metrics)
     reconstruction_metrics = {
+        "surface_selection": (
+            "largest_connected_surface"
+            if args.save_largest_connected_surface
+            else "all_surfaces"
+        ),
         "mask_definition": {
             "current_mask_center_world_m": cube_center.tolist(),
-            "plus_1cm_bottom_z_m": PLUS_1CM_BOTTOM_Z_M,
-            "plus_1cm_center_world_m": plus_1cm_center.tolist(),
+            "raised_object_bottom_z_m": RAISED_OBJECT_BOTTOM_Z_M,
+            "raised_object_center_world_m": raised_object_center.tolist(),
             "cube_side_m": args.cube_side,
         },
         "cases": {
@@ -2552,13 +3330,14 @@ def main() -> None:
                 "depth_metrics": depth_by_case.get("current_mask"),
                 "prefusion_pointcloud_metrics": recon_by_case.get("current_mask"),
                 "surface_metrics": surface_metrics,
+                "original_depth_surface_metrics": original_depth_surface_metrics,
                 "rendered_depth_metrics": rendered_metrics,
             },
-            "plus_1cm": {
-                "depth_metrics": depth_by_case.get("plus_1cm"),
-                "prefusion_pointcloud_metrics": recon_by_case.get("plus_1cm"),
-                "surface_metrics": plus_1cm_surface_metrics,
-                "rendered_depth_metrics": plus_1cm_rendered_metrics,
+            "raised_object_cube": {
+                "depth_metrics": depth_by_case.get("raised_object_cube"),
+                "prefusion_pointcloud_metrics": recon_by_case.get("raised_object_cube"),
+                "surface_metrics": raised_object_surface_metrics,
+                "rendered_depth_metrics": raised_object_rendered_metrics,
             },
         },
     }
@@ -2567,20 +3346,26 @@ def main() -> None:
     )
     case_lines = [
         "Reconstruction metrics for full-scale and spatially cropped meshes",
+        (
+            "Surface selection: largest connected surface"
+            if args.save_largest_connected_surface
+            else "Surface selection: all extracted surfaces"
+        ),
         f"Current cube center: {cube_center.tolist()} m",
-        f"+1 cm cube bottom: z={PLUS_1CM_BOTTOM_Z_M:.3f} m; center={plus_1cm_center.tolist()} m",
+        f"Raised object cube bottom: z={RAISED_OBJECT_BOTTOM_Z_M:.3f} m; center={raised_object_center.tolist()} m",
         "",
     ]
     for case_name, label in (
         ("full_scale", "Full scale (uncropped)"),
         ("current_mask", "Current mask"),
-        ("plus_1cm", "+1 cm bottom"),
+        ("raised_object_cube", "Raised object cube (+1.5 cm)"),
     ):
         case = reconstruction_metrics["cases"][case_name]
         case_lines.append(label)
         depth_case = case["depth_metrics"]
         point_case = case["prefusion_pointcloud_metrics"]
         surface_case = case["surface_metrics"]
+        original_surface_case = case.get("original_depth_surface_metrics")
         render_case = case["rendered_depth_metrics"]
         if depth_case:
             case_lines.append(f"  Depth MAE/RMSE: {depth_case['mae_m']:.6f}/{depth_case['rmse_m']:.6f} m")
@@ -2590,6 +3375,22 @@ def main() -> None:
             case_lines.append(f"  Post-TSDF Chamfer mean/median: {surface_case['chamfer_mean_m']:.6f}/{surface_case['chamfer_median_m']:.6f} m")
             case_lines.append(f"  Normal consistency: {surface_case['normal_consistency_symmetric']:.6f}")
             case_lines.append(f"  F-score @1/2/5 cm: {surface_case['fscore_1cm']:.2%}/{surface_case['fscore_2cm']:.2%}/{surface_case['fscore_5cm']:.2%}")
+        if original_surface_case:
+            case_lines.append(
+                "  Versus native-depth mesh Chamfer mean/median: "
+                f"{original_surface_case['chamfer_mean_m']:.6f}/"
+                f"{original_surface_case['chamfer_median_m']:.6f} m"
+            )
+            case_lines.append(
+                "  Versus native-depth mesh normal consistency: "
+                f"{original_surface_case['normal_consistency_symmetric']:.6f}"
+            )
+            case_lines.append(
+                "  Versus native-depth mesh F-score @1/2/5 cm: "
+                f"{original_surface_case['fscore_1cm']:.2%}/"
+                f"{original_surface_case['fscore_2cm']:.2%}/"
+                f"{original_surface_case['fscore_5cm']:.2%}"
+            )
         if render_case:
             case_lines.append(f"  Rendered MAE/RMSE: {render_case['mae_m']:.6f}/{render_case['rmse_m']:.6f} m")
             case_lines.append(f"  Render coverage: {render_case['valid_render_percentage']:.2%}")

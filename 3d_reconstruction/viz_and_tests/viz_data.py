@@ -192,18 +192,35 @@ def _resolve_data_dir(path: Path) -> Path:
     )
 
 
+def _recording_pose_files(data_dir: Path) -> list[Path]:
+    """Find pose files, restricting dataset roots to train and eval splits."""
+    direct_pose_file = data_dir / "hdf5" / "poses.h5"
+    if direct_pose_file.is_file():
+        return [direct_pose_file]
+
+    split_dirs = [
+        data_dir / split_name
+        for split_name in ("train", "eval")
+        if (data_dir / split_name).is_dir()
+    ]
+    if split_dirs:
+        return sorted(
+            pose_file
+            for split_dir in split_dirs
+            for pose_file in split_dir.rglob("hdf5/poses.h5")
+        )
+
+    # Preserve support for passing a split directory such as data/new_2/train.
+    return sorted(data_dir.rglob("hdf5/poses.h5"))
+
+
 def load_recorded_ee_poses(
     data_dir: Path,
 ) -> tuple[np.ndarray, list[tuple[str, int]]]:
     """Recursively load every recorded ``ee_T`` pose below a data directory."""
     import h5py
 
-    direct_pose_file = data_dir / "hdf5" / "poses.h5"
-    pose_files = (
-        [direct_pose_file]
-        if direct_pose_file.is_file()
-        else sorted(data_dir.rglob("hdf5/poses.h5"))
-    )
+    pose_files = _recording_pose_files(data_dir)
     if not pose_files:
         raise FileNotFoundError(f"No hdf5/poses.h5 files found below {data_dir}")
 
@@ -231,33 +248,36 @@ def load_recorded_ee_poses(
     return np.concatenate(transforms, axis=0), sequence_counts
 
 
-def load_recorded_translational_speeds(data_dir: Path) -> np.ndarray:
-    """Load per-frame EE translational speeds from recorded sequences."""
+def load_recorded_translational_speeds(
+    data_dir: Path,
+) -> tuple[np.ndarray, list[dict[str, int | str]]]:
+    """Load EE speeds and diagnostics describing rejected speed samples."""
     import h5py
 
     resolved_dir = _resolve_data_dir(data_dir)
-    direct_pose_file = resolved_dir / "hdf5" / "poses.h5"
-    pose_files = (
-        [direct_pose_file]
-        if direct_pose_file.is_file()
-        else sorted(resolved_dir.rglob("hdf5/poses.h5"))
-    )
+    pose_files = _recording_pose_files(resolved_dir)
     all_speeds: list[np.ndarray] = []
+    diagnostics: list[dict[str, int | str]] = []
     for pose_file in pose_files:
         sequence_dir = pose_file.parent.parent
+        sequence_name = str(sequence_dir.relative_to(resolved_dir))
         with h5py.File(pose_file, "r") as handle:
             positions = handle["ee_T"][:, :3, 3].astype(np.float64)
 
         timestamps_s = None
+        timestamp_source = "generated from metadata FPS"
         realsense_path = sequence_dir / "hdf5" / "realsense.h5"
         if realsense_path.is_file():
             with h5py.File(realsense_path, "r") as handle:
                 if "t_global_ms" in handle:
                     timestamps_s = handle["t_global_ms"][:].astype(np.float64) / 1e3
+                    timestamp_source = "realsense.h5:t_global_ms"
                 elif "t_hw_as_sys_ns" in handle:
                     timestamps_s = handle["t_hw_as_sys_ns"][:].astype(np.float64) / 1e9
+                    timestamp_source = "realsense.h5:t_hw_as_sys_ns"
                 elif "t_sys_ns" in handle:
                     timestamps_s = handle["t_sys_ns"][:].astype(np.float64) / 1e9
+                    timestamp_source = "realsense.h5:t_sys_ns"
 
         if timestamps_s is None:
             fps = 30.0
@@ -267,8 +287,23 @@ def load_recorded_translational_speeds(data_dir: Path) -> np.ndarray:
                     fps = float(handle.attrs.get("fps", fps))
             timestamps_s = np.arange(len(positions), dtype=np.float64) / max(fps, 1e-6)
 
-        count = min(len(positions), len(timestamps_s))
+        pose_count = len(positions)
+        timestamp_count = len(timestamps_s)
+        count = min(pose_count, timestamp_count)
+        diagnostic: dict[str, int | str] = {
+            "sequence": sequence_name,
+            "timestamp_source": timestamp_source,
+            "pose_count": pose_count,
+            "timestamp_count": timestamp_count,
+            "aligned_count": count,
+            "poses_without_timestamp": max(0, pose_count - timestamp_count),
+            "unused_timestamps": max(0, timestamp_count - pose_count),
+            "invalid_dt": 0,
+            "nonfinite_speed": 0,
+            "valid_speed_count": 0,
+        }
         if count < 2:
+            diagnostics.append(diagnostic)
             continue
         positions = positions[:count]
         timestamps_s = timestamps_s[:count]
@@ -278,9 +313,20 @@ def load_recorded_translational_speeds(data_dir: Path) -> np.ndarray:
         displacement = positions[right] - positions[left]
         valid = np.isfinite(dt) & (dt > 1e-9)
         speed = np.linalg.norm(displacement[valid], axis=1) / dt[valid]
-        all_speeds.append(speed[np.isfinite(speed)])
+        finite_speed = np.isfinite(speed)
+        usable_speed = speed[finite_speed]
+        diagnostic["invalid_dt"] = int(count - valid.sum())
+        diagnostic["nonfinite_speed"] = int((~finite_speed).sum())
+        diagnostic["valid_speed_count"] = len(usable_speed)
+        diagnostics.append(diagnostic)
+        all_speeds.append(usable_speed)
 
-    return np.concatenate(all_speeds) if all_speeds else np.empty(0, dtype=np.float64)
+    speeds = (
+        np.concatenate(all_speeds)
+        if all_speeds
+        else np.empty(0, dtype=np.float64)
+    )
+    return speeds, diagnostics
 
 
 def create_speed_distribution_plot(speeds_m_s: np.ndarray, output_path: Path) -> None:
@@ -318,15 +364,15 @@ def create_speed_distribution_plot(speeds_m_s: np.ndarray, output_path: Path) ->
     )
     median, p95, p99 = np.percentile(speed, [50, 95, 99])
     for value, label, color in (
-        (median, "median", "#E07A1F"),
-        (p95, "95th percentile", "#C33C54"),
-        (p99, "99th percentile", "#3A923A"),
+        (median, "Median", "#E07A1F"),
+        (p95, "95th Percentile", "#C33C54"),
+        (p99, "99th Percentile", "#3A923A"),
     ):
         axis.axvline(value, color=color, linestyle="--", linewidth=1.8,
                      label=f"{label}: {value:.3f} m/s")
     axis.set_xlabel("End-effector translational speed [m/s]")
     axis.set_ylabel("Density")
-    axis.set_title(f"Recorded speed distribution ({speed.size:,} frames)")
+    axis.set_title("Recorded End-Effector Speed Distribution")
     axis.legend()
     figure.tight_layout()
     figure.savefig(output_path, dpi=190, bbox_inches="tight", facecolor="white")
@@ -788,7 +834,13 @@ def create_sensor_modalities_plot(
             f"shape {projected_depth.shape} in {sequence_dir}. Regenerate both "
             "with the same crop/resize mode."
         )
-    overlay_events = events
+    # Use the original, un-dilated event support in both event-frame panels.
+    overlay_event_mask = events > 0.0
+    event_display = overlay_event_mask.astype(np.float32)
+    # Event pixels are opaque white; zero-event pixels are transparent, so the
+    # event layer cannot darken the projected-depth colours.
+    event_highlight = np.ones((*events.shape, 4), dtype=np.float32)
+    event_highlight[..., 3] = event_display
 
     sns.set_theme(
         context="talk",
@@ -819,7 +871,13 @@ def create_sensor_modalities_plot(
             "turbo",
             {"vmin": 0.05, "vmax": 1.0},
         ),
-        (axes[1, 0], events, "Events", "gray", {"vmin": 0.0, "vmax": 1.0}),
+        (
+            axes[1, 0],
+            event_display,
+            "Events",
+            "gray",
+            {"vmin": 0.0, "vmax": 1.0},
+        ),
     )
     for axis, image, title, color_map, image_kwargs in panels:
         axis.imshow(image, cmap=color_map, **image_kwargs)
@@ -830,16 +888,15 @@ def create_sensor_modalities_plot(
             spine.set_visible(False)
 
     overlay_axis = axes[1, 1]
-    overlay_axis.imshow(overlay_events, cmap="gray", vmin=0.0, vmax=1.0)
     overlay_axis.imshow(
         np.ma.masked_less_equal(projected_depth, 0.0),
         cmap="turbo",
         vmin=0.05,
         vmax=1.0,
-        alpha=0.68,
     )
+    overlay_axis.imshow(event_highlight)
     overlay_axis.set_title(
-        "Depth in event frame over events",
+        "Depth in event frame with events",
         pad=10,
         fontweight="semibold",
     )
@@ -866,6 +923,8 @@ def write_summary(
     position_label: str,
     source_label: str,
     sequence_counts: list[tuple[str, int]],
+    speeds_m_s: np.ndarray,
+    speed_diagnostics: list[dict[str, int | str]],
 ) -> None:
     accepted_ee = ee_points[valid]
     accepted_displayed = displayed_points[valid]
@@ -900,11 +959,90 @@ def write_summary(
         "Scope: sampler position constraints only; IK/collision feasibility is not tested.",
     ]
     if sequence_counts:
-        lines.extend(["", f"Recorded sequences: {len(sequence_counts)}"])
+        sequence_lengths = np.asarray(
+            [count for _, count in sequence_counts], dtype=np.int64
+        )
+        lines.extend(
+            [
+                "",
+                f"Recorded sequences: {len(sequence_counts)}",
+                (
+                    "Sequence length range [pose frames]: "
+                    f"{int(sequence_lengths.min())}--{int(sequence_lengths.max())}"
+                ),
+            ]
+        )
         lines.extend(
             f"  {sequence_name}: {count} poses"
             for sequence_name, count in sequence_counts
         )
+    finite_speeds = np.asarray(speeds_m_s, dtype=np.float64)
+    finite_speeds = finite_speeds[
+        np.isfinite(finite_speeds) & (finite_speeds >= 0.0)
+    ]
+    if finite_speeds.size:
+        lines.extend(
+            [
+                "",
+                f"Highest measured EE translational speed [m/s]: {finite_speeds.max():.6f}",
+            ]
+        )
+    if speed_diagnostics:
+        total_pose_samples = sum(int(row["pose_count"]) for row in speed_diagnostics)
+        total_aligned = sum(int(row["aligned_count"]) for row in speed_diagnostics)
+        total_without_timestamp = sum(
+            int(row["poses_without_timestamp"]) for row in speed_diagnostics
+        )
+        total_unused_timestamps = sum(
+            int(row["unused_timestamps"]) for row in speed_diagnostics
+        )
+        total_invalid_dt = sum(int(row["invalid_dt"]) for row in speed_diagnostics)
+        total_nonfinite_speed = sum(
+            int(row["nonfinite_speed"]) for row in speed_diagnostics
+        )
+        total_valid_speeds = sum(
+            int(row["valid_speed_count"]) for row in speed_diagnostics
+        )
+        lines.extend(
+            [
+                "",
+                "EE speed sample diagnostics",
+                f"Pose samples read for speed calculation: {total_pose_samples}",
+                f"Pose/timestamp pairs after length alignment: {total_aligned}",
+                f"Poses without a corresponding timestamp: {total_without_timestamp}",
+                f"Extra timestamps without a corresponding pose: {total_unused_timestamps}",
+                f"Rejected pairs with non-finite or non-positive time difference: {total_invalid_dt}",
+                f"Rejected pairs producing non-finite speed: {total_nonfinite_speed}",
+                f"Valid speed samples used by the plot: {total_valid_speeds}",
+            ]
+        )
+        problematic = [
+            row
+            for row in speed_diagnostics
+            if any(
+                int(row[key]) > 0
+                for key in (
+                    "poses_without_timestamp",
+                    "unused_timestamps",
+                    "invalid_dt",
+                    "nonfinite_speed",
+                )
+            )
+        ]
+        if problematic:
+            lines.append("Sequences with rejected or unpaired speed samples:")
+            for row in problematic:
+                lines.append(
+                    "  "
+                    f"{row['sequence']}: poses={row['pose_count']}, "
+                    f"timestamps={row['timestamp_count']} "
+                    f"({row['timestamp_source']}), aligned={row['aligned_count']}, "
+                    f"missing_timestamp={row['poses_without_timestamp']}, "
+                    f"extra_timestamp={row['unused_timestamps']}, "
+                    f"invalid_dt={row['invalid_dt']}, "
+                    f"nonfinite_speed={row['nonfinite_speed']}, "
+                    f"used={row['valid_speed_count']}"
+                )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -923,9 +1061,11 @@ def main() -> None:
         type=Path,
         default=None,
         help=(
-            "Load all recorded hdf5/poses.h5 files recursively below this "
-            "directory instead of generating Monte Carlo samples. Paths such as "
-            "data/new are also resolved relative to 3d_reconstruction."
+            "Load recorded hdf5/poses.h5 files instead of generating Monte "
+            "Carlo samples. Dataset roots are restricted to their train/ and "
+            "eval/ subdirectories; direct sequence and split paths remain "
+            "supported. Paths such as data/new are resolved relative to "
+            "3d_reconstruction."
         ),
     )
     parser.add_argument(
@@ -1046,9 +1186,13 @@ def main() -> None:
         else _HERE / "plots" / f"{default_stem}.txt"
     )
     speed_distribution_path = None
+    recorded_speeds = np.empty(0, dtype=np.float64)
+    speed_diagnostics: list[dict[str, int | str]] = []
     speed_source_dir = args.data_dir or args.sequence_dir
     if speed_source_dir is not None:
-        recorded_speeds = load_recorded_translational_speeds(speed_source_dir)
+        recorded_speeds, speed_diagnostics = load_recorded_translational_speeds(
+            speed_source_dir
+        )
         if recorded_speeds.size:
             speed_distribution_path = output_path.with_name(
                 f"{output_path.stem}_speed_distribution.png"
@@ -1075,6 +1219,8 @@ def main() -> None:
         position_label,
         source_label,
         sequence_counts,
+        recorded_speeds,
+        speed_diagnostics,
     )
 
     sequence_output_path = None
