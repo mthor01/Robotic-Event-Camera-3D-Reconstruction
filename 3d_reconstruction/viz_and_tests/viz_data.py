@@ -21,10 +21,13 @@ import numpy as np
 
 _HERE = Path(__file__).resolve().parent
 _REPOSITORY_ROOT = _HERE.parents[1]
+_RECONSTRUCTION_ROOT = _REPOSITORY_ROOT / "3d_reconstruction"
 _FRANKA_PIPELINE_ROOT = _REPOSITORY_ROOT / "franka_pipeline"
 sys.path.insert(0, str(_FRANKA_PIPELINE_ROOT))
+sys.path.insert(0, str(_RECONSTRUCTION_ROOT))
 
 import config_defaults as cfg  # noqa: E402
+from config import DEPTH_MIN, D_MAX  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -757,7 +760,7 @@ def create_sensor_modalities_plot(
     output_stem: Path,
     frame_index: int | None,
     sequence_name: str,
-) -> tuple[Path, int]:
+) -> tuple[Path, Path, int]:
     """Render aligned RGB, depth, events, and event-frame depth in a 2x2 grid."""
     import h5py
     import matplotlib
@@ -911,7 +914,30 @@ def create_sensor_modalities_plot(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output_path, dpi=190, bbox_inches="tight", facecolor="white")
     plt.close(figure)
-    return output_path, selected_frame
+
+    # Export the bottom-right panel separately with the same target transform
+    # used during training: cap metric depth at D_MAX, then scale the training
+    # interval [DEPTH_MIN, D_MAX] to [0, 1]. Invalid depth remains black and
+    # event pixels remain opaque white, matching the modalities overview.
+    valid_depth = projected_depth > 0.0
+    training_depth = np.minimum(projected_depth, D_MAX)
+    training_depth = np.clip(
+        (training_depth - DEPTH_MIN) / (D_MAX - DEPTH_MIN),
+        0.0,
+        1.0,
+    )
+    depth_event_image = matplotlib.colormaps["turbo"](training_depth)
+    depth_event_image[~valid_depth, :3] = 0.0
+    depth_event_image[~valid_depth, 3] = 1.0
+    depth_event_image[overlay_event_mask, :3] = 1.0
+    depth_event_image[overlay_event_mask, 3] = 1.0
+
+    training_depth_path = output_stem.with_name(
+        f"{output_stem.stem}_frame_{selected_frame:06d}"
+        "_depth_events_training_scaled.png"
+    )
+    plt.imsave(training_depth_path, depth_event_image)
+    return output_path, training_depth_path, selected_frame
 
 
 def write_summary(
@@ -1225,6 +1251,7 @@ def main() -> None:
 
     sequence_output_path = None
     sensor_overview_path = None
+    training_depth_overlay_path = None
     if args.sequence_dir is not None:
         resolved_sequence_dir = _resolve_data_dir(args.sequence_dir)
         sequence_ee_transforms = load_sequence_ee_poses(resolved_sequence_dir)
@@ -1252,7 +1279,7 @@ def main() -> None:
         sensor_output_stem = output_path.with_name(
             f"{output_path.stem}_{sequence_stem}"
         )
-        sensor_overview_path, _ = create_sensor_modalities_plot(
+        sensor_overview_path, training_depth_overlay_path, _ = create_sensor_modalities_plot(
             resolved_sequence_dir,
             sensor_output_stem,
             args.frame_index,
@@ -1273,6 +1300,11 @@ def main() -> None:
         print(f"3D recording path written to: {sequence_output_path}")
     if sensor_overview_path is not None:
         print(f"Sensor overview written to: {sensor_overview_path}")
+    if training_depth_overlay_path is not None:
+        print(
+            "Training-scaled depth/events image written to: "
+            f"{training_depth_overlay_path}"
+        )
 
 
 if __name__ == "__main__":
