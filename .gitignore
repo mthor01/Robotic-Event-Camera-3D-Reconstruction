@@ -2,7 +2,7 @@
 3d_reconstruction/data/
 **/*.obj
 **/*.pt
-**/*.png
+3d_reconstruction/**/*.png
 3d_reconstruction/training/checkpoints/
 **/logs/
 **/*.sbatch

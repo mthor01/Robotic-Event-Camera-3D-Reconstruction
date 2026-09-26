@@ -1,22 +1,144 @@
 # Robot Recording and Event-Based 3-D Reconstruction
 
-This repository contains an experimental research pipeline for collecting
-robot-mounted multi-modal data with a Franka Emika Panda arm and reconstructing
-tabletop scenes from event-camera measurements.  It combines:
+This repository contains the complete research pipeline developed for my
+master's thesis: synchronized data recording with robot-mounted cameras,
+geometric preprocessing, event-based multi-view depth prediction, and dense
+3-D reconstruction through TSDF fusion.
 
-- a Franka/Deoxys control and data-collection pipeline;
-- synchronized RealSense RGB-D, event-camera, and end-effector-pose recording;
-- multi-camera calibration and geometric preprocessing;
-- event-voxel generation, table-plane priors, multiview depth training, and
-  TSDF-based 3-D reconstruction; and
-- diagnostics and visualizations for calibration, timing, pose selection, and
-  reconstruction quality.
+**[Read the master's thesis (PDF)](docs/Masters_Thesis_github.pdf)**
+
+The main contribution is an event-based depth-estimation method inspired by
+RGB multi-view stereo (MVS). Instead of matching conventional RGB images, the
+model combines event voxel grids from several calibrated viewpoints with an
+approximate table-plane prior. It uses camera geometry to construct
+coarse-to-fine cost volumes, predicts a dense depth map and confidence map for
+each reference view, and fuses the resulting predictions into a 3-D mesh.
 
 > **Safety notice:** this code can command a physical robot. Run new code in
 > simulation first, keep the emergency stop accessible, verify workspace and
 > collision limits, and never operate the real robot unattended. The included
 > calibration files and workspace constants describe one particular setup and
 > must be revalidated for any other robot, camera mount, table, or scene.
+
+## Experimental setup and recorded dataset
+
+An Intel RealSense D435 RGB-D camera and an IDS UE-39B0XCP-E event camera are
+rigidly attached to the end effector of a Franka Emika Panda robot. The cameras
+are hardware synchronized, while the robot publishes timestamped end-effector
+poses. Camera, hand-eye, and robot calibration provide the transformations
+needed both to project RealSense depth into the event-camera frame and to place
+all event-camera observations in a common world coordinate system.
+
+<p align="center">
+  <img src="docs/images/cameras_2%20-%20Kopie.jpg" alt="Close-up of the synchronized event and RGB-D cameras mounted on the robot end effector" width="760">
+</p>
+
+<p align="center"><em>The event camera and RealSense depth camera on the custom end-effector mount.</em></p>
+
+<p align="center">
+  <img src="docs/images/robot_arm_2%20-%20Kopie.jpg" alt="Franka robot recording a building-block object on the tabletop" width="560">
+</p>
+
+<p align="center"><em>The complete recording setup with a static building-block object in the workspace.</em></p>
+
+The recorded dataset contains **48 object-specific sequences** of static,
+colored building-block structures on a mostly textureless white table. For
+each sequence, the robot moves the camera rig along a smooth path through
+randomly sampled, reachable viewpoints on a restricted hemisphere around the
+object. Each trajectory is constructed from 30 target poses and is recorded
+continuously, producing synchronized event streams, RGB-D measurements, and
+camera poses. The split contains **42 training sequences** and **6 held-out
+evaluation sequences**; there is no separate test set.
+
+The RealSense depth measurements serve as supervision rather than model input:
+after calibration they are projected into the event-camera frame to form
+ground-truth depth maps. The event camera records at 1280 x 720 pixels, while
+RealSense depth is captured at 640 x 480 pixels and 30 Hz. An optical filter in
+front of the event-camera lens suppresses events caused by the RealSense
+infrared projector.
+
+## End-to-end reconstruction pipeline
+
+The project covers all stages from physical recording to a reconstructed
+surface:
+
+1. **Synchronized recording.** The robot follows a multi-view trajectory around
+   a static object. Event data, RealSense RGB-D frames, and end-effector poses
+   are recorded and associated through hardware triggering and ZeroMQ-based
+   synchronization.
+2. **Calibration and preprocessing.** Hand-eye and multi-camera calibration
+   determine the event-camera poses and the transformation between both
+   cameras. RealSense depth is projected into the event-camera frame, raw
+   events are accumulated into five-bin voxel grids, and a view-dependent
+   table-plane depth prior is generated.
+3. **MVS-inspired depth prediction.** One event observation is selected as the
+   reference view and up to eight displaced observations of the same scene are
+   used as source views. A shared feature pyramid extracts multi-scale features
+   from each event voxel grid and table prior. As in RGB MVS methods, calibrated
+   camera geometry warps source-view features across depth hypotheses. Cascaded
+   cost volumes progressively narrow the depth interval, after which a
+   refinement network predicts full-resolution reference-view depth and a
+   per-pixel confidence map.
+4. **TSDF reconstruction.** Predicted depth maps are transformed into the
+   common world frame and integrated into a truncated signed distance field.
+   Confidence-weighted fusion reduces the influence of unreliable predictions,
+   and the final surface is extracted as a triangle mesh.
+
+```text
+Event camera + RGB-D supervision + robot poses
+                      |
+                      v
+       calibration and synchronized recording
+                      |
+                      v
+ event voxel grids + table priors + ground-truth depth
+                      |
+                      v
+ geometry-aware multi-view depth and confidence prediction
+                      |
+                      v
+        confidence-weighted TSDF fusion -> 3-D mesh
+```
+
+## Results on the recorded dataset
+
+The following results are measured on the six held-out recording sequences,
+whose objects were not used for training. Depth errors are reported in three
+regions: the whole image, a workspace cube around the recording area, and a
+raised cube that removes most of the dominant table surface and therefore
+focuses the evaluation on the object itself. Lower MAE and RMSE are better.
+
+<p align="center">
+  <img src="docs/images/final_results_table%20-%20Kopie.png" alt="Depth-prediction results on the held-out recorded dataset" width="560">
+</p>
+
+<p align="center"><em>Mean depth-prediction error of the geometry-based multiview model over the held-out sequences.</em></p>
+
+The model reaches a whole-frame MAE of **0.182 cm** and a workspace-cube MAE
+of **0.180 cm**. The raised-cube MAE is higher at **0.522 cm**, because this
+region emphasizes the more difficult object surfaces and depth discontinuities
+instead of the large, comparatively simple table.
+
+For reconstruction, the predicted depth maps are fused with confidence-weighted
+TSDF integration and compared with reference meshes reconstructed from the
+ground-truth depth maps. The values below are averages over the same six
+held-out objects. Accuracy measures predicted-to-reference surface distance,
+completeness measures reference-to-predicted distance, and their symmetric mean
+is the Chamfer distance; lower is better. Normal consistency is better when
+closer to one.
+
+<p align="center">
+  <img src="docs/images/mesh_results_table%20-%20Kopie.png" alt="TSDF mesh-reconstruction results on the held-out recorded dataset" width="820">
+</p>
+
+<p align="center"><em>Mean surface metrics for confidence-weighted TSDF reconstructions of the held-out sequences.</em></p>
+
+Inside the workspace cube, the reconstructed meshes achieve a mean Chamfer
+distance of **0.108 cm** and normal consistency of **0.966**. In the more
+object-focused raised cube, the Chamfer distance is **0.180 cm** and normal
+consistency is **0.905**. These results show that the predicted event-based
+depth maps remain sufficiently consistent across viewpoints to produce coherent
+surfaces after fusion.
 
 ## Repository layout
 
@@ -31,7 +153,7 @@ tabletop scenes from event-camera measurements.  It combines:
 | `docker_installation/` | Dockerfiles for the robot backend, robot frontend, and recording/training environment. |
 | `instructions/` | Hardware notes and vendor documentation retained from the development setup. |
 
-## System overview
+## Software architecture
 
 The physical-data workflow uses two cooperating processes:
 
@@ -39,24 +161,6 @@ The physical-data workflow uses two cooperating processes:
    timestamped end-effector poses plus episode events through ZeroMQ.
 2. `3d_reconstruction/rec_data.py` records the cameras, subscribes to those
    poses, and uses a request/reply handshake to synchronize recording.
-
-The reconstruction workflow is:
-
-```text
-RealSense RGB-D + event camera + robot poses
-                 |
-                 v
-        camera/hand-eye calibration
-                 |
-                 v
- depth projection -> table-plane prior -> event voxel grids
-                 |
-                 v
- multiview depth network (event voxels + table priors + poses)
-                 |
-                 v
- per-view depth / confidence -> TSDF fusion -> mesh and metrics
-```
 
 Shared recording, preprocessing, and reconstruction constants live in
 [`3d_reconstruction/config.py`](3d_reconstruction/config.py), including image
@@ -267,6 +371,6 @@ vendor PDFs and linking to their official download pages instead.
 
 ## Citation
 
-If this code supports a paper, thesis, or report, add the bibliographic entry
-here before release. Until then, please cite the repository URL and the commit
-or release version used.
+For the scientific motivation, method, and complete evaluation, please refer to
+the [master's thesis](docs/Masters_Thesis_github.pdf). If you use the code,
+please also cite the repository URL and the commit or release version used.
