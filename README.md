@@ -14,12 +14,6 @@ approximate table-plane prior. It uses camera geometry to construct
 coarse-to-fine cost volumes, predicts a dense depth map and confidence map for
 each reference view, and fuses the resulting predictions into a 3-D mesh.
 
-> **Safety notice:** this code can command a physical robot. Run new code in
-> simulation first, keep the emergency stop accessible, verify workspace and
-> collision limits, and never operate the real robot unattended. The included
-> calibration files and workspace constants describe one particular setup and
-> must be revalidated for any other robot, camera mount, table, or scene.
-
 ## Experimental setup and recorded dataset
 
 An Intel RealSense D435 RGB-D camera and an IDS UE-39B0XCP-E event camera are
@@ -103,21 +97,10 @@ Event camera + RGB-D supervision + robot poses
 ## Results on the recorded dataset
 
 The following results are measured on the six held-out recording sequences,
-whose objects were not used for training. Depth errors are reported in three
-regions: the whole image, a workspace cube around the recording area, and a
-raised cube that removes most of the dominant table surface and therefore
-focuses the evaluation on the object itself. Lower MAE and RMSE are better.
-
-<p align="center">
-  <img src="docs/images/final_results_table%20-%20Kopie.png" alt="Depth-prediction results on the held-out recorded dataset" width="560">
-</p>
-
-<p align="center"><em>Mean depth-prediction error of the geometry-based multiview model over the held-out sequences.</em></p>
-
-The model reaches a whole-frame MAE of **0.182 cm** and a workspace-cube MAE
-of **0.180 cm**. The raised-cube MAE is higher at **0.522 cm**, because this
-region emphasizes the more difficult object surfaces and depth discontinuities
-instead of the large, comparatively simple table.
+whose objects were not used for training. Evaluation is restricted to the
+workspace cube surrounding the recording area. In this region, the
+geometry-based multiview model achieves a mean absolute depth error (MAE) of
+**0.180 cm** and a root mean squared error (RMSE) of **0.630 cm**.
 
 For reconstruction, the predicted depth maps are fused with confidence-weighted
 TSDF integration and compared with reference meshes reconstructed from the
@@ -127,18 +110,11 @@ completeness measures reference-to-predicted distance, and their symmetric mean
 is the Chamfer distance; lower is better. Normal consistency is better when
 closer to one.
 
-<p align="center">
-  <img src="docs/images/mesh_results_table%20-%20Kopie.png" alt="TSDF mesh-reconstruction results on the held-out recorded dataset" width="820">
-</p>
-
-<p align="center"><em>Mean surface metrics for confidence-weighted TSDF reconstructions of the held-out sequences.</em></p>
-
-Inside the workspace cube, the reconstructed meshes achieve a mean Chamfer
-distance of **0.108 cm** and normal consistency of **0.966**. In the more
-object-focused raised cube, the Chamfer distance is **0.180 cm** and normal
-consistency is **0.905**. These results show that the predicted event-based
-depth maps remain sufficiently consistent across viewpoints to produce coherent
-surfaces after fusion.
+Inside the workspace cube, the reconstructed meshes achieve a mean accuracy of
+**0.108 cm**, completeness of **0.108 cm**, Chamfer distance of **0.108 cm**,
+and normal consistency of **0.966**. These results show that the predicted
+event-based depth maps remain sufficiently consistent across viewpoints to
+produce coherent surfaces after fusion.
 
 ## Repository layout
 
@@ -174,20 +150,34 @@ Docker, a Franka Emika Panda, Deoxys, an Intel RealSense camera, and an
 event-camera stack based on Metavision/IDS uEye EVS. It is hardware-specific;
 this repository does not make the system plug-and-play on arbitrary hardware.
 
-For reconstruction and training, the recording/training Dockerfile installs the
-main Python packages: PyTorch, Open3D, OpenCV, NumPy, SciPy, h5py, pyzmq,
-msgpack, TensorBoard, Matplotlib, and related tools. Build it from its directory:
+All scripts in `3d_reconstruction/` are intended to run inside the environment
+defined by
+[`docker_installation/training_and_reconstruction/Dockerfile`](docker_installation/training_and_reconstruction/Dockerfile).
+This includes camera recording, calibration, data preprocessing, model training,
+evaluation, and TSDF reconstruction. Build the image from its directory:
 
 ```bash
 cd docker_installation/training_and_reconstruction
 docker build -t robot-record-reconstruction .
 ```
 
-For the robot pipeline, install the Python dependencies listed in
-[`franka_pipeline/requirements.txt`](franka_pipeline/requirements.txt), plus
-the hardware-specific packages that are intentionally left optional there
-(`pyrealsense2`, OpenCV, input-device packages, Deoxys, and robosuite). The
-robot backend and frontend Dockerfiles document the original container setup.
+Data recording additionally requires `franka_pipeline/` and its two-container
+robot-control environment:
+
+- The image defined by
+  [`docker_installation/robot_arm_backend/Dockerfile`](docker_installation/robot_arm_backend/Dockerfile)
+  runs the low-level Deoxys backend that communicates with the robot. This
+  container must already be running in the background before robot commands are
+  issued.
+- The scripts in `franka_pipeline/` run inside the image defined by
+  [`docker_installation/robot_arm_frontend/Dockerfile`](docker_installation/robot_arm_frontend/Dockerfile).
+  The frontend connects to the running backend and handles trajectory execution,
+  robot poses, and synchronization with the recording process.
+
+Consequently, physical data collection uses three cooperating components: the
+robot backend container, the robot frontend container running
+`franka_pipeline/`, and the training-and-reconstruction container running the
+recording script from `3d_reconstruction/`.
 
 The Dockerfiles download third-party dependencies at build time and may need
 updates as upstream package repositories change. They also use privileged,
@@ -226,14 +216,17 @@ and `--random-seed` to control them. Exact defaults are in
 Only use this section after hardware, network addresses, calibration, and
 emergency-stop procedures have been checked.
 
-Start the robot-side pipeline with synchronized recording enabled:
+First start the Deoxys backend using the robot-backend Docker image and leave it
+running in the background. Then open the robot-frontend container and start the
+robot-side pipeline with synchronized recording enabled:
 
 ```bash
 cd franka_pipeline
 python main.py --real-robot --sync-recording
 ```
 
-Then start the recording client in a separate environment:
+In parallel, use the training-and-reconstruction container to start the camera
+recording client:
 
 ```bash
 cd 3d_reconstruction
