@@ -120,7 +120,7 @@ produce coherent surfaces after fusion.
 
 | Path | Purpose |
 | --- | --- |
-| `franka_pipeline/` | Franka robot control, simulation, teleoperation agents, pose streaming, and synthetic-data collection. |
+| `franka_pipeline/` | Franka robot control, trajectory execution, pose streaming, and synchronized data collection. |
 | `3d_reconstruction/` | Recording client, calibration, preprocessing, training, evaluation, reconstruction, and visualization tools. |
 | `3d_reconstruction/camera_data/` | Example camera intrinsics, extrinsics, depth scale, and recorded end-effector poses for the original hardware setup. |
 | `3d_reconstruction/data_precomputation/` | Scripts that project depth into event-camera geometry, create table priors, and build event voxel grids. |
@@ -128,20 +128,6 @@ produce coherent surfaces after fusion.
 | `3d_reconstruction/viz_and_tests/` | Analysis and visualization utilities; these are primarily research diagnostics. |
 | `docker_installation/` | Dockerfiles for the robot backend, robot frontend, and recording/training environment. |
 | `instructions/` | Hardware notes and vendor documentation retained from the development setup. |
-
-## Software architecture
-
-The physical-data workflow uses two cooperating processes:
-
-1. `franka_pipeline/main.py` controls the robot or simulator and publishes
-   timestamped end-effector poses plus episode events through ZeroMQ.
-2. `3d_reconstruction/rec_data.py` records the cameras, subscribes to those
-   poses, and uses a request/reply handshake to synchronize recording.
-
-Shared recording, preprocessing, and reconstruction constants live in
-[`3d_reconstruction/config.py`](3d_reconstruction/config.py), including image
-sizes, voxel-bin count, workspace dimensions, depth limits, and local ZeroMQ
-addresses.
 
 ## Requirements
 
@@ -184,60 +170,9 @@ updates as upstream package repositories change. They also use privileged,
 host-networked container settings for hardware access; review those settings
 before running them on a shared system.
 
-## Quick start: simulation and synthetic data
-
-Simulation is the recommended first step. From `franka_pipeline/`, inspect the
-available options and objects:
-
-```bash
-python main.py --help
-python main.py --list-objects
-```
-
-Run a headless synthetic-data collection job, optionally restricting the set of
-objects:
-
-```bash
-python main.py \
-  --simulated-robot \
-  --synthetic-data \
-  --headless \
-  --object-filter cube,sphere \
-  --synthetic-output-dir data/synthetic
-```
-
-The runner supports hemisphere and random-hemisphere camera trajectories. Use
-`--num-poses`, `--sphere-radius`, `--target-x`, `--target-y`, `--target-z`,
-and `--random-seed` to control them. Exact defaults are in
-[`franka_pipeline/config_defaults.py`](franka_pipeline/config_defaults.py).
-
-## Physical recording
-
-Only use this section after hardware, network addresses, calibration, and
-emergency-stop procedures have been checked.
-
-First start the Deoxys backend using the robot-backend Docker image and leave it
-running in the background. Then open the robot-frontend container and start the
-robot-side pipeline with synchronized recording enabled:
-
-```bash
-cd franka_pipeline
-python main.py --real-robot --sync-recording
-```
-
-In parallel, use the training-and-reconstruction container to start the camera
-recording client:
-
-```bash
-cd 3d_reconstruction
-python rec_data.py \
-  --zmq-sync-addr tcp://ROBOT_HOST:6001 \
-  --zmq-pose-addr tcp://ROBOT_HOST:6000
-```
-
-The default addresses are localhost ports `6000` and `6001`. Change them for
-separate machines and expose only trusted interfaces. The recording client
-expects the required camera drivers and the physical cameras to be available.
+If a recorded and preprocessed dataset is already available, skip the
+**Calibration** and **Physical recording** sections and continue directly with
+[Training](#training) or [Evaluation and reconstruction](#evaluation-and-reconstruction).
 
 ## Calibration
 
@@ -263,6 +198,56 @@ python calibration.py \
 
 Use `verify_calibration.py` and the tools in `viz_and_tests/` to inspect the
 result before collecting a dataset or training a model.
+
+## Physical recording
+
+Only use this section after hardware, network addresses, calibration, and
+emergency-stop procedures have been checked.
+
+### Software architecture
+
+Physical recording uses two synchronized application processes in addition to
+the low-level robot backend:
+
+1. `franka_pipeline/main.py`, running in the robot-frontend container, controls
+   the robot and publishes timestamped end-effector poses and episode events
+   through ZeroMQ.
+2. `3d_reconstruction/rec_data.py`, running in the
+   training-and-reconstruction container, records both cameras, subscribes to
+   the robot poses, and uses a request/reply handshake to synchronize recording.
+
+The Deoxys backend container communicates directly with the robot and must
+remain active while the frontend process is running.
+
+Shared recording, preprocessing, and reconstruction constants live in
+[`3d_reconstruction/config.py`](3d_reconstruction/config.py), including image
+sizes, voxel-bin count, workspace dimensions, depth limits, and local ZeroMQ
+addresses.
+
+### Starting a recording
+
+First start the Deoxys backend using the robot-backend Docker image and leave it
+running in the background. Then open the robot-frontend container and start the
+robot-side pipeline with synchronized recording enabled:
+
+```bash
+cd franka_pipeline
+python main.py --real-robot --sync-recording
+```
+
+In parallel, use the training-and-reconstruction container to start the camera
+recording client:
+
+```bash
+cd 3d_reconstruction
+python rec_data.py \
+  --zmq-sync-addr tcp://ROBOT_HOST:6001 \
+  --zmq-pose-addr tcp://ROBOT_HOST:6000
+```
+
+The default addresses are localhost ports `6000` and `6001`. Change them for
+separate machines and expose only trusted interfaces. The recording client
+expects the required camera drivers and the physical cameras to be available.
 
 ## Data layout and preprocessing
 
@@ -351,7 +336,7 @@ tabletop scene.
 
 ## Third-party software and licensing
 
-This project depends on third-party systems including Deoxys, robosuite,
+This project depends on third-party systems including Deoxys,
 RealSense/librealsense, Metavision, IDS uEye EVS, Open3D, PyTorch, and optional
 vision-language/grasping services. Their licences, terms, and redistribution
 rules apply independently.
