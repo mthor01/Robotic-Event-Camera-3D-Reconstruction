@@ -69,12 +69,11 @@ import matplotlib.cm as cm
 from config import (
     D_MAX, DEPTH_MIN, NUM_BINS,
     CALIB_DIR as _CALIB_DIR,
-    TRAIN_RESIZE_HW, TRAIN_CROP_HW,
-    CROP_THEN_RESIZE_CROP_HW, CROP_THEN_RESIZE_HW,
+    PREPROCESS_CROP_HW, PREPROCESS_RESIZE_HW,
     TSDF_VOXEL_SIZE, TSDF_SDF_TRUNC_FACTOR, TSDF_DEPTH_MAX,
     SPATIAL_CUBE_SIDE, SPATIAL_TARGET_X, SPATIAL_TARGET_Y, SPATIAL_TARGET_Z,
 )
-from preprocessing_geometry import transform_intrinsics, transform_name
+from preprocessing_geometry import INTRINSICS_TRANSFORM, transform_intrinsics
 from view_selection import select_pose_views
 from spatial_mask import depth_cube_mask, points_in_cube
 from train_unet import RecurrentUNet, UNet
@@ -85,7 +84,6 @@ from multiview import (
 )
 
 CALIB_DIR = _HERE / _CALIB_DIR
-CROP_THEN_RESIZE_MODE = False
 RAISED_OBJECT_BOTTOM_Z_M = 0.015
 
 
@@ -97,7 +95,6 @@ def load_K(
     calib_dir: Path,
     resize_hw: Optional[Tuple[int, int]] = None,
     crop_hw: Optional[Tuple[int, int]] = None,
-    crop_then_resize: bool = False,
 ) -> Tuple[np.ndarray, int, int]:
     """Return camera intrinsics scaled to the model's input resolution."""
     ev = np.load(calib_dir / "event_intrinsics.npz")
@@ -106,11 +103,8 @@ def load_K(
     native_H = int(ev["image_size"][1])
     if resize_hw is None or crop_hw is None:
         return K, native_H, native_W
-    K = transform_intrinsics(
-        K, (native_H, native_W), resize_hw, crop_hw, crop_then_resize
-    )
-    final_hw = resize_hw if crop_then_resize else crop_hw
-    return K, final_hw[0], final_hw[1]
+    K = transform_intrinsics(K, (native_H, native_W), resize_hw, crop_hw)
+    return K, resize_hw[0], resize_hw[1]
 
 
 def load_T_ee_from_event(calib_dir: Path) -> np.ndarray:
@@ -286,65 +280,47 @@ def load_model(ckpt_path: Path, device: torch.device):
 #  Preprocessing helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def resize_crop(
+def crop_resize(
     arr: np.ndarray,
     resize_hw: Optional[Tuple[int, int]],
     crop_hw:   Optional[Tuple[int, int]],
     mode: str = "bilinear",
 ) -> np.ndarray:
     t = torch.from_numpy(arr.astype(np.float32)).unsqueeze(0).unsqueeze(0)
-    final_hw = resize_hw if CROP_THEN_RESIZE_MODE else crop_hw
+    final_hw = resize_hw
     if final_hw is not None and tuple(t.shape[-2:]) == tuple(final_hw):
         return arr
     kw = {} if mode == "nearest" else {"align_corners": False}
-    if CROP_THEN_RESIZE_MODE:
-        if crop_hw is not None:
-            ch, cw = crop_hw
-            y0 = (t.shape[2] - ch) // 2
-            x0 = (t.shape[3] - cw) // 2
-            t = t[:, :, y0:y0 + ch, x0:x0 + cw]
-        if resize_hw is not None:
-            t = F.interpolate(t, size=resize_hw, mode=mode, **kw)
-    else:
-        if resize_hw is not None:
-            t = F.interpolate(t, size=resize_hw, mode=mode, **kw)
-        if crop_hw is not None:
-            ch, cw = crop_hw
-            y0 = (t.shape[2] - ch) // 2
-            x0 = (t.shape[3] - cw) // 2
-            t = t[:, :, y0:y0 + ch, x0:x0 + cw]
+    if crop_hw is not None:
+        ch, cw = crop_hw
+        y0 = (t.shape[2] - ch) // 2
+        x0 = (t.shape[3] - cw) // 2
+        t = t[:, :, y0:y0 + ch, x0:x0 + cw]
+    if resize_hw is not None:
+        t = F.interpolate(t, size=resize_hw, mode=mode, **kw)
     return t[0, 0].numpy()
 
 
-def resize_crop_rgb(
+def crop_resize_rgb(
     rgb: np.ndarray,
     resize_hw: Optional[Tuple[int, int]],
     crop_hw:   Optional[Tuple[int, int]],
 ) -> np.ndarray:
-    """Resize/crop an RGB image to the target reconstruction resolution."""
+    """Center-crop and resize RGB to the reconstruction resolution."""
     if rgb.ndim != 3 or rgb.shape[-1] != 3:
         raise ValueError(f"Expected RGB image with shape (H, W, 3), got {rgb.shape}")
-    final_h = (resize_hw[0] if CROP_THEN_RESIZE_MODE and resize_hw is not None else
-               crop_hw[0]   if crop_hw   is not None else
-               resize_hw[0] if resize_hw is not None else rgb.shape[0])
-    final_w = (resize_hw[1] if CROP_THEN_RESIZE_MODE and resize_hw is not None else
-               crop_hw[1]   if crop_hw   is not None else
-               resize_hw[1] if resize_hw is not None else rgb.shape[1])
+    final_h = resize_hw[0] if resize_hw is not None else rgb.shape[0]
+    final_w = resize_hw[1] if resize_hw is not None else rgb.shape[1]
     if rgb.shape[0] == final_h and rgb.shape[1] == final_w:
         return rgb.astype(np.uint8, copy=False)
     t = torch.from_numpy(rgb.astype(np.float32)).permute(2, 0, 1).unsqueeze(0)
-    if CROP_THEN_RESIZE_MODE and crop_hw is not None:
+    if crop_hw is not None:
         ch, cw = crop_hw
         y0 = (t.shape[2] - ch) // 2
         x0 = (t.shape[3] - cw) // 2
         t = t[:, :, y0:y0 + ch, x0:x0 + cw]
     if resize_hw is not None:
         t = F.interpolate(t, size=resize_hw, mode="bilinear", align_corners=False)
-    if not CROP_THEN_RESIZE_MODE and crop_hw is not None:
-        ch, cw = crop_hw
-        y0 = (t.shape[2] - ch) // 2
-        x0 = (t.shape[3] - cw) // 2
-        t = t[:, :, y0:y0 + ch, x0:x0 + cw]
     out = t.squeeze(0).permute(1, 2, 0).clamp(0, 255).numpy()
     return out.astype(np.uint8)
 
@@ -354,28 +330,19 @@ def _preprocess_voxels(
     resize_hw: Optional[Tuple[int, int]],
     crop_hw:   Optional[Tuple[int, int]],
 ) -> np.ndarray:
-    """Resize/crop a (C, H, W) voxel grid to the target resolution."""
-    final_h = (resize_hw[0] if CROP_THEN_RESIZE_MODE and resize_hw is not None else
-               crop_hw[0]   if crop_hw   is not None else
-               resize_hw[0] if resize_hw is not None else vox_raw.shape[1])
-    final_w = (resize_hw[1] if CROP_THEN_RESIZE_MODE and resize_hw is not None else
-               crop_hw[1]   if crop_hw   is not None else
-               resize_hw[1] if resize_hw is not None else vox_raw.shape[2])
+    """Center-crop and resize a voxel grid to the target resolution."""
+    final_h = resize_hw[0] if resize_hw is not None else vox_raw.shape[1]
+    final_w = resize_hw[1] if resize_hw is not None else vox_raw.shape[2]
     if vox_raw.shape[1] == final_h and vox_raw.shape[2] == final_w:
         return vox_raw
     t = torch.from_numpy(vox_raw).unsqueeze(0)  # (1, C, H, W)
-    if CROP_THEN_RESIZE_MODE and crop_hw is not None:
+    if crop_hw is not None:
         ch, cw = crop_hw
         y0 = (t.shape[2] - ch) // 2
         x0 = (t.shape[3] - cw) // 2
         t = t[:, :, y0:y0 + ch, x0:x0 + cw]
     if resize_hw is not None:
         t = F.interpolate(t, size=resize_hw, mode="bilinear", align_corners=False)
-    if not CROP_THEN_RESIZE_MODE and crop_hw is not None:
-        ch, cw = crop_hw
-        y0 = (t.shape[2] - ch) // 2
-        x0 = (t.shape[3] - cw) // 2
-        t = t[:, :, y0:y0 + ch, x0:x0 + cw]
     return t.squeeze(0).numpy()
 
 
@@ -1306,7 +1273,7 @@ def evaluate_rendered_depth(
         for frame_idx in frame_indices:
             gt = depth_file["depth"][frame_idx].astype(np.float32)
             if resize_hw is not None or crop_hw is not None:
-                gt = resize_crop(gt, resize_hw, crop_hw, mode="bilinear")
+                gt = crop_resize(gt, resize_hw, crop_hw, mode="bilinear")
             T_world_from_cam = ee_T_all[frame_idx] @ T_ee_from_event
             rendered = _render_mesh_depth(
                 mesh_path, K, T_world_from_cam, gt.shape[0], gt.shape[1]
@@ -2210,7 +2177,6 @@ def _run_sequence_directory(args: argparse.Namespace) -> bool:
 
 
 def main() -> None:
-    global CROP_THEN_RESIZE_MODE
     parser = argparse.ArgumentParser(
         description="Depth-map, point-cloud, and TSDF reconstruction from trained depth models.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -2251,13 +2217,10 @@ def main() -> None:
                         help="Output directory (default: training/results/<checkpoint_name>)")
     parser.add_argument("--depth_min", type=float, default=DEPTH_MIN)
     parser.add_argument("--depth_max", type=float, default=D_MAX)
-    parser.add_argument("--resize_h", type=int, default=TRAIN_RESIZE_HW[0])
-    parser.add_argument("--resize_w", type=int, default=TRAIN_RESIZE_HW[1])
-    parser.add_argument("--crop_h",   type=int, default=TRAIN_CROP_HW[0])
-    parser.add_argument("--crop_w",   type=int, default=TRAIN_CROP_HW[1])
-    parser.add_argument("--crop_then_resize", "--crop-then-resize", action="store_true",
-                        help="Use native center-crop followed by resize, with "
-                             "CROP_THEN_RESIZE_* settings from config.py")
+    parser.add_argument("--resize_h", type=int, default=PREPROCESS_RESIZE_HW[0])
+    parser.add_argument("--resize_w", type=int, default=PREPROCESS_RESIZE_HW[1])
+    parser.add_argument("--crop_h",   type=int, default=PREPROCESS_CROP_HW[0])
+    parser.add_argument("--crop_w",   type=int, default=PREPROCESS_CROP_HW[1])
     pose_layout_group = parser.add_mutually_exclusive_group()
     pose_layout_group.add_argument(
         "--allow_fewer_pose_views",
@@ -2411,13 +2374,10 @@ def main() -> None:
         dtype=np.float64,
     )
 
-    CROP_THEN_RESIZE_MODE = args.crop_then_resize
-    if args.crop_then_resize:
-        resize_hw = CROP_THEN_RESIZE_HW
-        crop_hw = CROP_THEN_RESIZE_CROP_HW
-    else:
-        resize_hw = (args.resize_h, args.resize_w) if args.resize_h > 0 and args.resize_w > 0 else TRAIN_RESIZE_HW
-        crop_hw = (args.crop_h, args.crop_w) if args.crop_h > 0 and args.crop_w > 0 else TRAIN_CROP_HW
+    resize_hw = (args.resize_h, args.resize_w)
+    crop_hw = (args.crop_h, args.crop_w)
+    if min(*resize_hw, *crop_hw) <= 0:
+        parser.error("crop and resize dimensions must be positive")
 
     if args.out_dir is None:
         out_dir = _HERE / "training" / "results" / ckpt_path.stem
@@ -2444,7 +2404,7 @@ def main() -> None:
         transform = table_file.attrs.get("intrinsics_transform", "")
         if isinstance(transform, bytes):
             transform = transform.decode("utf-8", errors="replace")
-        corrected_table_transform = transform == transform_name(args.crop_then_resize)
+        corrected_table_transform = transform == INTRINSICS_TRANSFORM
     if not corrected_table_transform:
         raise RuntimeError(
             f"{table_plane_h5_path} uses obsolete direct-scaling geometry. "
@@ -2464,9 +2424,7 @@ def main() -> None:
         )
 
     # ── Camera intrinsics ─────────────────────────────────────────
-    K, out_H, out_W = load_K(
-        CALIB_DIR, resize_hw, crop_hw, args.crop_then_resize
-    )
+    K, out_H, out_W = load_K(CALIB_DIR, resize_hw, crop_hw)
     print(f"Input resolution : {out_W}×{out_H}")
     if use_original_depth_mesh:
         K_depth, T_ee_from_depth, original_depth_scale = load_original_depth_calibration(CALIB_DIR)
@@ -2484,12 +2442,12 @@ def main() -> None:
     if args.pose_layout_override is not None:
         ckpt["allow_unbalanced_pose_views"] = args.pose_layout_override
         ckpt["allow_fewer_pose_views"] = args.pose_layout_override
-    expected_transform = transform_name(args.crop_then_resize)
-    checkpoint_transform = ckpt.get("intrinsics_transform", "resize_center_crop")
+    expected_transform = INTRINSICS_TRANSFORM
+    checkpoint_transform = ckpt.get("intrinsics_transform", "")
     if checkpoint_transform != expected_transform:
         raise RuntimeError(
             f"Checkpoint uses {checkpoint_transform!r}, but reconstruction requested "
-            f"{expected_transform!r}. Use the matching preprocessing flag."
+            f"{expected_transform!r}. Use a crop-then-resize checkpoint."
         )
     use_learned_uncertainty = args.uncertainty_weighted_tsdf
     if use_learned_uncertainty:
@@ -2756,7 +2714,7 @@ def main() -> None:
             tbl_np   = table_f["table_plane"][frame_idx].astype(np.float32)
             tbl_eval = tbl_np
             if tbl_eval.shape[0] != out_H or tbl_eval.shape[1] != out_W:
-                tbl_eval = resize_crop(tbl_eval, resize_hw, crop_hw, mode="bilinear")
+                tbl_eval = crop_resize(tbl_eval, resize_hw, crop_hw, mode="bilinear")
 
             if ckpt_type == "multiview":
                 pred_norm, uncertainty_map = _infer_multiview(
@@ -2824,7 +2782,7 @@ def main() -> None:
             # GT depth
             gt = depth_f["depth"][frame_idx].astype(np.float32)
             if gt.shape[0] != out_H or gt.shape[1] != out_W:
-                gt = resize_crop(gt, resize_hw, crop_hw, mode="bilinear")
+                gt = crop_resize(gt, resize_hw, crop_hw, mode="bilinear")
             gt_valid = np.isfinite(gt) & (gt > depth_min) & (gt < depth_max)
             pred_valid = np.isfinite(pred_m) & (pred_m > depth_min) & (pred_m < depth_max)
             gt_mask = gt_valid.astype(np.float32)
@@ -2855,7 +2813,7 @@ def main() -> None:
                 gt_masked   = np.where(gt_valid,   gt,     np.float32(0.0)).astype(np.float32)
                 if rgb_f is not None:
                     rgb = rgb_f["rgb"][frame_idx]
-                    rgb_by_frame[frame_idx] = resize_crop_rgb(rgb, resize_hw, crop_hw)
+                    rgb_by_frame[frame_idx] = crop_resize_rgb(rgb, resize_hw, crop_hw)
                 mesh_candidates.append({
                     "frame_idx": frame_idx,
                     "pred_masked": pred_masked,

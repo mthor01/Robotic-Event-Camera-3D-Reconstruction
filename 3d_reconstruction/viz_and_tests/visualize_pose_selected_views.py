@@ -9,7 +9,7 @@ the ground-truth depth image of the target frame.
 
 Example:
     python3 viz_and_tests/visualize_pose_selected_views.py \
-        data/new_2/train/22 300 --crop-then-resize
+        data/new_2/train/22 300
 """
 
 from __future__ import annotations
@@ -157,15 +157,6 @@ def main() -> None:
             "viz_and_tests/plots/pose_selected_views/."
         ),
     )
-    parser.add_argument(
-        "--crop-then-resize",
-        "--crop_then_resize",
-        action="store_true",
-        help=(
-            "Load data precomputed with native centre crop followed by resize, "
-            "matching the training flag of the same name."
-        ),
-    )
     pose_layout_group = parser.add_mutually_exclusive_group()
     pose_layout_group.add_argument(
         "--allow-fewer-pose-views",
@@ -255,7 +246,6 @@ def main() -> None:
         pose_move_threshold=args.pose_move_threshold,
         allow_unbalanced_pose_views=args.allow_unbalanced_pose_views,
         fill_invalid=False,
-        crop_then_resize=args.crop_then_resize,
     )
     dataset_item = _find_dataset_item(dataset, args.target_frame)
     sample = dataset[dataset_item]
@@ -271,7 +261,7 @@ def main() -> None:
         f"num_views: {args.num_views}",
         f"pose_move_threshold_m: {args.pose_move_threshold:g}",
         f"allow_unbalanced_pose_views: {args.allow_unbalanced_pose_views}",
-        f"intrinsics_transform: {'center_crop_resize' if args.crop_then_resize else 'resize_center_crop'}",
+        "intrinsics_transform: center_crop_resize",
         f"event_dilation_radius: {args.event_dilation_radius}",
         f"binary_events: {args.binary_events}",
         "",

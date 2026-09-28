@@ -43,15 +43,13 @@ from config import (
     D_MAX,
     DEPTH_VIZ_MIN,
     DEPTH_VIZ_MAX,
-    CROP_THEN_RESIZE_CROP_HW,
-    CROP_THEN_RESIZE_HW,
-    TRAIN_RESIZE_HW,
-    TRAIN_CROP_HW,
+    PREPROCESS_CROP_HW,
+    PREPROCESS_RESIZE_HW,
     SPATIAL_TARGET_Z,
     SPATIAL_CUBE_SIDE,
     TABLE_Z_OFFSET,
 )
-from preprocessing_geometry import transform_intrinsics, transform_name
+from preprocessing_geometry import INTRINSICS_TRANSFORM, transform_intrinsics
 
 CALIB_DIR = _HERE.parent / _CALIB_DIR
 DATA_ROOT = _HERE.parent / _DATA_ROOT
@@ -132,7 +130,7 @@ def _compute_channel(
     return channel.reshape(out_H, out_W).astype(np.float32)
 
 
-def _scale_K_resize_crop(
+def _transform_K_crop_resize(
     K_native: np.ndarray,
     native_H: int,
     native_W: int,
@@ -140,11 +138,10 @@ def _scale_K_resize_crop(
     resize_W: int,
     crop_H: int,
     crop_W: int,
-    crop_then_resize: bool = False,
 ) -> np.ndarray:
     return transform_intrinsics(
         K_native.astype(np.float64), (native_H, native_W),
-        (resize_H, resize_W), (crop_H, crop_W), crop_then_resize,
+        (resize_H, resize_W), (crop_H, crop_W),
     )
 
 
@@ -209,7 +206,6 @@ def process_sequence(
     table_z:   float,
     overwrite: bool = False,
     debug:     bool = False,
-    crop_then_resize: bool = False,
 ) -> dict:
     """Compute and save the canonical corrected table_plane.h5 prior."""
     result = {"name": seq_dir.name, "success": False, "n_frames": 0, "error": None}
@@ -236,11 +232,11 @@ def process_sequence(
         resize_W = int(df.attrs.get("resize_w", native_W))
         crop_H = int(df.attrs.get("crop_h", H))
         crop_W = int(df.attrs.get("crop_w", W))
-        stored_transform = df.attrs.get("intrinsics_transform", "resize_center_crop")
+        stored_transform = df.attrs.get("intrinsics_transform", "")
         if isinstance(stored_transform, bytes):
             stored_transform = stored_transform.decode("utf-8", errors="replace")
 
-    expected_transform = transform_name(crop_then_resize)
+    expected_transform = INTRINSICS_TRANSFORM
     if stored_transform != expected_transform:
         result["error"] = (
             f"depth uses {stored_transform!r}, requested {expected_transform!r}; "
@@ -299,7 +295,7 @@ def process_sequence(
             f"(robot base frame). Training depth range: [{DEPTH_MIN}, {D_MAX}] m."
         )
 
-        K_for_table = _scale_K_resize_crop(
+        K_for_table = _transform_K_crop_resize(
             calib["K_native"],
             native_H,
             native_W,
@@ -307,7 +303,6 @@ def process_sequence(
             resize_W,
             crop_H,
             crop_W,
-            crop_then_resize,
         )
         K_native_H, K_native_W = H, W
 
@@ -365,10 +360,6 @@ def main() -> None:
         help="Save debug/table_plane_debug.png (GT depth | table-plane depth) "
              "for each sequence.",
     )
-    parser.add_argument(
-        "--crop_then_resize", "--crop-then-resize", action="store_true",
-        help="Use crop-then-resize geometry; projected depth must use the same mode.",
-    )
     args = parser.parse_args()
 
     def _resolve_data_path(path_str: str) -> Path:
@@ -383,20 +374,12 @@ def main() -> None:
         args.table_z = SPATIAL_TARGET_Z - SPATIAL_CUBE_SIDE / 2.0 + TABLE_Z_OFFSET
 
     print(f"Table plane Z : {args.table_z:.4f} m")
-    if args.crop_then_resize:
-        crop_h, crop_w = CROP_THEN_RESIZE_CROP_HW
-        resize_h, resize_w = CROP_THEN_RESIZE_HW
-        print(
-            f"Preprocessing : crop -> {crop_w}x{crop_h} -> "
-            f"resize -> {resize_w}x{resize_h}"
-        )
-    else:
-        resize_h, resize_w = TRAIN_RESIZE_HW
-        crop_h, crop_w = TRAIN_CROP_HW
-        print(
-            f"Preprocessing : resize -> {resize_w}x{resize_h} -> "
-            f"crop -> {crop_w}x{crop_h}"
-        )
+    crop_h, crop_w = PREPROCESS_CROP_HW
+    resize_h, resize_w = PREPROCESS_RESIZE_HW
+    print(
+        f"Preprocessing : crop -> {crop_w}x{crop_h} -> "
+        f"resize -> {resize_w}x{resize_h}"
+    )
     data_root = _resolve_data_path(args.data_root)
     print(f"Data root     : {data_root}")
 
@@ -446,7 +429,6 @@ def main() -> None:
             seq_dir, calib, args.table_z,
             overwrite=args.overwrite,
             debug=args.debug,
-            crop_then_resize=args.crop_then_resize,
         )
         results.append(r)
         status = "OK"   if r["success"] else "FAIL"

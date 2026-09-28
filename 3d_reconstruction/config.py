@@ -5,7 +5,7 @@ All shared constants used across recording, preprocessing, training,
 reconstruction and visualization scripts are defined here.
 Import constants directly from this module, for example:
 
-    from config import FPS, TRAIN_RESIZE_HW, TRAIN_CROP_HW
+    from config import FPS, PREPROCESS_CROP_HW, PREPROCESS_RESIZE_HW
 """
 
 from pathlib import Path
@@ -34,16 +34,11 @@ RS_HEIGHT = 480
 # ═══════════════════════════════════════════════════════════════════
 #  Model input preprocessing
 # ═══════════════════════════════════════════════════════════════════
-# Precomputation and reconstruction apply the same transforms. Camera
-# intrinsics must undergo this resize and centre crop as well.
-TRAIN_RESIZE_HW = (240, 427)  # (H, W) intermediate resize (288, 384)
-TRAIN_CROP_HW   = (240, 320)  # (H, W) final model input (240, 320)
-
-# Optional crop-then-resize preprocessing. Enable it explicitly with
-# --crop_then_resize; without that flag the legacy settings above are used.
-# The crop is in native event-camera pixels and the resize is the final size.
-CROP_THEN_RESIZE_CROP_HW = (720, 960)
-CROP_THEN_RESIZE_HW      = (240, 320)
+# Every spatial pipeline stage uses the same operation order: center-crop the
+# native event-camera image, then resize to the model input resolution. Camera
+# intrinsics must undergo this exact transform as well.
+PREPROCESS_CROP_HW = (720, 960)   # (H, W) crop in native event-camera pixels
+PREPROCESS_RESIZE_HW = (240, 320) # (H, W) final model input
 
 # ═══════════════════════════════════════════════════════════════════
 #  Event camera biases

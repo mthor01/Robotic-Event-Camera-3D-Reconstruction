@@ -29,8 +29,8 @@ _ROOT = _HERE.parent
 sys.path.insert(0, str(_ROOT))
 
 from config import (  # noqa: E402
-    CROP_THEN_RESIZE_CROP_HW,
-    CROP_THEN_RESIZE_HW,
+    PREPROCESS_CROP_HW,
+    PREPROCESS_RESIZE_HW,
     DATA_ROOT,
     DEPTH_VIZ_MAX,
     DEPTH_VIZ_MIN,
@@ -131,11 +131,8 @@ def load_event_calibration(
     event = np.load(calib_dir / "event_intrinsics.npz")
     K_native = event["camera_matrix"].astype(np.float64)
     native_w, native_h = (int(value) for value in event["image_size"])
-    # Always use the current configured crop-then-resize geometry. Some
-    # existing projected-depth files retain an older metadata label even
-    # though they are used with the current preprocessing configuration.
-    resize_hw = CROP_THEN_RESIZE_HW
-    crop_hw = CROP_THEN_RESIZE_CROP_HW
+    resize_hw = PREPROCESS_RESIZE_HW
+    crop_hw = PREPROCESS_CROP_HW
     expected_depth_hw = tuple(int(value) for value in depth_file["depth"].shape[-2:])
     if expected_depth_hw != tuple(resize_hw):
         raise RuntimeError(
@@ -147,7 +144,6 @@ def load_event_calibration(
         (native_h, native_w),
         resize_hw,
         crop_hw,
-        crop_then_resize=True,
     )
     T_rgb_from_ee = np.load(calib_dir / "T_rgb_from_ee.npz")["T"].astype(np.float64)
     T_event_from_rgb = np.load(calib_dir / "T_event_from_rgb.npz")["T"].astype(np.float64)

@@ -46,10 +46,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import (
-    DEPTH_MIN, D_MAX, NUM_BINS, TRAIN_CROP_HW, TRAIN_RESIZE_HW,
-    CROP_THEN_RESIZE_CROP_HW, CROP_THEN_RESIZE_HW,
+    DEPTH_MIN, D_MAX, NUM_BINS, PREPROCESS_CROP_HW, PREPROCESS_RESIZE_HW,
 )
-from preprocessing_geometry import transform_intrinsics, transform_name
+from preprocessing_geometry import INTRINSICS_TRANSFORM, transform_intrinsics
 from view_selection import build_pose_view_ids, pose_layout_counts
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -357,7 +356,6 @@ def _compute_table_plane_channel(
     table_z_base: float,
     depth_min: float = DEPTH_MIN,
     depth_max: float = D_MAX,
-    crop_then_resize: bool = False,
 ) -> np.ndarray:
     """
     Return (vox_H, vox_W) float32 channel where each pixel holds the
@@ -368,15 +366,11 @@ def _compute_table_plane_channel(
     how GT depth is normalised during training.
     Pixels whose rays are parallel to the plane, or face away from it, get 0.
     """
-    if crop_then_resize:
-        resize_hw = CROP_THEN_RESIZE_HW
-        crop_hw = CROP_THEN_RESIZE_CROP_HW
-    else:
-        resize_hw = TRAIN_RESIZE_HW
-        crop_hw = (vox_H, vox_W)
+    resize_hw = PREPROCESS_RESIZE_HW
+    crop_hw = PREPROCESS_CROP_HW
     K = transform_intrinsics(
         K_native.astype(np.float64), (native_H, native_W),
-        resize_hw, crop_hw, crop_then_resize,
+        resize_hw, crop_hw,
     )
     fx, fy = K[0, 0], K[1, 1]
     cx, cy = K[0, 2], K[1, 2]
@@ -440,7 +434,6 @@ class TablePriorDataset(Dataset):
         allow_unbalanced_pose_views: bool = True,
         recurrent: bool = False,
         recurrent_enrollment_range: int = 0,
-        crop_then_resize: bool = False,
     ):
         super().__init__()
         if num_views < 1:
@@ -485,9 +478,7 @@ class TablePriorDataset(Dataset):
         with h5py.File(self.depth_path,       "r") as f: n_d = f["depth"].shape[0]
         with h5py.File(self.voxels_path, "r") as f:
             n_v = f["voxels"].shape[0]
-            voxel_transform = f["voxels"].attrs.get(
-                "intrinsics_transform", "resize_center_crop"
-            )
+            voxel_transform = f["voxels"].attrs.get("intrinsics_transform", "")
             if isinstance(voxel_transform, bytes):
                 voxel_transform = voxel_transform.decode("utf-8", errors="replace")
         with h5py.File(self.table_plane_path, "r") as f:
@@ -495,7 +486,7 @@ class TablePriorDataset(Dataset):
             transform = f.attrs.get("intrinsics_transform", "")
             if isinstance(transform, bytes):
                 transform = transform.decode("utf-8", errors="replace")
-            expected_transform = transform_name(crop_then_resize)
+            expected_transform = INTRINSICS_TRANSFORM
             corrected_table_transform = transform == expected_transform
         if not corrected_table_transform:
             raise RuntimeError(
@@ -507,7 +498,7 @@ class TablePriorDataset(Dataset):
         if voxel_transform != expected_transform:
             raise RuntimeError(
                 f"{self.voxels_path} uses {voxel_transform!r}, requested "
-                f"{expected_transform!r}. Regenerate or use the matching flag."
+                f"{expected_transform!r}. Regenerate the sequence."
             )
         needs_poses = self.pose_channels or self.pose_view_selection
         if needs_poses:
@@ -1037,8 +1028,6 @@ def main() -> None:
                         help="Run name used in checkpoint filenames. Prompted if not provided.")
     parser.add_argument("--tb_root",       type=Path, default=DEFAULT_TB_ROOT,
                         help="Shared TensorBoard root. Runs are logged under <tb_root>/unet_table/<name>.")
-    parser.add_argument("--crop_then_resize", "--crop-then-resize", action="store_true",
-                        help="Train on data precomputed with native crop followed by resize")
     args = parser.parse_args()
 
     if args.model_scale <= 0:
@@ -1157,7 +1146,6 @@ def main() -> None:
         allow_unbalanced_pose_views=args.allow_unbalanced_pose_views,
         recurrent=args.recurrent,
         recurrent_enrollment_range=args.recurrent_enrollment_range,
-        crop_then_resize=args.crop_then_resize,
     )
     train_sets = [TablePriorDataset(d, **ds_kw) for d in train_seqs]
     val_sets = [TablePriorDataset(d, **ds_kw) for d in val_seqs]
@@ -1224,16 +1212,11 @@ def main() -> None:
     else:
         model = UNet(in_ch=in_ch, base=base_channels).to(device)
 
-    # K for loss: use the canonical resize + centred-crop transform.
-    if args.crop_then_resize:
-        resize_hw = CROP_THEN_RESIZE_HW
-        crop_hw = CROP_THEN_RESIZE_CROP_HW
-    else:
-        resize_hw = TRAIN_RESIZE_HW
-        crop_hw = TRAIN_CROP_HW
+    # K for loss: use the canonical native center crop followed by resize.
+    resize_hw = PREPROCESS_RESIZE_HW
+    crop_hw = PREPROCESS_CROP_HW
     K_loss = transform_intrinsics(
         K_native, (native_H, native_W), resize_hw, crop_hw,
-        args.crop_then_resize,
     )
     K_tensor = torch.from_numpy(K_loss).to(device)
 
@@ -1400,7 +1383,7 @@ def main() -> None:
             "recurrent": args.recurrent,
             "recurrent_enrollment_range": args.recurrent_enrollment_range,
             "early_fusion_views": True,
-            "intrinsics_transform": transform_name(args.crop_then_resize),
+            "intrinsics_transform": INTRINSICS_TRANSFORM,
             "table_z": table_z_ckpt,
             "predict_uncertainty": args.predict_uncertainty,
             "uncertainty_weight": args.uncertainty_weight,

@@ -45,7 +45,7 @@ from config import (
     SPATIAL_TARGET_Y,
     SPATIAL_TARGET_Z,
 )
-from preprocessing_geometry import transform_name
+from preprocessing_geometry import INTRINSICS_TRANSFORM
 from spatial_mask import depth_cube_mask, depth_cube_masks_for_bottom_offsets
 
 
@@ -3255,12 +3255,12 @@ def _evaluate_checkpoint(
     print(f"\nLoading checkpoint: {checkpoint_path}", flush=True)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     state, metadata = _checkpoint_state(checkpoint)
-    expected_transform = transform_name(args.crop_then_resize)
-    checkpoint_transform = metadata.get("intrinsics_transform", "resize_center_crop")
+    expected_transform = INTRINSICS_TRANSFORM
+    checkpoint_transform = metadata.get("intrinsics_transform", "")
     if checkpoint_transform != expected_transform:
         raise RuntimeError(
             f"Checkpoint uses {checkpoint_transform!r}, but evaluation requested "
-            f"{expected_transform!r}. Use the matching preprocessing flag."
+            f"{expected_transform!r}. Use a crop-then-resize checkpoint."
         )
     model = _build_model(metadata, state, device)
 
@@ -3450,7 +3450,6 @@ def _evaluate_checkpoint(
             recurrent=recurrent_model,
             recurrent_enrollment_range=recurrent_enrollment_range,
             aug=MultiViewAugConfig(enabled=False),
-            crop_then_resize=args.crop_then_resize,
         )
         available_frames = len(dataset)
         all_valid_indices = dataset.valid_indices.copy()
@@ -4097,7 +4096,7 @@ def _evaluate_checkpoint(
         },
         "evaluation_configuration": {
             "fill_invalid": args.fill_invalid,
-            "intrinsics_transform": transform_name(args.crop_then_resize),
+            "intrinsics_transform": INTRINSICS_TRANSFORM,
             "frame_step": args.fast_mode,
             "boundary_definition": (
                 "inside pixel adjacent (4-connected) to undefined GT or "
@@ -4405,10 +4404,6 @@ def _parse_args() -> argparse.Namespace:
         "--fill_invalid",
         action="store_true",
         help="Fill invalid GT pixels using the table-plane prior before evaluation.",
-    )
-    parser.add_argument(
-        "--crop_then_resize", "--crop-then-resize", action="store_true",
-        help="Evaluate data precomputed with native crop followed by resize.",
     )
     pose_layout_group = parser.add_mutually_exclusive_group()
     pose_layout_group.add_argument(

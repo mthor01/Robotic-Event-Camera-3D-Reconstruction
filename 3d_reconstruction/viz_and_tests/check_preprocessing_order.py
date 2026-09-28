@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report the crop/resize order declared by HDF5 files in one sequence."""
+"""Check that HDF5 files declare the canonical crop-then-resize geometry."""
 
 from __future__ import annotations
 
@@ -9,12 +9,7 @@ from pathlib import Path
 import h5py
 
 
-TRANSFORM_NAMES = {
-    "center_crop_resize": "crop then resize",
-    "crop_then_resize": "crop then resize",
-    "resize_center_crop": "resize then crop",
-    "resize_then_crop": "resize then crop",
-}
+EXPECTED_TRANSFORM = "center_crop_resize"
 
 
 def as_text(value: object) -> str:
@@ -49,8 +44,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Read intrinsics_transform metadata from every HDF5 file in a "
-            "sequence and report whether it declares crop-then-resize or "
-            "resize-then-crop preprocessing."
+            "sequence and verify the canonical crop-then-resize preprocessing."
         )
     )
     parser.add_argument("--sequence", required=True, type=Path)
@@ -61,7 +55,7 @@ def main() -> None:
     if not h5_paths:
         raise FileNotFoundError(f"No HDF5 files found in {sequence} or its subdirectories")
 
-    reported_modes: set[str] = set()
+    invalid_labels: list[str] = []
     labelled_files = 0
     print(f"Sequence: {sequence}")
     print("HDF5 preprocessing metadata:")
@@ -75,20 +69,21 @@ def main() -> None:
         labelled_files += 1
         descriptions = []
         for location, raw_label in labels:
-            mode = TRANSFORM_NAMES.get(raw_label, "unknown transform")
-            if mode != "unknown transform":
-                reported_modes.add(mode)
-            descriptions.append(f"{location}={raw_label!r} ({mode})")
+            valid = raw_label == EXPECTED_TRANSFORM
+            if not valid:
+                invalid_labels.append(f"{relative_path}:{location}={raw_label!r}")
+            descriptions.append(
+                f"{location}={raw_label!r} ({'valid' if valid else 'unsupported'})"
+            )
         print(f"  {relative_path}: " + "; ".join(descriptions))
 
     print()
-    if len(reported_modes) == 1:
-        mode = next(iter(reported_modes))
-        print(f"RESULT: metadata reports {mode.upper()}.")
-    elif len(reported_modes) > 1:
-        print("RESULT: CONFLICTING METADATA; both preprocessing orders are reported.")
+    if invalid_labels:
+        print("RESULT: UNSUPPORTED PREPROCESSING METADATA; regenerate these files:")
+        for label in invalid_labels:
+            print(f"  - {label}")
     elif labelled_files:
-        print("RESULT: labels exist, but none use a recognized transform name.")
+        print("RESULT: all labelled files use CENTER CROP THEN RESIZE.")
     else:
         print("RESULT: preprocessing order cannot be determined from HDF5 metadata.")
 
