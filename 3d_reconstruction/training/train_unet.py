@@ -32,7 +32,6 @@ Usage:
 """
 
 import argparse
-import copy
 import sys
 import time
 from pathlib import Path
@@ -48,8 +47,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import (
     DEPTH_MIN, D_MAX, NUM_BINS, PREPROCESS_CROP_HW, PREPROCESS_RESIZE_HW,
 )
-from preprocessing_geometry import INTRINSICS_TRANSFORM, transform_intrinsics
-from view_selection import build_pose_view_ids, pose_layout_counts
+from helpers import (
+    INTRINSICS_TRANSFORM,
+    ModelEMA,
+    build_pose_view_ids,
+    fixed_source_offsets,
+    is_precomputed_sequence,
+    load_event_from_ee,
+    load_event_intrinsics,
+    pose_layout_counts,
+    pose_channels_from_base_event,
+    transform_intrinsics,
+)
+from depth_losses import (
+    combined_depth_loss,
+    l1_metres,
+    worst_fraction_l1_metres,
+)
+from unet_models import RecurrentUNet, UNet, UncertaintyUNet
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_ROOT = _SCRIPT_DIR.parent / "data" / "lego"
@@ -61,246 +76,6 @@ from tensorboard_helper import (
     UncertaintyErrorLogger,
     VizLogger,
 )
-
-class _EncoderBlock(nn.Module):
-    """Strided conv (÷2) + plain conv — downsamples by 2."""
-
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=5, stride=2, padding=2, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
-
-
-class _DecoderBlock(nn.Module):
-    """Bilinear upsample + concat skip + double conv."""
-
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch + skip_ch, out_ch, kernel_size=5, padding=2, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = F.interpolate(x, size=skip.shape[2:], mode="bilinear", align_corners=False)
-        return self.conv(torch.cat([x, skip], dim=1))
-
-
-class _ResidualBlock(nn.Module):
-    """Bottleneck residual block."""
-
-    def __init__(self, channels: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(channels),
-        )
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.relu(x + self.net(x))
-
-
-class UNet(nn.Module):
-    """
-    Event-to-depth U-Net.
-    Output: sigmoid → [0, 1] linear-normalised depth.
-    Convert to metres: pred * (D_MAX - DEPTH_MIN) + DEPTH_MIN.
-
-    Encoder: stem + num_encoders strided-conv blocks (default 3).
-    Bottleneck: num_residuals residual blocks (default 2).
-    Decoder: num_encoders bilinear-upsample blocks with skip connections.
-    """
-
-    def __init__(
-        self,
-        in_ch:         int = NUM_BINS,
-        base:          int = 32,
-        num_encoders:  int = 3,
-        num_residuals: int = 2,
-    ):
-        super().__init__()
-        # Stem
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_ch, base, kernel_size=5, padding=2, bias=False),
-            nn.BatchNorm2d(base),
-            nn.ReLU(inplace=True),
-        )
-        # Encoder
-        self.encoders = nn.ModuleList()
-        ch = base
-        for _ in range(num_encoders):
-            self.encoders.append(_EncoderBlock(ch, ch * 2))
-            ch *= 2
-        # Bottleneck
-        self.bottleneck = nn.Sequential(
-            *[_ResidualBlock(ch) for _ in range(num_residuals)]
-        )
-        # Decoder
-        self.decoders = nn.ModuleList()
-        for i in range(num_encoders):
-            skip_ch = ch // 2 if i < num_encoders - 1 else base
-            out_ch  = ch // 2
-            self.decoders.append(_DecoderBlock(ch, skip_ch, out_ch))
-            ch = out_ch
-        # Output head
-        self.head = nn.Sequential(
-            nn.Conv2d(base, 1, kernel_size=1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feat  = self.stem(x)
-        skips = [feat]
-        for i, enc in enumerate(self.encoders):
-            feat = enc(feat)
-            if i < len(self.encoders) - 1:
-                skips.append(feat)
-        feat = self.bottleneck(feat)
-        for i, dec in enumerate(self.decoders):
-            feat = dec(feat, skips[-(i + 1)])
-        return self.head(feat)   # (B, 1, H, W) in [0, 1]
-
-
-
-def _charbonnier(pred: torch.Tensor, gt: torch.Tensor,
-                 mask: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
-    return (torch.sqrt((pred - gt) ** 2 + eps ** 2) * mask).sum() / mask.sum().clamp_min(1.0)
-
-
-def _gradient_loss(pred: torch.Tensor, gt: torch.Tensor,
-                   mask: torch.Tensor, num_scales: int = 4) -> torch.Tensor:
-    def gx(t): return t[:, :, :, 1:] - t[:, :, :, :-1]
-    def gy(t): return t[:, :, 1:, :] - t[:, :, :-1, :]
-
-    total = 0.0
-    for s in range(num_scales):
-        if s > 0:
-            m    = F.avg_pool2d(mask, 2)
-            pred = F.avg_pool2d(pred * mask, 2) / m.clamp_min(1e-6)
-            gt   = F.avg_pool2d(gt   * mask, 2) / m.clamp_min(1e-6)
-            mask = (m > 0.5).float()
-        r  = pred - gt
-        mx = mask[:, :, :, 1:] * mask[:, :, :, :-1]
-        my = mask[:, :, 1:, :] * mask[:, :, :-1, :]
-        total = total + (torch.abs(gx(r)) * mx).sum() / mx.sum().clamp_min(1.0)
-        total = total + (torch.abs(gy(r)) * my).sum() / my.sum().clamp_min(1.0)
-    return total / num_scales
-
-
-def compute_loss(
-    pred:           torch.Tensor,   # (B,1,H,W) model output in [0, 1]
-    gt_norm:        torch.Tensor,   # (B,1,H,W) GT normalised to [0, 1]
-    mask:           torch.Tensor,   # (B,1,H,W) binary valid mask
-    K:              torch.Tensor | None = None,  # (3,3) scaled camera intrinsics
-    lambda_grad:    float = 0.5,
-    lambda_normal:  float = 0.1,
-) -> tuple:
-    l_charb  = _charbonnier(pred, gt_norm, mask)
-    l_grad   = _gradient_loss(pred, gt_norm, mask)
-    total    = l_charb + lambda_grad * l_grad
-    l_normal_val = 0.0
-    if K is not None:
-        l_normal      = _normal_loss(pred, gt_norm, mask, K)
-        total         = total + lambda_normal * l_normal
-        l_normal_val  = l_normal.item()
-    return total, {
-        "charb":  l_charb.item(),
-        "grad":   l_grad.item(),
-        "normal": l_normal_val,
-    }
-
-
-def _l1_metres(pred_norm: torch.Tensor, depth_gt: torch.Tensor,
-               mask: torch.Tensor) -> torch.Tensor:
-    """L1 in metres for reporting. pred_norm in [0, 1], depth_gt in metres."""
-    pred_m = pred_norm * (D_MAX - DEPTH_MIN) + DEPTH_MIN
-    return (torch.abs(pred_m - depth_gt) * mask).sum() / mask.sum().clamp_min(1.0)
-
-
-def _worst_percent_l1_metres(
-    pred_norm: torch.Tensor,
-    depth_gt: torch.Tensor,
-    mask: torch.Tensor,
-    percent: float = 0.10,
-) -> torch.Tensor:
-    """Mean metric L1 over the worst valid pixels in each batch."""
-    pred_m = pred_norm * (D_MAX - DEPTH_MIN) + DEPTH_MIN
-    err = torch.abs(pred_m - depth_gt)[mask > 0.5]
-    if err.numel() == 0:
-        return pred_m.sum() * 0.0
-    k = max(1, int(np.ceil(err.numel() * percent)))
-    return torch.topk(err, k=min(k, err.numel()), largest=True).values.mean()
-
-
-_pixel_grid_cache: dict = {}
-
-
-def _get_pixel_grid(H: int, W: int, device: torch.device):
-    key = (H, W, str(device))
-    if key not in _pixel_grid_cache:
-        u  = torch.arange(W, device=device, dtype=torch.float32)
-        v  = torch.arange(H, device=device, dtype=torch.float32)
-        vv, uu = torch.meshgrid(v, u, indexing="ij")
-        pix = torch.stack(
-            [uu.reshape(-1), vv.reshape(-1), torch.ones(H * W, device=device)], dim=0
-        )
-        _pixel_grid_cache[key] = (uu, vv, pix)
-    return _pixel_grid_cache[key]
-
-
-def _compute_normals(depth_m: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
-    """Geometrically correct surface normals via backprojection + cross product."""
-    B, _, H, W = depth_m.shape
-    device = depth_m.device
-    K  = K.to(device=device, dtype=torch.float32)
-    fx, fy = K[0, 0], K[1, 1]
-    cx, cy = K[0, 2], K[1, 2]
-
-    uu, vv, _ = _get_pixel_grid(H, W, device)
-    D = depth_m[:, 0]
-    points = torch.stack([
-        (uu - cx) * D / fx,
-        (vv - cy) * D / fy,
-        D,
-    ], dim=1)
-
-    du = points[:, :, :, 2:] - points[:, :, :, :-2]
-    dv = points[:, :, 2:, :] - points[:, :, :-2, :]
-    du = F.pad(du, (1, 1, 0, 0), mode="replicate")
-    dv = F.pad(dv, (0, 0, 1, 1), mode="replicate")
-
-    nx = du[:, 1] * dv[:, 2] - du[:, 2] * dv[:, 1]
-    ny = du[:, 2] * dv[:, 0] - du[:, 0] * dv[:, 2]
-    nz = du[:, 0] * dv[:, 1] - du[:, 1] * dv[:, 0]
-    return F.normalize(torch.stack([nx, ny, nz], dim=1), dim=1)
-
-
-def _normal_loss(pred: torch.Tensor, gt: torch.Tensor,
-                 mask: torch.Tensor, K: torch.Tensor) -> torch.Tensor:
-    """Surface normal cosine loss. pred and gt are normalised [0, 1]."""
-    pred_m = pred * (D_MAX - DEPTH_MIN) + DEPTH_MIN
-    gt_m   = gt   * (D_MAX - DEPTH_MIN) + DEPTH_MIN
-    n_pred = _compute_normals(pred_m, K)
-    n_gt   = _compute_normals(gt_m,   K)
-    cosine = (n_pred * n_gt).sum(dim=1, keepdim=True)
-    return ((1.0 - cosine) * mask).sum() / mask.sum().clamp_min(1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -315,32 +90,6 @@ _CAM_DATA = _SCRIPT_DIR.parent / "camera_data"
 # ---------------------------------------------------------------------------
 # Calibration helpers
 # ---------------------------------------------------------------------------
-
-def _load_event_K_native() -> tuple[np.ndarray, int, int]:
-    """Return event-camera intrinsics at native resolution, plus native (H, W)."""
-    d = np.load(_CAM_DATA / "event_intrinsics.npz")
-    K = d["camera_matrix"].astype(np.float32).copy()
-    W = int(d["image_size"][0])
-    H = int(d["image_size"][1])
-    return K, H, W
-
-
-def _load_T_event_from_ee() -> np.ndarray:
-    """Return T_event_from_ee from saved RGB/event hand-eye calibration."""
-    T_rgb_from_ee = np.load(_CAM_DATA / "T_rgb_from_ee.npz")["T"].astype(np.float32)
-    T_event_from_rgb = np.load(_CAM_DATA / "T_event_from_rgb.npz")["T"].astype(np.float32)
-    return T_event_from_rgb @ T_rgb_from_ee
-
-
-def _pose_channels_from_base_event(T_base_from_event: np.ndarray) -> np.ndarray:
-    """Return six pose values: event-camera position and optical axis in base frame."""
-    position = T_base_from_event[:3, 3].astype(np.float32)
-    optical_axis = T_base_from_event[:3, 2].astype(np.float32)
-    norm = float(np.linalg.norm(optical_axis))
-    if norm > 1e-6:
-        optical_axis = optical_axis / norm
-    return np.concatenate([position, optical_axis]).astype(np.float32)
-
 
 # ---------------------------------------------------------------------------
 # Table-plane channel  (kept here so reconstruction.py can import it)
@@ -510,7 +259,7 @@ class TablePriorDataset(Dataset):
             with h5py.File(self.poses_path, "r") as f:
                 ee_T_all = f["ee_T"][:].astype(np.float32)
                 n_p = ee_T_all.shape[0]
-            self.T_ee_from_event = np.linalg.inv(_load_T_event_from_ee()).astype(np.float32)
+                self.T_ee_from_event = np.linalg.inv(load_event_from_ee(_CAM_DATA)).astype(np.float32)
         else:
             ee_T_all = None
             n_p = n_d
@@ -529,7 +278,7 @@ class TablePriorDataset(Dataset):
             self.valid_indices = self._make_pose_view_ids(num_views, self.pose_move_threshold)
         else:
             self.cam_centers_base = None
-            self.src_offsets = self._make_source_offsets(num_views, view_interval)
+            self.src_offsets = fixed_source_offsets(num_views, view_interval)
             if self.recurrent:
                 self.valid_indices = np.arange(
                     self.recurrent_enrollment_range,
@@ -568,18 +317,6 @@ class TablePriorDataset(Dataset):
     def __len__(self) -> int:
         return len(self.valid_indices)
 
-    @staticmethod
-    def _make_source_offsets(num_views: int, view_interval: int) -> list[int]:
-        """Match MultiViewTableDataset's target, past, future ordering."""
-        offsets: list[int] = []
-        distance = 1
-        while len(offsets) < num_views - 1:
-            offsets.append(-distance * view_interval)
-            if len(offsets) < num_views - 1:
-                offsets.append(distance * view_interval)
-            distance += 1
-        return offsets
-
     def _make_pose_view_ids(self, num_views: int, move_threshold: float) -> np.ndarray:
         self.pose_view_ids, valid = build_pose_view_ids(
             self.cam_centers_base,
@@ -605,7 +342,7 @@ class TablePriorDataset(Dataset):
         if self.pose_channels:
             T_base_from_ee = self._poses[idx].astype(np.float32)
             T_base_from_event = T_base_from_ee @ self.T_ee_from_event
-            pose_values = _pose_channels_from_base_event(T_base_from_event)
+            pose_values = pose_channels_from_base_event(T_base_from_event)
             pose_t = torch.from_numpy(pose_values).view(6, 1, 1).expand(-1, height, width)
             channels.append(pose_t)
         return torch.cat(channels, dim=0)
@@ -658,118 +395,6 @@ class TablePriorDataset(Dataset):
 # ---------------------------------------------------------------------------
 # Optional uncertainty head
 # ---------------------------------------------------------------------------
-
-class UncertaintyUNet(UNet):
-    """UNet variant that predicts depth plus log variance in normalised depth units."""
-
-    def __init__(self, in_ch: int, base: int):
-        super().__init__(in_ch=in_ch, base=base)
-        self.head = nn.Conv2d(base, 2, kernel_size=1)
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        feat = self.stem(x)
-        skips = [feat]
-        for i, enc in enumerate(self.encoders):
-            feat = enc(feat)
-            if i < len(self.encoders) - 1:
-                skips.append(feat)
-        feat = self.bottleneck(feat)
-        for i, dec in enumerate(self.decoders):
-            feat = dec(feat, skips[-(i + 1)])
-
-        out = self.head(feat)
-        pred = torch.sigmoid(out[:, :1])
-        log_var = out[:, 1:2].clamp(min=-6.0, max=3.0)
-        return pred, log_var
-
-
-class ConvGRUCell(nn.Module):
-    """Convolutional GRU cell used at the U-Net bottleneck."""
-
-    def __init__(self, channels: int, kernel_size: int = 3):
-        super().__init__()
-        padding = kernel_size // 2
-        self.gates = nn.Conv2d(
-            channels * 2,
-            channels * 2,
-            kernel_size=kernel_size,
-            padding=padding,
-        )
-        self.candidate = nn.Conv2d(
-            channels * 2,
-            channels,
-            kernel_size=kernel_size,
-            padding=padding,
-        )
-
-    def forward(self, x: torch.Tensor, h: torch.Tensor | None) -> torch.Tensor:
-        if h is None:
-            h = torch.zeros_like(x)
-        reset, update = torch.sigmoid(self.gates(torch.cat([x, h], dim=1))).chunk(2, dim=1)
-        candidate = torch.tanh(self.candidate(torch.cat([x, reset * h], dim=1)))
-        return (1.0 - update) * h + update * candidate
-
-
-class RecurrentUNet(UNet):
-    """Single-view recurrent U-Net with a ConvGRU bottleneck state."""
-
-    def __init__(self, in_ch: int, base: int):
-        super().__init__(in_ch=in_ch, base=base)
-        bottleneck_channels = base * (2 ** len(self.encoders))
-        self.gru = ConvGRUCell(bottleneck_channels)
-
-    def _encode_one(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        feat = self.stem(x)
-        skips = [feat]
-        for i, enc in enumerate(self.encoders):
-            feat = enc(feat)
-            if i < len(self.encoders) - 1:
-                skips.append(feat)
-        feat = self.bottleneck(feat)
-        return feat, skips
-
-    def _decode_one(self, feat: torch.Tensor, skips: list[torch.Tensor]) -> torch.Tensor:
-        for i, dec in enumerate(self.decoders):
-            feat = dec(feat, skips[-(i + 1)])
-        return self.head(feat)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() == 4:
-            x = x.unsqueeze(1)
-        if x.dim() != 5:
-            raise ValueError(f"RecurrentUNet expects (B,T,C,H,W) or (B,C,H,W), got {tuple(x.shape)}")
-
-        hidden = None
-        final_skips = None
-        for t in range(x.shape[1]):
-            feat, skips = self._encode_one(x[:, t])
-            hidden = self.gru(feat, hidden)
-            final_skips = skips
-        return self._decode_one(hidden, final_skips)
-
-
-class ModelEMA:
-    """Exponential moving average of parameters and floating-point buffers."""
-
-    def __init__(self, model: nn.Module, decay: float):
-        self.decay = float(decay)
-        self.model = copy.deepcopy(model).eval()
-        for parameter in self.model.parameters():
-            parameter.requires_grad_(False)
-
-    @torch.no_grad()
-    def update(self, model: nn.Module) -> None:
-        source = model.state_dict()
-        for name, averaged in self.model.state_dict().items():
-            current = source[name].detach()
-            if averaged.is_floating_point():
-                averaged.mul_(self.decay).add_(
-                    current.to(dtype=averaged.dtype),
-                    alpha=1.0 - self.decay,
-                )
-            else:
-                averaged.copy_(current)
-
 
 def uncertainty_nll_loss(
     pred_norm: torch.Tensor,
@@ -836,14 +461,14 @@ def run_epoch(
                     pred, log_var, dep_norm, mask_t
                 )
                 if depth_aux_weight > 0.0:
-                    depth_aux_loss, _ = compute_loss(
+                    depth_aux_loss, _ = combined_depth_loss(
                         pred, dep_norm, mask_t, K=K,
                         lambda_grad=lambda_grad,
                         lambda_normal=lambda_normal,
                     )
                     loss = loss + depth_aux_weight * depth_aux_loss
             else:
-                loss, _ = compute_loss(
+                loss, _ = combined_depth_loss(
                     pred, dep_norm, mask_t, K=K,
                     lambda_grad=lambda_grad,
                     lambda_normal=lambda_normal,
@@ -858,12 +483,12 @@ def run_epoch(
 
             total_loss += loss.item()
             with torch.no_grad():
-                total_l1 += _l1_metres(pred, dep_t, mask_t).item()
+                total_l1 += l1_metres(pred, dep_t, mask_t).item()
                 pred_m = pred * (D_MAX - DEPTH_MIN) + DEPTH_MIN
                 valid_errors = torch.abs(pred_m - dep_t)[mask_t > 0.5]
                 if valid_errors.numel() > 0:
                     total_p95 += float(torch.quantile(valid_errors.float(), 0.95))
-                total_worst10_l1 += _worst_percent_l1_metres(pred, dep_t, mask_t).item()
+                total_worst10_l1 += worst_fraction_l1_metres(pred, dep_t, mask_t).item()
 
             n_batches += 1
             now = time.perf_counter()
@@ -1065,25 +690,17 @@ def main() -> None:
     np.random.seed(args.seed)
 
     import h5py
-    K_native, native_H, native_W = _load_event_K_native()
+    K_native, (native_H, native_W) = load_event_intrinsics(_CAM_DATA)
 
     # ── Discover sequences ────────────────────────────────────────────────
-    def _is_sequence(p: Path) -> bool:
-        return (
-            (p / "events" / "voxels_cam0.h5").exists()
-            and (p / "hdf5" / "depth_in_event_frame.h5").exists()
-            and (p / "hdf5" / "poses.h5").exists()
-            and (p / "hdf5" / "table_plane.h5").exists()
-        )
-
     train_root = args.data_dir / "train"
     eval_root = args.data_dir / "eval"
     explicit_train_seqs = (
-        sorted(d for d in train_root.iterdir() if d.is_dir() and _is_sequence(d))
+        sorted(d for d in train_root.iterdir() if d.is_dir() and is_precomputed_sequence(d))
         if train_root.is_dir() else []
     )
     explicit_eval_seqs = (
-        sorted(d for d in eval_root.iterdir() if d.is_dir() and _is_sequence(d))
+        sorted(d for d in eval_root.iterdir() if d.is_dir() and is_precomputed_sequence(d))
         if eval_root.is_dir() else []
     )
 

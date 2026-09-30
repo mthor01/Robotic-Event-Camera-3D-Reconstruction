@@ -29,24 +29,29 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+_CAMERA_DATA_DIR = Path(__file__).resolve().parent.parent / "camera_data"
+
 from multiview import (
-    DEPTH_MIN,
-    D_MAX,
-    NUM_BINS,
     MultiViewAugConfig,
     ModernMVSNet,
     MultiViewTableDataset,
-    _find_sequences,
-    _load_event_calibration,
+)
+from helpers import (
+    INTRINSICS_TRANSFORM,
+    depth_cube_mask,
+    depth_cube_masks_for_bottom_offsets,
+    find_precomputed_sequences,
+    load_event_calibration,
 )
 from config import (
+    DEPTH_MIN,
+    D_MAX,
+    NUM_BINS,
     SPATIAL_CUBE_SIDE,
     SPATIAL_TARGET_X,
     SPATIAL_TARGET_Y,
     SPATIAL_TARGET_Z,
 )
-from preprocessing_geometry import INTRINSICS_TRANSFORM
-from spatial_mask import depth_cube_mask, depth_cube_masks_for_bottom_offsets
 
 
 DEPTH_METRIC_NAMES = (
@@ -513,7 +518,7 @@ def _build_model(
     if model_arch == "ModernMVSNet":
         pass
     elif model_arch in ("UNet", "UNet+uncertainty", "RecurrentUNet") or "predict_uncertainty" in metadata:
-        from train_unet import RecurrentUNet, UNet, UncertaintyUNet
+        from unet_models import RecurrentUNet, UNet, UncertaintyUNet
 
         predicts_uncertainty = bool(metadata.get("predict_uncertainty", False))
         recurrent = bool(metadata.get("recurrent", False)) or model_arch == "RecurrentUNet"
@@ -3314,7 +3319,7 @@ def _evaluate_checkpoint(
     )
 
     evaluation_root = args.data_dir
-    sequence_dirs = _find_sequences(evaluation_root)
+    sequence_dirs = find_precomputed_sequences(evaluation_root)
     if not sequence_dirs:
         raise RuntimeError(
             f"No valid sequences found at or directly under {evaluation_root}"
@@ -3355,7 +3360,7 @@ def _evaluate_checkpoint(
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    calib = _load_event_calibration()
+    calib = load_event_calibration(_CAMERA_DATA_DIR)
     depth_total = DepthAccumulator()
     lower_cube_depth_total = DepthAccumulator()
     upper_cube_depth_total = DepthAccumulator()

@@ -30,7 +30,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import copy
 import math
 import sys
 import time
@@ -44,10 +43,16 @@ import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, Sampler
 from torch.utils.tensorboard import SummaryWriter
 
-from train_unet import (
-    DEPTH_MIN, D_MAX, NUM_BINS, _SCRIPT_DIR, DATA_ROOT,
-    _charbonnier, _gradient_loss, _l1_metres, _normal_loss,
-    _worst_percent_l1_metres,
+_SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_SCRIPT_DIR.parent))
+
+from config import DEPTH_MIN, D_MAX, NUM_BINS
+from depth_losses import (
+    charbonnier_loss,
+    gradient_loss,
+    l1_metres,
+    normal_loss,
+    worst_fraction_l1_metres,
 )
 from tensorboard_helper import (
     DEFAULT_TB_ROOT,
@@ -57,10 +62,22 @@ from tensorboard_helper import (
     UncertaintyErrorLogger,
     VizLogger,
 )
-from preprocessing_geometry import INTRINSICS_TRANSFORM, transform_intrinsics
-from view_selection import build_pose_view_ids, pose_layout_counts
+from helpers import (
+    INTRINSICS_TRANSFORM,
+    ModelEMA,
+    build_pose_view_ids,
+    camera_centers_world,
+    find_precomputed_sequences,
+    fixed_source_offsets,
+    load_event_calibration,
+    pose_layout_counts,
+    pose_channels_from_base_event,
+    set_3d_axes_equal,
+    transform_intrinsics,
+)
 
 _CAM_DATA = _SCRIPT_DIR.parent / "camera_data"
+DATA_ROOT = _SCRIPT_DIR.parent / "data" / "lego"
 
 
 @dataclass(frozen=True)
@@ -86,38 +103,6 @@ class MultiViewAugConfig:
 # Calibration / geometry
 # ---------------------------------------------------------------------------
 
-def _load_event_calibration() -> dict:
-    """Load event intrinsics plus T_event_from_ee from camera_data."""
-    ev = np.load(_CAM_DATA / "event_intrinsics.npz")
-    K_native = ev["camera_matrix"].astype(np.float32)
-    native_w = int(ev["image_size"][0])
-    native_h = int(ev["image_size"][1])
-
-    T_rgb_from_ee = np.load(_CAM_DATA / "T_rgb_from_ee.npz")["T"].astype(np.float32)
-    T_event_from_rgb = np.load(_CAM_DATA / "T_event_from_rgb.npz")["T"].astype(np.float32)
-    T_event_from_ee = T_event_from_rgb @ T_rgb_from_ee
-
-    return {
-        "K_native": K_native,
-        "native_hw": (native_h, native_w),
-        "T_event_from_ee": T_event_from_ee,
-    }
-
-
-def _transform_K_crop_resize(
-    K: np.ndarray,
-    native_hw: tuple[int, int],
-    resize_hw: tuple[int, int],
-    crop_hw: tuple[int, int],
-) -> np.ndarray:
-    """Scale event intrinsics through native center crop followed by resize.
-
-    This matches the preprocessing used by project_realsense_to_event.py and
-    precompute_voxels.py.
-    """
-    return transform_intrinsics(K, native_hw, resize_hw, crop_hw).astype(np.float32)
-
-
 def _inverse_depth_candidates(coarse_depths: int, depth_min: float, depth_max: float) -> np.ndarray:
     if coarse_depths < 2:
         raise ValueError(f"--coarse_depths must be >= 2, got {coarse_depths}")
@@ -130,16 +115,6 @@ def _linear_depth_candidates(coarse_depths: int, depth_min: float, depth_max: fl
     if coarse_depths < 2:
         raise ValueError(f"--coarse_depths must be >= 2, got {coarse_depths}")
     return np.linspace(depth_min, depth_max, coarse_depths, dtype=np.float32)
-
-
-def _pose_channels_from_base_event(T_base_from_event: np.ndarray) -> np.ndarray:
-    """Return six pose values: event-camera position and optical axis in base frame."""
-    position = T_base_from_event[:3, 3].astype(np.float32)
-    optical_axis = T_base_from_event[:3, 2].astype(np.float32)
-    norm = float(np.linalg.norm(optical_axis))
-    if norm > 1e-6:
-        optical_axis = optical_axis / norm
-    return np.concatenate([position, optical_axis]).astype(np.float32)
 
 
 def homo_warp_features(
@@ -351,12 +326,12 @@ class MultiViewTableDataset(Dataset):
                 f"{self.voxels_path} uses {voxel_transform!r}, requested "
                 f"{expected_transform!r}. Regenerate the sequence."
             )
-        self.K = _transform_K_crop_resize(
+        self.K = transform_intrinsics(
             calib["K_native"],
             (native_h, native_w),
             (resize_h, resize_w),
             (crop_h, crop_w),
-        )
+        ).astype(np.float32)
         self.linear_depth_candidates = bool(linear_depth_candidates)
         if self.linear_depth_candidates:
             self.depth_values = _linear_depth_candidates(
@@ -372,11 +347,11 @@ class MultiViewTableDataset(Dataset):
         self.T_cam_from_world = np.einsum(
             "ij,njk->nik", calib["T_event_from_ee"], T_ee_inv
         ).astype(np.float32)
-        self.cam_centers_world = self._camera_centers_world(self.T_cam_from_world)
+        self.cam_centers_world = camera_centers_world(self.T_cam_from_world)
         if self.pose_channels:
             T_base_from_event = np.linalg.inv(self.T_cam_from_world).astype(np.float32)
             self.pose_values = np.stack(
-                [_pose_channels_from_base_event(T) for T in T_base_from_event],
+                [pose_channels_from_base_event(T) for T in T_base_from_event],
                 axis=0,
             ).astype(np.float32)
         else:
@@ -392,7 +367,7 @@ class MultiViewTableDataset(Dataset):
         elif self.pose_view_selection:
             valid = self._make_pose_view_ids(num_views, self.pose_move_threshold)
         else:
-            self.src_offsets = self._make_source_offsets(num_views, view_interval)
+            self.src_offsets = fixed_source_offsets(num_views, view_interval)
             margin = max(abs(o) for o in self.src_offsets)
             valid = np.arange(margin, self.n_frames - margin, dtype=np.int64)
         if len(valid) == 0:
@@ -423,23 +398,6 @@ class MultiViewTableDataset(Dataset):
         self._vox = None
         self._dep = None
         self._tbl = None
-
-    @staticmethod
-    def _make_source_offsets(num_views: int, view_interval: int) -> list[int]:
-        offsets: list[int] = []
-        k = 1
-        while len(offsets) < num_views - 1:
-            offsets.append(-k * view_interval)
-            if len(offsets) < num_views - 1:
-                offsets.append(k * view_interval)
-            k += 1
-        return offsets
-
-    @staticmethod
-    def _camera_centers_world(T_cam_from_world: np.ndarray) -> np.ndarray:
-        R = T_cam_from_world[:, :3, :3]
-        t = T_cam_from_world[:, :3, 3]
-        return -np.einsum("nij,nj->ni", np.transpose(R, (0, 2, 1)), t).astype(np.float32)
 
     def _make_pose_view_ids(self, num_views: int, move_threshold: float) -> np.ndarray:
         self.pose_view_ids, valid = build_pose_view_ids(
@@ -1501,13 +1459,13 @@ def run_epoch(
 
             pred_loss = pred
             if l1_loss_only:
-                loss_final = _l1_metres(pred_loss, dep_t, mask_t)
+                loss_final = l1_metres(pred_loss, dep_t, mask_t)
             else:
-                loss_final = _charbonnier(pred_loss, dep_norm, mask_t)
-                loss_final = loss_final + lambda_grad * _gradient_loss(
+                loss_final = charbonnier_loss(pred_loss, dep_norm, mask_t)
+                loss_final = loss_final + lambda_grad * gradient_loss(
                     pred_loss, dep_norm, mask_t
                 )
-                loss_final = loss_final + lambda_normal * _normal_loss(
+                loss_final = loss_final + lambda_normal * normal_loss(
                     pred_loss, dep_norm, mask_t, K[0]
                 )
             loss = loss_final
@@ -1545,12 +1503,12 @@ def run_epoch(
 
             total_loss += float(loss.detach())
             with torch.no_grad():
-                total_l1 += float(_l1_metres(pred_loss, dep_t, mask_t))
+                total_l1 += float(l1_metres(pred_loss, dep_t, mask_t))
                 pred_m = pred_loss * (D_MAX - DEPTH_MIN) + DEPTH_MIN
                 valid_errors = torch.abs(pred_m - dep_t)[mask_t > 0.5]
                 if valid_errors.numel() > 0:
                     total_p95 += float(torch.quantile(valid_errors.float(), 0.95))
-                total_worst10_l1 += float(_worst_percent_l1_metres(pred_loss, dep_t, mask_t))
+                total_worst10_l1 += float(worst_fraction_l1_metres(pred_loss, dep_t, mask_t))
             n_batches += 1
 
             now = time.perf_counter()
@@ -1629,22 +1587,6 @@ def _event_activity_image(voxels: np.ndarray) -> np.ndarray:
     if hi - lo < 1e-8:
         return np.zeros_like(activity, dtype=np.float32)
     return np.clip((activity - lo) / (hi - lo), 0.0, 1.0)
-
-
-def _set_axes_equal(ax) -> None:
-    xlim = ax.get_xlim3d()
-    ylim = ax.get_ylim3d()
-    zlim = ax.get_zlim3d()
-    ranges = [abs(xlim[1] - xlim[0]), abs(ylim[1] - ylim[0]), abs(zlim[1] - zlim[0])]
-    centers = [
-        (xlim[0] + xlim[1]) * 0.5,
-        (ylim[0] + ylim[1]) * 0.5,
-        (zlim[0] + zlim[1]) * 0.5,
-    ]
-    radius = max(ranges) * 0.5
-    ax.set_xlim3d(centers[0] - radius, centers[0] + radius)
-    ax.set_ylim3d(centers[1] - radius, centers[1] + radius)
-    ax.set_zlim3d(centers[2] - radius, centers[2] + radius)
 
 
 def _write_pose_debug_text(
@@ -1739,7 +1681,7 @@ def debug_multiview_samples(
         ax3d.set_xlabel("base/world x [m]")
         ax3d.set_ylabel("base/world y [m]")
         ax3d.set_zlabel("base/world z [m]")
-        _set_axes_equal(ax3d)
+        set_3d_axes_equal(ax3d)
         ax3d.view_init(elev=25, azim=-60)
 
         fig.suptitle(
@@ -1761,53 +1703,9 @@ def debug_multiview_samples(
 # Main
 # ---------------------------------------------------------------------------
 
-def _is_sequence(p: Path) -> bool:
-    return (
-        (p / "events" / "voxels_cam0.h5").exists()
-        and (p / "hdf5" / "depth_in_event_frame.h5").exists()
-        and (p / "hdf5" / "poses.h5").exists()
-        and (p / "hdf5" / "table_plane.h5").exists()
-    )
-
-
-def _find_sequences(root: Path) -> list[Path]:
-    """Return a sequence at root, or all valid immediate child sequences."""
-    if _is_sequence(root):
-        return [root]
-    if not root.is_dir():
-        return []
-    return sorted(
-        d for d in root.iterdir()
-        if d.is_dir() and _is_sequence(d)
-    )
-
-
 def _set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
     for group in optimizer.param_groups:
         group["lr"] = lr
-
-
-class ModelEMA:
-    """Exponential moving average of parameters and floating-point buffers."""
-
-    def __init__(self, model: nn.Module, decay: float):
-        self.decay = float(decay)
-        self.model = copy.deepcopy(model).eval()
-        for parameter in self.model.parameters():
-            parameter.requires_grad_(False)
-
-    @torch.no_grad()
-    def update(self, model: nn.Module) -> None:
-        source = model.state_dict()
-        for name, averaged in self.model.state_dict().items():
-            current = source[name].detach()
-            if averaged.is_floating_point():
-                averaged.mul_(self.decay).add_(
-                    current.to(dtype=averaged.dtype),
-                    alpha=1.0 - self.decay,
-                )
-            else:
-                averaged.copy_(current)
 
 
 def _make_optimizer(args: argparse.Namespace, model: nn.Module) -> torch.optim.Optimizer:
@@ -2158,12 +2056,12 @@ def main() -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    calib = _load_event_calibration()
+    calib = load_event_calibration(_CAM_DATA)
 
     train_root = args.data_dir / "train"
     eval_root = args.data_dir / "eval"
-    train_seqs = _find_sequences(train_root)
-    val_seqs = _find_sequences(eval_root)
+    train_seqs = find_precomputed_sequences(train_root)
+    val_seqs = find_precomputed_sequences(eval_root)
 
     if not train_seqs or not val_seqs:
         missing = []
