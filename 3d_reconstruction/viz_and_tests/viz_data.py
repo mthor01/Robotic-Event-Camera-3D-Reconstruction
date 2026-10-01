@@ -821,7 +821,7 @@ def create_sensor_modalities_plot(
     depth_scale = float(np.load(depth_scale_path)["scale"])
     raw_depth *= depth_scale
 
-    # The voxel grid has already undergone the exact crop/resize transform used
+    # The voxel grid has already undergone the exact crop-then-resize transform used
     # by the model. Collapse its temporal bins into a grayscale activity image.
     events = np.abs(voxel).sum(axis=0)
     event_min = float(events.min())
@@ -835,7 +835,7 @@ def create_sensor_modalities_plot(
         raise ValueError(
             f"Voxel image shape {events.shape} does not match projected depth "
             f"shape {projected_depth.shape} in {sequence_dir}. Regenerate both "
-            "with the same crop/resize mode."
+            "with the canonical center-crop-then-resize geometry."
         )
     # Use the original, un-dilated event support in both event-frame panels.
     overlay_event_mask = events > 0.0

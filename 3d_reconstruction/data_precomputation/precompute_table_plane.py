@@ -49,7 +49,7 @@ from config import (
     SPATIAL_CUBE_SIDE,
     TABLE_Z_OFFSET,
 )
-from preprocessing_geometry import INTRINSICS_TRANSFORM, transform_intrinsics
+from helpers import INTRINSICS_TRANSFORM, resolve_path, transform_intrinsics
 
 CALIB_DIR = _HERE.parent / _CALIB_DIR
 DATA_ROOT = _HERE.parent / _DATA_ROOT
@@ -128,21 +128,6 @@ def _compute_channel(
 
     channel = ((depth - depth_min) / max(float(depth_max - depth_min), 1e-6)).clip(0.0, 1.0)
     return channel.reshape(out_H, out_W).astype(np.float32)
-
-
-def _transform_K_crop_resize(
-    K_native: np.ndarray,
-    native_H: int,
-    native_W: int,
-    resize_H: int,
-    resize_W: int,
-    crop_H: int,
-    crop_W: int,
-) -> np.ndarray:
-    return transform_intrinsics(
-        K_native.astype(np.float64), (native_H, native_W),
-        (resize_H, resize_W), (crop_H, crop_W),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +250,7 @@ def process_sequence(
                     return result
                 print(
                     f"  [{seq_dir.name}] Existing table_plane.h5 uses the obsolete "
-                    "direct-scaling geometry; recomputing with resize + centred crop."
+                    "direct-scaling geometry; recomputing with centred crop + resize."
                 )
 
     # Build T_base_from_event for every frame
@@ -295,14 +280,11 @@ def process_sequence(
             f"(robot base frame). Training depth range: [{DEPTH_MIN}, {D_MAX}] m."
         )
 
-        K_for_table = _transform_K_crop_resize(
-            calib["K_native"],
-            native_H,
-            native_W,
-            resize_H,
-            resize_W,
-            crop_H,
-            crop_W,
+        K_for_table = transform_intrinsics(
+            calib["K_native"].astype(np.float64),
+            (native_H, native_W),
+            (resize_H, resize_W),
+            (crop_H, crop_W),
         )
         K_native_H, K_native_W = H, W
 
@@ -362,14 +344,6 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    def _resolve_data_path(path_str: str) -> Path:
-        path = Path(path_str)
-        if path.is_absolute():
-            return path
-        # Resolve relative paths against the 3d_reconstruction/ directory so that
-        # Relative paths such as data/new/train/1 work regardless of the cwd.
-        return (_HERE.parent / path).resolve()
-
     if args.table_z is None:
         args.table_z = SPATIAL_TARGET_Z - SPATIAL_CUBE_SIDE / 2.0 + TABLE_Z_OFFSET
 
@@ -380,7 +354,7 @@ def main() -> None:
         f"Preprocessing : crop -> {crop_w}x{crop_h} -> "
         f"resize -> {resize_w}x{resize_h}"
     )
-    data_root = _resolve_data_path(args.data_root)
+    data_root = resolve_path(args.data_root, _HERE.parent)
     print(f"Data root     : {data_root}")
 
     calib = _load_calibration()
@@ -406,7 +380,7 @@ def main() -> None:
         seq_dirs = []
         searched_roots = []
         for data_dir in args.data_dir:
-            path = _resolve_data_path(data_dir)
+            path = resolve_path(data_dir, _HERE.parent)
             searched_roots.append(path)
             seq_dirs.extend(_collect_sequences(path))
         seq_dirs = sorted(set(seq_dirs))

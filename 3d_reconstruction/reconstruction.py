@@ -2,8 +2,8 @@
 """
 Depth-map, point-cloud, and TSDF reconstruction from trained depth models.
 
-Supports single- and multi-view early-fusion U-Net checkpoints, recurrent
-U-Net checkpoints, and geometric multiview checkpoints produced by the two
+Supports single- and multi-view early-fusion U-Net checkpoints and geometric
+multiview checkpoints produced by the two
 current training entry points: ``training/train_unet.py`` and
 ``training/multiview.py``.
 Uses the precomputed table-plane channel stored in hdf5/table_plane.h5
@@ -73,10 +73,16 @@ from config import (
     TSDF_VOXEL_SIZE, TSDF_SDF_TRUNC_FACTOR, TSDF_DEPTH_MAX,
     SPATIAL_CUBE_SIDE, SPATIAL_TARGET_X, SPATIAL_TARGET_Y, SPATIAL_TARGET_Z,
 )
-from preprocessing_geometry import INTRINSICS_TRANSFORM, transform_intrinsics
-from view_selection import select_pose_views
-from spatial_mask import depth_cube_mask, points_in_cube
-from train_unet import RecurrentUNet, UNet
+from helpers import (
+    INTRINSICS_TRANSFORM,
+    camera_centers_world,
+    depth_cube_mask,
+    points_in_cube,
+    pose_channels_from_base_event,
+    select_pose_views,
+    transform_intrinsics,
+)
+from train_unet import UNet
 from multiview import (
     ModernMVSNet,
     _inverse_depth_candidates,
@@ -168,10 +174,12 @@ def load_model(ckpt_path: Path, device: torch.device):
     if ckpt_type == "unet_table":
         in_ch = ckpt.get("in_ch", NUM_BINS + 1)
         base  = ckpt.get("base",  32)
-        if bool(ckpt.get("recurrent", False)) or ckpt.get("model_arch") == "RecurrentUNet":
-            model = RecurrentUNet(in_ch=in_ch, base=base).to(device)
-        else:
-            model = UNet(in_ch=in_ch, base=base).to(device)
+        if ckpt.get("model_arch", "UNet") != "UNet":
+            raise ValueError(
+                "Only standard UNet checkpoints are supported; got "
+                f"{ckpt.get('model_arch')!r}"
+            )
+        model = UNet(in_ch=in_ch, base=base).to(device)
         model.load_state_dict(ckpt["model"])
         model.eval()
         return model, ckpt, ckpt_type
@@ -346,16 +354,6 @@ def _preprocess_voxels(
     return t.squeeze(0).numpy()
 
 
-def _pose_channels_from_base_event(T_base_from_event: np.ndarray) -> np.ndarray:
-    """Return six pose values: event-camera position and optical axis in base frame."""
-    position = T_base_from_event[:3, 3].astype(np.float32)
-    optical_axis = T_base_from_event[:3, 2].astype(np.float32)
-    norm = float(np.linalg.norm(optical_axis))
-    if norm > 1e-6:
-        optical_axis = optical_axis / norm
-    return np.concatenate([position, optical_axis]).astype(np.float32)
-
-
 def _unet_input_np(
     vox_np: np.ndarray,
     tbl_np: np.ndarray,
@@ -449,7 +447,7 @@ def _infer_early_fusion_unet(
     target_tbl = tbl_ds[frame_idx].astype(np.float32)
     target_pose_values = None
     if use_pose_channels:
-        target_pose_values = _pose_channels_from_base_event(
+        target_pose_values = pose_channels_from_base_event(
             np.linalg.inv(T_cam_from_world[frame_idx]).astype(np.float32)
         )
     target_input = _unet_input_np(
@@ -471,7 +469,7 @@ def _infer_early_fusion_unet(
             T_base_from_event = np.linalg.inv(T_cam_from_world[view_idx]).astype(
                 np.float32
             )
-            pose_values = _pose_channels_from_base_event(T_base_from_event)
+            pose_values = pose_channels_from_base_event(T_base_from_event)
         view_inputs.append(
             _unet_input_np(vox_np, tbl_np, pose_values=pose_values)
         )
@@ -485,37 +483,7 @@ def _infer_early_fusion_unet(
             f"checkpoint expects {expected_channels}."
         )
     inp = torch.from_numpy(inp_np).unsqueeze(0).to(device)
-    out = model(inp)
-    pred = out[0] if isinstance(out, tuple) else out
-    return pred[0, 0].cpu().numpy()
-
-
-def _infer_recurrent_unet(
-    model: torch.nn.Module,
-    frame_idx: int,
-    vox_ds,
-    tbl_ds,
-    T_cam_from_world: np.ndarray,
-    ckpt: dict,
-    device: torch.device,
-    resize_hw: Optional[Tuple[int, int]],
-    crop_hw: Optional[Tuple[int, int]],
-) -> np.ndarray:
-    enrollment = int(ckpt.get("recurrent_enrollment_range", 0))
-    frame_ids = [max(0, frame_idx - offset) for offset in range(enrollment, -1, -1)]
-    inputs = []
-    for idx in frame_ids:
-        vox_np = _preprocess_voxels(vox_ds[idx].astype(np.float32), resize_hw, crop_hw)
-        tbl_np = tbl_ds[idx].astype(np.float32)
-        pose_values = None
-        if bool(ckpt.get("pose_channels", False)):
-            pose_values = _pose_channels_from_base_event(
-                np.linalg.inv(T_cam_from_world[idx]).astype(np.float32)
-            )
-        inputs.append(_unet_input_np(vox_np, tbl_np, pose_values=pose_values))
-    inp = torch.from_numpy(np.stack(inputs, axis=0)).unsqueeze(0).to(device)
-    out = model(inp)
-    pred = out[0] if isinstance(out, tuple) else out
+    pred = model(inp)
     return pred[0, 0].cpu().numpy()
 
 
@@ -528,12 +496,6 @@ def _multiview_source_offsets(num_views: int, view_interval: int) -> List[int]:
             offsets.append(k * view_interval)
         k += 1
     return offsets
-
-
-def _camera_centers_world(T_cam_from_world: np.ndarray) -> np.ndarray:
-    R = T_cam_from_world[:, :3, :3]
-    t = T_cam_from_world[:, :3, 3]
-    return -np.einsum("nij,nj->ni", np.transpose(R, (0, 2, 1)), t).astype(np.float32)
 
 
 def _multiview_view_ids(
@@ -2561,7 +2523,7 @@ def main() -> None:
         T_event_from_ee = np.linalg.inv(T_ee_from_event).astype(np.float32)
         T_ee_inv = np.linalg.inv(ee_T_all.astype(np.float32))
         T_cam_from_world = np.einsum("ij,njk->nik", T_event_from_ee, T_ee_inv).astype(np.float32)
-        cam_centers_world = _camera_centers_world(T_cam_from_world)
+        cam_centers_world = camera_centers_world(T_cam_from_world)
 
     # ── Frame counts ──────────────────────────────────────────────
     with h5py.File(depth_h5_path, "r") as f:
@@ -2732,26 +2694,6 @@ def main() -> None:
                     return_uncertainty=use_learned_uncertainty,
                 )
                 recurrent_states = None
-            elif (
-                ckpt_type == "unet_table"
-                and (
-                    bool(ckpt.get("recurrent", False))
-                    or ckpt.get("model_arch") == "RecurrentUNet"
-                )
-            ):
-                pred_norm = _infer_recurrent_unet(
-                    model,
-                    frame_idx,
-                    voxels_f["voxels"],
-                    table_f["table_plane"],
-                    T_cam_from_world,
-                    ckpt,
-                    device,
-                    resize_hw,
-                    crop_hw,
-                )
-                recurrent_states = None
-                uncertainty_map = None
             elif ckpt_type == "unet_table":
                 pred_norm = _infer_early_fusion_unet(
                     model,

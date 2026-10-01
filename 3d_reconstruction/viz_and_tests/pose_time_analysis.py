@@ -35,7 +35,6 @@ from pathlib import Path
 
 import h5py
 import numpy as np
-from scipy.signal import find_peaks
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -44,6 +43,7 @@ from matplotlib.gridspec import GridSpec
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import FPS as DEFAULT_FPS
+from helpers import box_smooth, find_troughs, unit_norm
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -55,29 +55,6 @@ def ensure_out_dir(data_dir: Path) -> Path:
     d = data_dir / "pose_plots"
     d.mkdir(parents=True, exist_ok=True)
     return d
-
-
-def box_smooth(arr: np.ndarray, k: int) -> np.ndarray:
-    if k <= 1:
-        return arr.astype(np.float64).copy()
-    kernel = np.ones(k) / k
-    return np.convolve(arr.astype(np.float64), kernel, mode="same")
-
-
-def find_troughs(sig: np.ndarray, min_prominence_frac: float = 0.15) -> np.ndarray:
-    """Find troughs using scipy find_peaks on inverted signal."""
-    if len(sig) < 3:
-        return np.array([], dtype=np.float64)
-    sig_range = float(sig.max() - sig.min())
-    if sig_range == 0:
-        return np.array([], dtype=np.float64)
-    peaks, _ = find_peaks(-sig, prominence=min_prominence_frac * sig_range)
-    return peaks.astype(np.float64)
-
-
-def unit_norm(a: np.ndarray) -> np.ndarray:
-    mx = np.abs(a).max()
-    return a / mx if mx > 0 else a
 
 
 # ══════════════════════════════════════════════════════════════════════

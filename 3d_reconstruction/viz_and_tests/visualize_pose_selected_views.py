@@ -32,6 +32,7 @@ _TRAINING_DIR = _RECONSTRUCTION_ROOT / "training"
 sys.path.insert(0, str(_TRAINING_DIR))
 
 import multiview as mv  # noqa: E402
+from helpers import load_event_calibration  # noqa: E402
 
 
 def _resolve_sequence_path(path: Path) -> Path:
@@ -240,7 +241,7 @@ def main() -> None:
 
     dataset = mv.MultiViewTableDataset(
         sequence_path,
-        mv._load_event_calibration(),
+        load_event_calibration(_RECONSTRUCTION_ROOT / "camera_data"),
         num_views=args.num_views,
         pose_view_selection=True,
         pose_move_threshold=args.pose_move_threshold,

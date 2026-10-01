@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import h5py
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from helpers import INTRINSICS_TRANSFORM
 
-EXPECTED_TRANSFORM = "center_crop_resize"
+EXPECTED_TRANSFORM = INTRINSICS_TRANSFORM
 
 
 def as_text(value: object) -> str:

@@ -9,7 +9,7 @@ voxel bins and pixels::
 The activity series is min-max normalized to [0, 1]. End-effector speed is
 computed from the high-rate transforms in ``hdf5/raw_poses.h5`` and sampled at
 the camera-frame timestamps. Raw pose timestamps receive the exact correction
-used by ``rec_data.assign_poses_to_frames``::
+used by ``data_recording.rec_data.assign_poses_to_frames``::
 
     corrected = t_recv_ns - transport_delay_ns + pose_time_offset_ms
 

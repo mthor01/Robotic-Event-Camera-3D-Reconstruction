@@ -10,7 +10,7 @@ the saved images, and reports / visualises:
   4. 3D camera-frame plot – positions/orientations of all cameras
 
 Usage:
-    python verify_calibration.py [--data-dir camera_data] [--no-plots]
+    python data_recording/verify_calibration.py [--data-dir camera_data] [--no-plots]
 """
 
 from __future__ import annotations
@@ -19,9 +19,13 @@ import argparse
 import sys
 from pathlib import Path
 
+_PROJECT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PROJECT_DIR))
+
 import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
+from helpers import create_charuco_board as _make_charuco, detect_charuco
 
 # Try interactive backends in order; fall back to Agg (file-only) if none works
 import matplotlib
@@ -54,23 +58,8 @@ MARKER_LEN = 0.015
 # ════════════════════════════════════════════════════════════════════
 #  ChArUco helpers
 # ════════════════════════════════════════════════════════════════════
-def _make_charuco():
-    d = cv2.aruco.getPredefinedDictionary(ARUCO_DICT)
-    board = cv2.aruco.CharucoBoard(
-        (SQUARES_H, SQUARES_V), SQUARE_LEN, MARKER_LEN, d
-    )
-    det = cv2.aruco.CharucoDetector(
-        board, cv2.aruco.CharucoParameters(), cv2.aruco.DetectorParameters()
-    )
-    return board, det
-
-
 def _detect(image, detector):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-    corners, ids, _, _ = detector.detectBoard(gray)
-    if corners is not None and len(corners) >= 4:
-        return corners, ids
-    return None, None
+    return detect_charuco(image, detector, min_corners=4)
 
 
 def _load_images(folder: Path) -> list[tuple[str, np.ndarray]]:
@@ -561,7 +550,7 @@ def main():
         description="Verify and visualize multi-camera calibration results"
     )
     parser.add_argument(
-        "--data-dir", default="camera_data",
+        "--data-dir", default=_PROJECT_DIR / "camera_data",
         help="Directory with calibration files (default: camera_data)"
     )
     parser.add_argument(
@@ -575,6 +564,8 @@ def main():
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
+    if not data_dir.is_absolute():
+        data_dir = _PROJECT_DIR / data_dir
     if not data_dir.exists():
         print(f"Data directory not found: {data_dir}")
         sys.exit(1)

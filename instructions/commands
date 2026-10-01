@@ -43,7 +43,7 @@ xhost +local:root
 ##########Record Data############
 python3 main.py --real-robot
 
-python3 rec_data.py
+python3 data_recording/rec_data.py
 
 bash precompute_all.sh --data_root data/... --voxel --float16
 
@@ -59,9 +59,9 @@ python3 precompute_pose_depth.py
 ##########Calibration############
 python main.py --calibration-poses calibration_poses.npy --agent-type multi_cam_calibrate
 
-python3 calibration.py --output-dir camera_data
+python3 data_recording/calibration.py --output-dir camera_data
 
-python3 verify_calibration.py --data-dir camera_data
+python3 data_recording/verify_calibration.py --data-dir camera_data
 
 python3 viz_and_tests/pose_time_analysis.py --data-dir data/temporal_check
 

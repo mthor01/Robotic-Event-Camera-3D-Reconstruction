@@ -121,7 +121,8 @@ produce coherent surfaces after fusion.
 | Path | Purpose |
 | --- | --- |
 | `franka_pipeline/` | Franka robot control, trajectory execution, pose streaming, and synchronized data collection. |
-| `3d_reconstruction/` | Recording client, calibration, preprocessing, training, evaluation, reconstruction, and visualization tools. |
+| `3d_reconstruction/` | Preprocessing, training, evaluation, reconstruction, and visualization tools. |
+| `3d_reconstruction/data_recording/` | System-specific camera calibration, calibration verification, and synchronized recording entry points. |
 | `3d_reconstruction/camera_data/` | Example camera intrinsics, extrinsics, depth scale, and recorded end-effector poses for the original hardware setup. |
 | `3d_reconstruction/data_precomputation/` | Scripts that project depth into event-camera geometry, create table priors, and build event voxel grids. |
 | `3d_reconstruction/training/` | Multiview depth network, training loop, evaluation, and TensorBoard helpers. |
@@ -131,224 +132,309 @@ produce coherent surfaces after fusion.
 
 ## Requirements
 
-The full real-robot workflow was developed for Linux, NVIDIA GPU acceleration,
-Docker, a Franka Emika Panda, Deoxys, an Intel RealSense camera, and an
-event-camera stack based on Metavision/IDS uEye EVS. It is hardware-specific;
-this repository does not make the system plug-and-play on arbitrary hardware.
+The physical data-collection system depends on our particular Franka Emika
+Panda, Deoxys backend, synchronized Intel RealSense D435 and IDS event camera,
+custom camera mount, calibration, network setup, and vendor drivers. The
+recording code is included to document and reproduce our experimental system;
+it is not intended as a generic data-collection system to be reimplemented on
+an arbitrary robot or camera setup.
 
-All scripts in `3d_reconstruction/` are intended to run inside the environment
-defined by
-[`docker_installation/training_and_reconstruction/Dockerfile`](docker_installation/training_and_reconstruction/Dockerfile).
-This includes camera recording, calibration, data preprocessing, model training,
-evaluation, and TSDF reconstruction. Build the image from its directory:
+Everything after recording is ready to run inside the main
+`training_and_reconstruction` Docker image: raw-data preprocessing, U-Net and
+MVS-inspired training, quantitative evaluation, and TSDF reconstruction. A
+Linux machine is recommended, and model training and reconstruction require an
+NVIDIA GPU with a working NVIDIA Container Toolkit installation.
 
-```bash
-cd docker_installation/training_and_reconstruction
-docker build -t robot-record-reconstruction .
-```
-
-Data recording additionally requires `franka_pipeline/` and its two-container
-robot-control environment:
-
-- The image defined by
-  [`docker_installation/robot_arm_backend/Dockerfile`](docker_installation/robot_arm_backend/Dockerfile)
-  runs the low-level Deoxys backend that communicates with the robot. This
-  container must already be running in the background before robot commands are
-  issued.
-- The scripts in `franka_pipeline/` run inside the image defined by
-  [`docker_installation/robot_arm_frontend/Dockerfile`](docker_installation/robot_arm_frontend/Dockerfile).
-  The frontend connects to the running backend and handles trajectory execution,
-  robot poses, and synchronization with the recording process.
-
-Consequently, physical data collection uses three cooperating components: the
-robot backend container, the robot frontend container running
-`franka_pipeline/`, and the training-and-reconstruction container running the
-recording script from `3d_reconstruction/`.
-
-The Dockerfiles download third-party dependencies at build time and may need
-updates as upstream package repositories change. They also use privileged,
-host-networked container settings for hardware access; review those settings
-before running them on a shared system.
-
-If a recorded and preprocessed dataset is already available, skip the
-**Calibration** and **Physical recording** sections and continue directly with
-[Training](#training) or [Evaluation and reconstruction](#evaluation-and-reconstruction).
-
-## Calibration
-
-The repository includes calibration outputs for its original rig. Treat them as
-examples, not portable parameters. Recalibrate after changing a camera, lens,
-mount, robot base, table, resolution, or preprocessing transform.
-
-To estimate calibration from existing captures:
+Build the image from the repository root. Supplying the local user and group
+IDs keeps bind-mounted outputs writable by the host user:
 
 ```bash
-cd 3d_reconstruction
-python calibration.py --output-dir camera_data
+docker build \
+  --build-arg UID="$(id -u)" \
+  --build-arg GID="$(id -g)" \
+  -t robot-record-reconstruction \
+  docker_installation/training_and_reconstruction
 ```
 
-To collect a new calibration sequence through the robot-side ZeroMQ service:
+Start an interactive container with the repository mounted at `/workspace`:
 
 ```bash
-python calibration.py \
-  --collect-data \
-  --output-dir camera_data \
-  --zmq-bind tcp://0.0.0.0:6002
+docker run --rm -it \
+  --gpus all \
+  --ipc=host \
+  --shm-size=16g \
+  -v "$(pwd):/workspace" \
+  -w /workspace/3d_reconstruction \
+  robot-record-reconstruction bash
 ```
 
-Use `verify_calibration.py` and the tools in `viz_and_tests/` to inspect the
-result before collecting a dataset or training a model.
+The commands below are executed from this container shell. Adjust `--shm-size`,
+batch sizes, and worker counts to the available RAM, shared memory, and GPU.
 
-## Physical recording
+## Input data format
 
-Only use this section after hardware, network addresses, calibration, and
-emergency-stop procedures have been checked.
+The directory and file names in this section are part of the data interface;
+they are not placeholders except for names written inside angle brackets.
+Each recording of one object is one **sequence directory**.
+`data_recording/rec_data.py`
+creates that directory as:
 
-### Software architecture
+```text
+3d_reconstruction/data/real/<object-name>/
+├── raw_event_data/
+│   └── events_cam0.raw
+├── hdf5/
+│   ├── realsense.h5
+│   ├── events_cam0.h5
+│   ├── poses.h5
+│   ├── raw_poses.h5              # recorder diagnostics; not precompute input
+│   └── metadata.h5               # recorder metadata; not precompute input
+└── videos/                       # previews; not precompute input
+    ├── events_cam0.mp4
+    ├── realsense_depth.mp4
+    └── realsense_rgb.mp4
+```
 
-Physical recording uses two synchronized application processes in addition to
-the low-level robot backend:
+`<object-name>` is the name entered when recording; spaces and other special
+characters are replaced with underscores. The three names
+`raw_event_data`, `hdf5`, and `events_cam0.raw`, and the HDF5 filenames shown
+above, must remain exactly as written. Do not place the HDF5 files directly in
+the object directory.
 
-1. `franka_pipeline/main.py`, running in the robot-frontend container, controls
-   the robot and publishes timestamped end-effector poses and episode events
-   through ZeroMQ.
-2. `3d_reconstruction/rec_data.py`, running in the
-   training-and-reconstruction container, records both cameras, subscribes to
-   the robot poses, and uses a request/reply handshake to synchronize recording.
+For multiview training, organize the complete sequence directories into the
+following exact split layout. Moving a sequence means moving its entire
+`<object-name>/` directory, without changing anything inside it:
 
-The Deoxys backend container communicates directly with the robot and must
-remain active while the frontend process is running.
+```text
+3d_reconstruction/data/<dataset-name>/
+├── train/
+│   ├── <training-object-1>/
+│   │   ├── raw_event_data/events_cam0.raw
+│   │   └── hdf5/
+│   │       ├── realsense.h5
+│   │       ├── events_cam0.h5
+│   │       └── poses.h5
+│   └── <training-object-2>/
+│       └── ...
+└── eval/
+    ├── <evaluation-object-1>/
+    │   ├── raw_event_data/events_cam0.raw
+    │   └── hdf5/
+    │       ├── realsense.h5
+    │       ├── events_cam0.h5
+    │       └── poses.h5
+    └── <evaluation-object-2>/
+        └── ...
+```
 
-Shared recording, preprocessing, and reconstruction constants live in
-[`3d_reconstruction/config.py`](3d_reconstruction/config.py), including image
-sizes, voxel-bin count, workspace dimensions, depth limits, and local ZeroMQ
-addresses.
+For example, `DATA_DIR="../data/my_dataset"` in `training/multiview.sh`
+means that the script reads sequences from `data/my_dataset/train/` and
+validates on sequences from `data/my_dataset/eval/`. The split directory names
+must literally be `train` and `eval`. Evaluation and reconstruction instead
+receive the evaluation split itself, for example
+`DATA_DIR="../data/my_dataset/eval"` in `training/eval.sh` and
+`DATA_DIR="data/my_dataset/eval"` in `reconstruction.sh`.
 
-### Starting a recording
+`precompute_all.sh` accepts one or more complete sequence directories through
+`--data_dir`, or searches recursively beneath `--data_root`. A directory is
+recognized by voxel preprocessing as a raw sequence only when it contains both
+`hdf5/realsense.h5` and at least one
+`raw_event_data/events_cam*.raw` file. Therefore it is safe to run preprocessing
+on the dataset root above: it will find sequences inside both splits.
 
-First start the Deoxys backend using the robot-backend Docker image and leave it
-running in the background. Then open the robot-frontend container and start the
-robot-side pipeline with synchronized recording enabled:
+The recorder-compatible file contents are described below. `N` always denotes
+the number of synchronized RealSense frames in one sequence. Unless explicitly
+marked optional, names, group paths, shapes, and index correspondence are
+required.
+
+### `raw_event_data/events_cam0.raw`
+
+A Metavision-compatible RAW event stream. Events must contain native event
+coordinates, timestamps in microseconds, and polarity. The recorder writes one
+rising-edge external-trigger event for every synchronized RealSense frame. The
+voxel preprocessor reads those triggers from the RAW stream and falls back to
+`events/hw_trigger_times_us` in `events_cam0.h5`; at least one of those sources
+must contain at least `N` triggers. Event timestamps, trigger timestamps, and
+the windows stored in `events_cam0.h5` must use the same event-camera clock.
+
+Additional event cameras may be supplied as `events_cam1.raw`,
+`events_cam2.raw`, and so on, with matching `hdf5/events_cam1.h5` files. The
+current training pipeline consumes `voxels_cam0.h5`.
+
+### `hdf5/realsense.h5`
+
+| Dataset | Shape and type | Use |
+| --- | --- | --- |
+| `depth` | `(N, H_d, W_d)`, `uint16` | **Required.** Raw RealSense depth units. The conversion to metres is stored separately in `camera_data/depth_scale.npz`. |
+| `rgb` | `(N, H_r, W_r, 3)`, `uint8` | Optional BGR color frames. When present, the default projection also creates `rgb_in_event_frame.h5`; omit them when only depth/event processing is needed. |
+| `t_global_ms` | `(N,)`, numeric | **Required by voxel preprocessing.** RealSense global timestamps in milliseconds. Older imported recordings may instead provide `t_sys_ns`; only the array length is used. |
+| `t_rgb_ms` | `(N,)`, numeric | Optional RGB timestamps retained for synchronization diagnostics. |
+| `frame_number` | `(N,)`, integer | Optional RealSense frame identifiers. |
+
+All frame-indexed datasets must be ordered consistently. The supplied recorder
+uses `480 x 640` depth and RGB frames, but preprocessing reads the calibrated
+resolution rather than requiring these literal dimensions.
+
+### `hdf5/events_cam0.h5`
+
+This is the frame-aligned index of the raw event stream. It must contain an
+`events` group with:
+
+| Dataset or attribute | Shape/value and use |
+| --- | --- |
+| `events/frames` | **Required by the current projection step.** `(N, H_e, W_e)`, `uint8` event preview frames. |
+| `events/t_ev_start_us` | **Required.** `(N,)`, integer start time of every aligned event window. |
+| `events/t_ev_end_us` | **Required.** `(N,)`, integer end time of every aligned event window. |
+| `events/hw_trigger_times_us` | Required only as a fallback when the RAW file does not expose at least `N` rising-edge triggers. |
+| `events/alignment_offset_us` | Optional `(N,)` signed diagnostic offsets between selected event-window centers and triggers. |
+| `events.attrs["height"]`, `events.attrs["width"]` | **Required.** Native event-camera dimensions as integer attributes. The recorder writes height `720` and width `1280`; voxel preprocessing uses them for RAW-event coordinates. |
+| `events.attrs["fps"]`, `events.attrs["delta_t_us"]` | Optional preview-frame metadata written by the recorder. |
+| `events.attrs["alignment_mode"]` | Optional diagnostic value `"hw_trigger"`. |
+
+The preprocessing code does not synthesize this alignment from unrelated
+clocks. If adapting an external dataset, the RAW triggers and aligned event
+windows must be generated beforehand.
+
+### `hdf5/poses.h5`
+
+| Dataset | Required shape and type | Meaning |
+| --- | --- | --- |
+| `ee_T` | `(N, 4, 4)`, floating point | One homogeneous `T_base_from_ee` end-effector pose per synchronized frame. |
+| `nearest_offset_ms` | `(N,)`, floating point | Optional diagnostic time difference to the raw robot pose selected for that frame. |
+
+The frame at index `i` in `poses.h5` must describe the camera pose for frame
+`i` in `realsense.h5` and the aligned event window at index `i`. In a normal
+recording, `depth`, `rgb`, `t_global_ms`, `events/frames`, both event-window
+timestamp arrays, `ee_T`, and `nearest_offset_ms` therefore all have the same
+leading length `N`. Preprocessing can truncate depth/table generation to an
+available minimum in some mismatch cases, but such a sequence is not the
+intended input format and should be repaired before training.
+
+The supplied recorder additionally creates `raw_poses.h5`, `metadata.h5`, and
+preview videos. These are useful for provenance and diagnostics but are not
+inputs to `precompute_all.sh`.
+
+### Calibration files
+
+Place the calibration in `3d_reconstruction/camera_data/`. To use another
+location for the complete pipeline, update `CALIB_DIR` in
+`3d_reconstruction/config.py`; the projection script's `--calib_dir` flag only
+changes the projection stage. The complete pipeline expects:
+
+| File | Required arrays |
+| --- | --- |
+| `event_intrinsics.npz` | `camera_matrix` `(3,3)`, `dist_coeffs`, and `image_size` `[W,H]` |
+| `rs_depth_intrinsics.npz` | `camera_matrix` `(3,3)` and `image_size` `[W,H]` |
+| `rs_rgb_intrinsics.npz` | `camera_matrix` `(3,3)` and `image_size` `[W,H]` |
+| `depth_scale.npz` | Scalar `scale`, converting stored `uint16` depth to metres |
+| `T_event_from_depth.npz` | Homogeneous transform `T` `(4,4)` |
+| `T_color_from_depth.npz` | Homogeneous transform `T` `(4,4)` |
+| `T_event_from_rgb.npz` | Homogeneous transform `T` `(4,4)` |
+| `T_rgb_from_ee.npz` | Homogeneous transform `T` `(4,4)` |
+
+The last two transforms are composed to obtain the event-camera pose relative
+to the robot end effector for table-prior generation, training, evaluation,
+and reconstruction.
+
+## Preprocessing
+
+From `/workspace/3d_reconstruction` inside the Docker container, process an
+entire dataset with:
 
 ```bash
-cd franka_pipeline
-python main.py --real-robot --sync-recording
+./data_precomputation/precompute_all.sh --data_root data/my_dataset
 ```
 
-In parallel, use the training-and-reconstruction container to start the camera
-recording client:
-
-```bash
-cd 3d_reconstruction
-python rec_data.py \
-  --zmq-sync-addr tcp://ROBOT_HOST:6001 \
-  --zmq-pose-addr tcp://ROBOT_HOST:6000
-```
-
-The default addresses are localhost ports `6000` and `6001`. Change them for
-separate machines and expose only trusted interfaces. The recording client
-expects the required camera drivers and the physical cameras to be available.
-
-## Data layout and preprocessing
-
-Raw data is intentionally ignored by Git. By default, scripts expect datasets
-under `3d_reconstruction/data/real/`. A recording sequence must provide the
-modalities and metadata expected by the preprocessing scripts; inspect their
-`--help` output and the relevant loader code before adapting a new dataset.
-
-The normal preprocessing order is:
-
-1. Project RealSense depth into the event-camera reference frame.
-2. Compute or load the table-plane prior.
-3. Convert event streams to temporal voxel grids.
-
-Run all three in order:
-
-```bash
-cd 3d_reconstruction
-./data_precomputation/precompute_all.sh --data_root data/real
-```
-
-For a specific sequence or a crop-then-resize setup:
+Or process one or more explicit sequences:
 
 ```bash
 ./data_precomputation/precompute_all.sh \
-  --data_dir data/real/my_sequence \
-  --crop_then_resize
+  --data_dir data/my_dataset/train/object_01 data/my_dataset/eval/object_07
 ```
 
-`precompute_all.sh` forwards common flags to every stage and accepts
-stage-specific flags after `--project`, `--table`, or `--voxel`. Run each Python
-script with `--help` for the authoritative set of options.
+The script runs depth/RGB projection, table-plane prior generation, and event
+voxel generation in the required order. It does not create a new sequence
+directory; it adds the derived files to each existing sequence. After a
+successful run, the complete sequence layout is:
 
-## Training
+```text
+<sequence>/
+├── raw_event_data/
+│   └── events_cam0.raw             # original input
+├── events/
+│   └── voxels_cam0.h5              # generated
+│       ├── /voxels                 # (N, 5, 240, 320), float32 by default
+│       └── /hw_trigger_times_us     # (N,), integer microseconds
+└── hdf5/
+    ├── realsense.h5                 # original input
+    ├── events_cam0.h5               # original aligned input
+    ├── poses.h5                     # original input
+    ├── depth_in_event_frame.h5      # generated: /depth, (N,240,320), float32 metres
+    ├── rgb_in_event_frame.h5        # generated if RGB exists: /rgb, (N,240,320,3), uint8
+    └── table_plane.h5               # generated: /table_plane, (N,240,320), float32 [0,1]
+```
 
-The depth model consumes event voxel grids, table-plane priors, camera geometry,
-and one or more selected views. Train from the reconstruction directory:
+All spatial products use the canonical native center crop to `720 x 960`
+followed by resizing to `240 x 320`. `precompute_all.sh` overwrites derived
+files. Its `--project`, `--table`, and `--voxel` section markers can be used to
+forward stage-specific options; run each underlying script with `--help` for
+the available settings.
+
+A sequence is ready for training only when these four exact paths exist:
+
+```text
+<sequence>/events/voxels_cam0.h5
+<sequence>/hdf5/depth_in_event_frame.h5
+<sequence>/hdf5/poses.h5
+<sequence>/hdf5/table_plane.h5
+```
+
+The model loader uses the dataset names `/voxels`, `/depth`, `/ee_T`, and
+`/table_plane` inside those files. `rgb_in_event_frame.h5` is useful for
+visualization but is not a model input. Frame index `i` must refer to the same
+instant and camera pose in all four model inputs.
+
+## Local training, evaluation, and reconstruction
+
+The local `.sh` launchers contain the same experiment commands as the Slurm
+launchers without cluster resource directives or hard-coded cluster paths.
+Their configuration blocks are deliberately near the top of each file. Edit
+the dataset paths, run names, checkpoints, batch sizes, workers, and model
+options there before running them.
+
+Train the MVS-inspired model:
 
 ```bash
-cd 3d_reconstruction
-python training/train_unet.py \
-  --data_dir data/real \
-  --out_dir checkpoints/run_001 \
-  --epochs 50 \
-  --batch_size 64 \
-  --num_views 1
+./training/multiview.sh
 ```
 
-For multiview training, increase `--num_views` and use `--view_interval` or
-`--pose_view_selection`. Other useful switches include `--predict_uncertainty`,
-`--recurrent`, `--crop_then_resize`, and loss-weight parameters. Outputs,
-TensorBoard logs, checkpoints, and result directories are ignored by Git.
-
-## Evaluation and reconstruction
-
-Evaluate a checkpoint with:
+Train the U-Net baseline:
 
 ```bash
-cd 3d_reconstruction
-python training/evaluation.py --help
+./training/train_unet.sh
 ```
 
-Reconstruct a sequence and fuse predicted depth maps into a TSDF volume with:
+Evaluate one or more checkpoints:
 
 ```bash
-python reconstruction.py --help
+./training/eval.sh
 ```
 
-Use the command help for required positional inputs and checkpoint arguments;
-these scripts have many experimental switches for frame selection, uncertainty
-filtering, pose layout, workspace cube bounds, mesh extraction, and rendering.
-The defaults are derived from `config.py` and are specific to the original
-tabletop scene.
+Create and compare TSDF reconstructions:
 
-## Development notes
+```bash
+./reconstruction.sh
+```
 
-- Run Python commands from `franka_pipeline/` or `3d_reconstruction/` as shown;
-  several scripts use relative imports and paths.
-- The project is research code, with experimental scripts and setup-specific
-  constants. There is no automated test suite or package installer at present.
-- Large raw recordings, model checkpoints, meshes, plots, and logs should stay
-  outside Git or be released through an archival/data service rather than
-  committed to the repository.
-- `viz_and_tests/` is a useful source of examples, but many scripts assume a
-  particular directory structure or development dataset.
+Each launcher also appends arguments supplied on the command line, making short
+temporary overrides possible without editing the file. For example:
 
-## Third-party software and licensing
+```bash
+./training/multiview.sh --epochs 5 --name local_smoke_test
+```
 
-This project depends on third-party systems including Deoxys,
-RealSense/librealsense, Metavision, IDS uEye EVS, Open3D, PyTorch, and optional
-vision-language/grasping services. Their licences, terms, and redistribution
-rules apply independently.
-
-No licence file is currently included for this repository. Before publishing,
-add a `LICENSE` that expresses the permissions you intend to grant, and verify
-that all bundled vendor packages and PDF documentation may legally be
-redistributed. In particular, consider removing the `.deb` installers and
-vendor PDFs and linking to their official download pages instead.
-
-## Citation
-
-For the scientific motivation, method, and complete evaluation, please refer to
-the [master's thesis](docs/Masters_Thesis_github.pdf). If you use the code,
-please also cite the repository URL and the commit or release version used.
+The scripts assume they are already running inside the main Docker image. They
+resolve the repository location from their own path, so they can be invoked
+from any working directory. Training outputs, evaluation reports, and
+reconstruction meshes are written into the mounted repository and therefore
+remain available after the container exits.

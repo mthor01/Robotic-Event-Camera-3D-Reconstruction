@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from reconstruction_config import POSE_VIZ_AXIS_LEN, POSE_VIZ_ARROW_LEN
+from config import POSE_VIZ_AXIS_LEN, POSE_VIZ_ARROW_LEN
 
 
 # ══════════════════════════════════════════════════════════════════════

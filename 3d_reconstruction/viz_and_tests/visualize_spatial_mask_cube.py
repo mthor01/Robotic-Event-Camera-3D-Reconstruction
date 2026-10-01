@@ -39,8 +39,7 @@ from config import (  # noqa: E402
     SPATIAL_TARGET_Y,
     SPATIAL_TARGET_Z,
 )
-from preprocessing_geometry import transform_intrinsics  # noqa: E402
-from spatial_mask import depth_cube_mask  # noqa: E402
+from helpers import depth_cube_mask, transform_intrinsics  # noqa: E402
 
 
 CUBE_EDGES = (

@@ -10,10 +10,10 @@ Two modes:
      new frames via robot arm movements. Overwrites existing frames.
 
 Usage (calibration-only, default):
-    python calibration.py --output-dir camera_data
+    python data_recording/calibration.py --output-dir camera_data
 
 Usage (collect new data with robot arm):
-    python calibration.py --collect-data \
+    python data_recording/calibration.py --collect-data \
         [--zmq-bind tcp://0.0.0.0:6002] [--output-dir camera_data]
 
 Protocol for --collect-data mode (this script = REP,  agent in Docker A = REQ):
@@ -40,10 +40,14 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import sys
 import threading
 import time
 import traceback
 from pathlib import Path
+
+_PROJECT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PROJECT_DIR))
 
 import cv2
 import numpy as np
@@ -59,6 +63,7 @@ from config import (
     BIAS_DIFF_ON, BIAS_DIFF_OFF, BIAS_FO, BIAS_HPF, BIAS_REFR,
     CHARUCO_SQUARES_H, CHARUCO_SQUARES_V, CHARUCO_SQUARE_LEN, CHARUCO_MARKER_LEN,
 )
+from helpers import create_charuco_board as _make_charuco, detect_charuco
 
 
 # ── ChArUco board defaults (must match the physical board) ──────────────
@@ -130,24 +135,9 @@ class EventAccumulator(threading.Thread):
 # ═══════════════════════════════════════════════════════════════════════
 #  ChArUco helpers
 # ═══════════════════════════════════════════════════════════════════════
-def _make_charuco():
-    d = cv2.aruco.getPredefinedDictionary(ARUCO_DICT)
-    board = cv2.aruco.CharucoBoard(
-        (SQUARES_H, SQUARES_V), SQUARE_LEN, MARKER_LEN, d
-    )
-    det = cv2.aruco.CharucoDetector(
-        board, cv2.aruco.CharucoParameters(), cv2.aruco.DetectorParameters()
-    )
-    return board, det
-
-
 def _detect(image, detector):
     """Detect ChArUco corners. Returns (corners, ids) or (None, None)."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-    corners, ids, _, _ = detector.detectBoard(gray)
-    if corners is not None and len(corners) >= 8:
-        return corners, ids
-    return None, None
+    return detect_charuco(image, detector, min_corners=8)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1255,10 +1245,10 @@ def main():
         epilog="""
 Examples:
   # Calibrate using existing frames (default)
-  python calibration.py --output-dir camera_data
+  python data_recording/calibration.py --output-dir camera_data
 
   # Collect new data with robot arm (overwrites existing frames)
-  python calibration.py --collect-data --output-dir camera_data
+  python data_recording/calibration.py --collect-data --output-dir camera_data
         """
     )
     parser.add_argument(
@@ -1274,7 +1264,7 @@ Examples:
     )
     parser.add_argument(
         "--output-dir",
-        default="camera_data",
+        default=_PROJECT_DIR / "camera_data",
         help="Directory to save/load calibration data (default: camera_data)",
     )
     parser.add_argument(
@@ -1296,6 +1286,13 @@ Examples:
     args = parser.parse_args()
     
     output_path = Path(args.output_dir)
+    if not output_path.is_absolute():
+        output_path = _PROJECT_DIR / output_path
+    calibration_poses_path = None
+    if args.calibration_poses:
+        calibration_poses_path = Path(args.calibration_poses)
+        if not calibration_poses_path.is_absolute():
+            calibration_poses_path = _PROJECT_DIR / calibration_poses_path
     
     if args.collect_data:
         # Robot arm collection mode
@@ -1307,7 +1304,7 @@ Examples:
         
         server = CalibrationRecordingServer(
             bind_addr=args.zmq_bind,
-            output_dir=args.output_dir,
+            output_dir=str(output_path),
         )
         server.serve()
     else:
@@ -1315,7 +1312,7 @@ Examples:
         success = run_standalone_calibration(
             output_path,
             max_images=args.max_images,
-            calibration_poses_file=Path(args.calibration_poses) if args.calibration_poses else None,
+            calibration_poses_file=calibration_poses_path,
         )
         if not success:
             exit(1)

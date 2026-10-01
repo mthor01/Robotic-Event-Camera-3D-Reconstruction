@@ -29,36 +29,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import numpy as np
-from scipy.signal import find_peaks
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from reconstruction_config import DATA_ROOT as _DATA_ROOT
+from config import DATA_ROOT as _DATA_ROOT
+from helpers import box_smooth, find_troughs, unit_norm
 
 
 # ──────────────────────────────────────────────────────────────────────
 #  Helpers (shared with pose_time_analysis)
 # ──────────────────────────────────────────────────────────────────────
-
-def box_smooth(arr: np.ndarray, k: int) -> np.ndarray:
-    if k <= 1:
-        return arr.astype(np.float64).copy()
-    return np.convolve(arr.astype(np.float64), np.ones(k) / k, mode="same")
-
-
-def find_troughs(sig: np.ndarray, min_prominence_frac: float = 0.15) -> np.ndarray:
-    if len(sig) < 3:
-        return np.array([], dtype=np.float64)
-    rng = float(sig.max() - sig.min())
-    if rng == 0:
-        return np.array([], dtype=np.float64)
-    peaks, _ = find_peaks(-sig, prominence=min_prominence_frac * rng)
-    return peaks.astype(np.float64)
-
-
-def unit_norm(a: np.ndarray) -> np.ndarray:
-    mx = np.abs(a).max()
-    return a / mx if mx > 0 else a
-
 
 # ──────────────────────────────────────────────────────────────────────
 #  Signal extraction

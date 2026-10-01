@@ -517,16 +517,10 @@ def _build_model(
     model_cls = ModernMVSNet
     if model_arch == "ModernMVSNet":
         pass
-    elif model_arch in ("UNet", "UNet+uncertainty", "RecurrentUNet") or "predict_uncertainty" in metadata:
-        from unet_models import RecurrentUNet, UNet, UncertaintyUNet
+    elif model_arch == "UNet":
+        from train_unet import UNet
 
-        predicts_uncertainty = bool(metadata.get("predict_uncertainty", False))
-        recurrent = bool(metadata.get("recurrent", False)) or model_arch == "RecurrentUNet"
-        if recurrent:
-            unet_cls = RecurrentUNet
-        else:
-            unet_cls = UncertaintyUNet if predicts_uncertainty else UNet
-        unet = unet_cls(
+        unet = UNet(
             in_ch=int(_required_metadata(metadata, "in_ch", NUM_BINS + 1)),
             base=base,
         )
@@ -550,13 +544,9 @@ def _build_model(
                 view_valid_mask: torch.Tensor | None = None,
             ) -> torch.Tensor:
                 del camera_matrices, intrinsics, depth_values, view_valid_mask
-                if recurrent:
-                    output = self.depth_model(images)
-                else:
-                    batch, views, channels, height, width = images.shape
-                    fused = images.reshape(batch, views * channels, height, width)
-                    output = self.depth_model(fused)
-                return output[0] if isinstance(output, tuple) else output
+                batch, views, channels, height, width = images.shape
+                fused = images.reshape(batch, views * channels, height, width)
+                return self.depth_model(fused)
 
         return EarlyFusionUNetEvaluationAdapter(unet).to(device).eval()
     else:
@@ -3270,22 +3260,17 @@ def _evaluate_checkpoint(
     model = _build_model(metadata, state, device)
 
     model_arch = str(metadata.get("model_arch", "ModernMVSNet"))
-    unet_model = (
-        model_arch in ("UNet", "UNet+uncertainty", "RecurrentUNet")
-        or "predict_uncertainty" in metadata
-    )
+    unet_model = model_arch == "UNet"
     evaluates_confidence = (
         not unet_model
         and bool(metadata.get("uncertainty", False))
         and any(key.startswith("confidence_head.") for key in state)
     )
-    recurrent_model = bool(metadata.get("recurrent", False)) or model_arch == "RecurrentUNet"
     num_views = int(metadata.get("num_views", 1)) if unet_model else int(
         _required_metadata(metadata, "num_views", 5)
     )
     model_display_name = _model_display_name(unet_model, num_views)
     pose_channels = bool(metadata.get("pose_channels", False)) if unet_model else False
-    recurrent_enrollment_range = int(metadata.get("recurrent_enrollment_range", 0))
     view_interval = int(_required_metadata(metadata, "view_interval", 5))
     pose_view_selection = bool(_required_metadata(metadata, "pose_view_selection", False))
     pose_move_threshold = float(
@@ -3452,8 +3437,6 @@ def _evaluate_checkpoint(
             linear_depth_candidates=linear_depth_candidates,
             fill_invalid=args.fill_invalid,
             pose_channels=pose_channels,
-            recurrent=recurrent_model,
-            recurrent_enrollment_range=recurrent_enrollment_range,
             aug=MultiViewAugConfig(enabled=False),
         )
         available_frames = len(dataset)

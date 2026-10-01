@@ -60,6 +60,7 @@ from config import (
     DEPTH_VIZ_MIN,
     DEPTH_VIZ_MAX,
 )
+from helpers import INTRINSICS_TRANSFORM, depth_pixel_rays
 
 _CFG_ROOT = _Path_cfg(__file__).resolve().parent.parent
 CALIB_DIR = _CFG_ROOT / _CALIB_DIR
@@ -149,21 +150,6 @@ def load_calibration(calib_dir: Path) -> dict:
         "rgb_h": int(rgb_size[1]),
         "T_color_from_depth": T_color_from_depth,
     }
-
-
-def build_depth_pixel_grid(K_depth: np.ndarray, h: int, w: int) -> np.ndarray:
-    """
-    Pre-compute normalised ray directions for every depth pixel.
-
-    Returns (h*w, 3) array where each row is [(u-cx)/fx, (v-cy)/fy, 1].
-    """
-    fx, fy = K_depth[0, 0], K_depth[1, 1]
-    cx, cy = K_depth[0, 2], K_depth[1, 2]
-    u = np.arange(w, dtype=np.float64)
-    v = np.arange(h, dtype=np.float64)
-    uu, vv = np.meshgrid(u, v)  # (h, w)
-    rays = np.stack([(uu - cx) / fx, (vv - cy) / fy, np.ones_like(uu)], axis=-1)
-    return rays.reshape(-1, 3)
 
 
 def _fill_small_depth_gaps_nearest(
@@ -429,7 +415,7 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
     out_h, out_w = resize_hw
 
     # Pre-compute depth pixel rays
-    rays = build_depth_pixel_grid(K_depth, dep_h, dep_w)
+    rays = depth_pixel_rays(K_depth, dep_h, dep_w)
 
     # Open source HDF5
     with h5py.File(rs_h5_path, "r") as rs_h5:
@@ -489,7 +475,7 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
         out_dh5.attrs["resize_w"] = resize_hw[1] if resize_hw is not None else ev_w
         out_dh5.attrs["crop_h"]   = crop_hw[0]   if crop_hw   is not None else (resize_hw[0] if resize_hw else ev_h)
         out_dh5.attrs["crop_w"]   = crop_hw[1]   if crop_hw   is not None else (resize_hw[1] if resize_hw else ev_w)
-        out_dh5.attrs["intrinsics_transform"] = "center_crop_resize"
+        out_dh5.attrs["intrinsics_transform"] = INTRINSICS_TRANSFORM
 
         out_rh5 = None
         rgb_out_ds = None
@@ -501,7 +487,7 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
             )
             out_rh5.attrs["description"] = "RGB projected into event camera frame"
             out_rh5.attrs["source"] = str(rs_h5_path)
-            out_rh5.attrs["intrinsics_transform"] = "center_crop_resize"
+            out_rh5.attrs["intrinsics_transform"] = INTRINSICS_TRANSFORM
 
         try:
             batch_size = max(1, workers * 4)

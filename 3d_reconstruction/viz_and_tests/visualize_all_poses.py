@@ -25,6 +25,7 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent
 sys.path.insert(0, str(_ROOT))
+from helpers import set_3d_axes_equal
 
 
 def _load_numpy():
@@ -56,22 +57,6 @@ def load_camera_poses(data_dir: Path, calib_dir: Path) -> tuple[np.ndarray, np.n
     T_base_from_event = ee_T @ np.linalg.inv(T_event_from_ee)
     centers = T_base_from_event[:, :3, 3]
     return T_base_from_event, centers
-
-
-def set_axes_equal(ax) -> None:
-    xlim = ax.get_xlim3d()
-    ylim = ax.get_ylim3d()
-    zlim = ax.get_zlim3d()
-    ranges = [abs(xlim[1] - xlim[0]), abs(ylim[1] - ylim[0]), abs(zlim[1] - zlim[0])]
-    centers = [
-        (xlim[0] + xlim[1]) * 0.5,
-        (ylim[0] + ylim[1]) * 0.5,
-        (zlim[0] + zlim[1]) * 0.5,
-    ]
-    radius = max(ranges) * 0.5
-    ax.set_xlim3d(centers[0] - radius, centers[0] + radius)
-    ax.set_ylim3d(centers[1] - radius, centers[1] + radius)
-    ax.set_zlim3d(centers[2] - radius, centers[2] + radius)
 
 
 def plot_poses(
@@ -148,7 +133,7 @@ def plot_poses(
     ax.set_ylabel("base/world y [m]")
     ax.set_zlabel("base/world z [m]")
     ax.legend(loc="upper right")
-    set_axes_equal(ax)
+    set_3d_axes_equal(ax)
     ax.view_init(elev=28, azim=-55)
     fig.tight_layout()
 

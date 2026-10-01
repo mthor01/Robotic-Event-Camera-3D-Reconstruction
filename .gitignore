@@ -6,9 +6,15 @@
 3d_reconstruction/training/checkpoints/
 **/logs/
 **/*.sbatch
+!3d_reconstruction/data_recording/verify_calibration.sbatch
 !3d_reconstruction/viz_and_tests/plot_voxel_activity_ee_speed.sbatch
+!3d_reconstruction/viz_and_tests/create_recording_gif.sbatch
 **/*.sif
 **/*.def
 3d_reconstruction/training/results
 3d_reconstruction/training/debug
 3d_reconstruction/training/architecture
+instructions
+.vscode
+**/viz_and_tests
+**/tests

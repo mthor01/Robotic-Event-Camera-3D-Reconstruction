@@ -17,6 +17,7 @@ Run this script first, then start my_main.py with --sync-recording flag.
 """
 import argparse
 import gc
+import sys
 import time
 import threading
 import cv2
@@ -29,6 +30,9 @@ from pathlib import Path
 from multiprocessing import Process, Event as MPEvent, Queue
 from collections import deque
 from typing import Optional
+
+_PROJECT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PROJECT_DIR))
 from metavision_hal import DeviceDiscovery
 from metavision_core.event_io import EventsIterator
 from metavision_sdk_core import PeriodicFrameGenerationAlgorithm
@@ -40,6 +44,9 @@ from config import (
     POSE_TIME_OFFSET_MS,
     DEPTH_VIZ_MIN, DEPTH_VIZ_MAX,
 )
+
+if not DATA_ROOT.is_absolute():
+    DATA_ROOT = _PROJECT_DIR / DATA_ROOT
 
 
 class ZMQPoseReceiver:

@@ -20,8 +20,8 @@ gets six additional constant pose channels:
     [event camera x, y, z in robot base frame,
      event camera optical-axis direction x, y, z in robot base frame]
 
-The same entry point supports the plain U-Net, uncertainty head, and recurrent
-variant. The default is a single view without pose channels.
+The entry point trains a standard early-fusion U-Net. The default is a single
+view without pose channels.
 
 Usage:
     python3 training/train_unet.py
@@ -64,8 +64,6 @@ from depth_losses import (
     l1_metres,
     worst_fraction_l1_metres,
 )
-from unet_models import RecurrentUNet, UNet, UncertaintyUNet
-
 _SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_ROOT = _SCRIPT_DIR.parent / "data" / "lego"
 from tensorboard_helper import (
@@ -73,7 +71,6 @@ from tensorboard_helper import (
     ErrorDistributionSpatialLogger,
     EventActivityAccuracyLogger,
     tensorboard_run_dir,
-    UncertaintyErrorLogger,
     VizLogger,
 )
 
@@ -85,6 +82,107 @@ from tensorboard_helper import (
 
 # Camera calibration paths
 _CAM_DATA = _SCRIPT_DIR.parent / "camera_data"
+
+
+# ---------------------------------------------------------------------------
+# U-Net
+# ---------------------------------------------------------------------------
+
+class _EncoderBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 5, stride=2, padding=2, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.block(inputs)
+
+
+class _DecoderBlock(nn.Module):
+    def __init__(self, in_channels: int, skip_channels: int, out_channels: int):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels + skip_channels, out_channels, 5, padding=2, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, inputs: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        inputs = F.interpolate(
+            inputs, size=skip.shape[2:], mode="bilinear", align_corners=False
+        )
+        return self.conv(torch.cat((inputs, skip), dim=1))
+
+
+class _ResidualBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.relu(inputs + self.net(inputs))
+
+
+class UNet(nn.Module):
+    """Event-to-depth U-Net producing linear-normalized depth in ``[0, 1]``."""
+
+    def __init__(
+        self,
+        in_ch: int = NUM_BINS,
+        base: int = 32,
+        num_encoders: int = 3,
+        num_residuals: int = 2,
+    ):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_ch, base, 5, padding=2, bias=False),
+            nn.BatchNorm2d(base),
+            nn.ReLU(inplace=True),
+        )
+        self.encoders = nn.ModuleList()
+        channels = base
+        for _ in range(num_encoders):
+            self.encoders.append(_EncoderBlock(channels, channels * 2))
+            channels *= 2
+        self.bottleneck = nn.Sequential(
+            *[_ResidualBlock(channels) for _ in range(num_residuals)]
+        )
+        self.decoders = nn.ModuleList()
+        for index in range(num_encoders):
+            skip_channels = channels // 2 if index < num_encoders - 1 else base
+            self.decoders.append(
+                _DecoderBlock(channels, skip_channels, channels // 2)
+            )
+            channels //= 2
+        self.head = nn.Sequential(nn.Conv2d(base, 1, 1), nn.Sigmoid())
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        features = self.stem(inputs)
+        skips = [features]
+        for index, encoder in enumerate(self.encoders):
+            features = encoder(features)
+            if index < len(self.encoders) - 1:
+                skips.append(features)
+        features = self.bottleneck(features)
+        for index, decoder in enumerate(self.decoders):
+            features = decoder(features, skips[-(index + 1)])
+        return self.head(features)
 
 
 # ---------------------------------------------------------------------------
@@ -181,8 +279,6 @@ class TablePriorDataset(Dataset):
         pose_view_selection: bool = False,
         pose_move_threshold: float = 0.01,
         allow_unbalanced_pose_views: bool = True,
-        recurrent: bool = False,
-        recurrent_enrollment_range: int = 0,
     ):
         super().__init__()
         if num_views < 1:
@@ -196,12 +292,6 @@ class TablePriorDataset(Dataset):
             )
         if pose_move_threshold <= 0:
             raise ValueError(f"pose_move_threshold must be > 0, got {pose_move_threshold}")
-        if recurrent and num_views != 1:
-            raise ValueError("--recurrent only supports single-view input; set --num_views 1")
-        if recurrent and pose_view_selection:
-            raise ValueError("--recurrent cannot be combined with --pose_view_selection")
-        if recurrent_enrollment_range < 0:
-            raise ValueError("recurrent_enrollment_range must be >= 0")
         self.seq_dir         = seq_dir
         self.fill_invalid    = fill_invalid
         self.num_views       = int(num_views)
@@ -210,8 +300,6 @@ class TablePriorDataset(Dataset):
         self.pose_view_selection = bool(pose_view_selection)
         self.pose_move_threshold = float(pose_move_threshold)
         self.allow_unbalanced_pose_views = bool(allow_unbalanced_pose_views)
-        self.recurrent = bool(recurrent)
-        self.recurrent_enrollment_range = int(recurrent_enrollment_range)
         self.voxels_path     = seq_dir / "events" / "voxels_cam0.h5"
         self.depth_path      = seq_dir / "hdf5"   / "depth_in_event_frame.h5"
         self.poses_path      = seq_dir / "hdf5"   / "poses.h5"
@@ -279,15 +367,8 @@ class TablePriorDataset(Dataset):
         else:
             self.cam_centers_base = None
             self.src_offsets = fixed_source_offsets(num_views, view_interval)
-            if self.recurrent:
-                self.valid_indices = np.arange(
-                    self.recurrent_enrollment_range,
-                    n_frames,
-                    dtype=np.int64,
-                )
-            else:
-                margin = max((abs(offset) for offset in self.src_offsets), default=0)
-                self.valid_indices = np.arange(margin, n_frames - margin, dtype=np.int64)
+            margin = max((abs(offset) for offset in self.src_offsets), default=0)
+            self.valid_indices = np.arange(margin, n_frames - margin, dtype=np.int64)
         if len(self.valid_indices) == 0:
             mode = (
                 f"pose threshold={pose_move_threshold:g} m"
@@ -350,11 +431,7 @@ class TablePriorDataset(Dataset):
     def __getitem__(self, item: int):
         self._open()
         idx = int(self.valid_indices[item])
-        if self.recurrent:
-            view_ids = list(range(idx - self.recurrent_enrollment_range, idx + 1))
-            view_inputs = [self._load_input(view_idx) for view_idx in view_ids]
-            inp = torch.stack(view_inputs, dim=0)
-        elif self.pose_view_selection:
+        if self.pose_view_selection:
             view_ids = self.pose_view_ids[idx]
             target_input = self._load_input(idx)
             view_inputs = [
@@ -393,25 +470,6 @@ class TablePriorDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Optional uncertainty head
-# ---------------------------------------------------------------------------
-
-def uncertainty_nll_loss(
-    pred_norm: torch.Tensor,
-    log_var: torch.Tensor,
-    gt_norm: torch.Tensor,
-    mask: torch.Tensor,
-) -> torch.Tensor:
-    residual_sq = (pred_norm - gt_norm) ** 2
-    nll = 0.5 * (torch.exp(-log_var) * residual_sq + log_var)
-    return (nll * mask).sum() / mask.sum().clamp_min(1.0)
-
-
-def uncertainty_metres(log_var: torch.Tensor) -> torch.Tensor:
-    return torch.exp(0.5 * log_var) * (D_MAX - DEPTH_MIN)
-
-
-# ---------------------------------------------------------------------------
 # Training / validation loop
 # ---------------------------------------------------------------------------
 
@@ -424,9 +482,6 @@ def run_epoch(
     viz=None,
     activity_diag=None,
     error_diag=None,
-    uncertainty_diag=None,
-    uncertainty_weight: float = 1.0,
-    depth_aux_weight: float = 0.0,
     lambda_grad: float = 0.5,
     lambda_normal: float = 0.1,
     ema_model: ModelEMA | None = None,
@@ -450,29 +505,12 @@ def run_epoch(
         for inp, dep_t, mask_t in loader:
             inp, dep_t, mask_t = inp.to(device), dep_t.to(device), mask_t.to(device)
             dep_norm = ((dep_t - DEPTH_MIN) / (D_MAX - DEPTH_MIN)).clamp(0.0, 1.0)
-            out = model(inp)
-            if isinstance(out, tuple):
-                pred, log_var = out
-            else:
-                pred, log_var = out, None
-
-            if log_var is not None:
-                loss = uncertainty_weight * uncertainty_nll_loss(
-                    pred, log_var, dep_norm, mask_t
-                )
-                if depth_aux_weight > 0.0:
-                    depth_aux_loss, _ = combined_depth_loss(
-                        pred, dep_norm, mask_t, K=K,
-                        lambda_grad=lambda_grad,
-                        lambda_normal=lambda_normal,
-                    )
-                    loss = loss + depth_aux_weight * depth_aux_loss
-            else:
-                loss, _ = combined_depth_loss(
-                    pred, dep_norm, mask_t, K=K,
-                    lambda_grad=lambda_grad,
-                    lambda_normal=lambda_normal,
-                )
+            pred = model(inp)
+            loss, _ = combined_depth_loss(
+                pred, dep_norm, mask_t, K=K,
+                lambda_grad=lambda_grad,
+                lambda_normal=lambda_normal,
+            )
 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
@@ -520,18 +558,10 @@ def run_epoch(
                 t_last = now
                 batches_at_last_log = n_batches
 
-            event_for_diag = (
-                inp[:, -1, :NUM_BINS]
-                if inp.dim() == 5
-                else inp[:, :NUM_BINS]
-            ).detach()
+            event_for_diag = inp[:, :NUM_BINS].detach()
             if viz is not None:
                 pred_m = (pred * (D_MAX - DEPTH_MIN) + DEPTH_MIN).detach()
-                tbl_ch = (
-                    inp[:, -1, NUM_BINS:NUM_BINS + 1]
-                    if inp.dim() == 5
-                    else inp[:, NUM_BINS:NUM_BINS + 1]
-                ).detach()
+                tbl_ch = inp[:, NUM_BINS:NUM_BINS + 1].detach()
                 viz.add_batch(event_for_diag, dep_t, mask_t, pred_m, table_depth=tbl_ch)
             if activity_diag is not None:
                 pred_m = (pred * (D_MAX - DEPTH_MIN) + DEPTH_MIN).detach()
@@ -539,14 +569,6 @@ def run_epoch(
             if error_diag is not None:
                 pred_m = (pred * (D_MAX - DEPTH_MIN) + DEPTH_MIN).detach()
                 error_diag.add_batch(pred_m, dep_t, mask_t)
-            if uncertainty_diag is not None and log_var is not None:
-                pred_m = (pred * (D_MAX - DEPTH_MIN) + DEPTH_MIN).detach()
-                uncertainty_diag.add_batch(
-                    uncertainty_metres(log_var).detach(),
-                    pred_m,
-                    dep_t,
-                    mask_t,
-                )
 
     elapsed_s = time.perf_counter() - t_phase_start
     batches_per_s = n_batches / max(elapsed_s, 1e-9)
@@ -623,12 +645,6 @@ def main() -> None:
     parser.add_argument("--pose_channels", "--pose_bins", action="store_true",
                         help="Append six constant pose channels per view: event-camera "
                              "position xyz and optical-axis direction xyz in robot base frame")
-    parser.add_argument("--recurrent", action="store_true",
-                        help="Use a single-view recurrent U-Net with a ConvGRU bottleneck. "
-                             "The dataset feeds previous frames as enrollment context.")
-    parser.add_argument("--recurrent_enrollment_range", type=int, default=0,
-                        help="Number of previous frames used to enroll/warm up the recurrent state "
-                             "before predicting the target frame. 0 means only the target frame.")
     parser.add_argument("--out_dir",       type=Path,
                         default=_SCRIPT_DIR / "checkpoints" / "unet_table")
     parser.add_argument("--seed",          type=int,  default=42)
@@ -637,12 +653,6 @@ def main() -> None:
                              "The actual table_z is read from hdf5/table_plane.h5.")
     parser.add_argument("--fill_invalid",  action="store_true",
                         help="Fill pixels with no depth measurement using the table-plane prior")
-    parser.add_argument("--predict_uncertainty", action="store_true",
-                        help="Predict a per-pixel uncertainty map and train it with a heteroscedastic loss.")
-    parser.add_argument("--uncertainty_weight", type=float, default=1.0,
-                        help="Weight for the primary uncertainty negative-log-likelihood term.")
-    parser.add_argument("--depth_aux_weight", type=float, default=0.0,
-                        help="Optional auxiliary weight for the original depth loss when uncertainty is enabled.")
     parser.add_argument("--lambda_grad", type=float, default=0.5,
                         help="Weight for the multi-scale gradient loss.")
     parser.add_argument("--lambda_normal", type=float, default=0.1,
@@ -667,17 +677,9 @@ def main() -> None:
         parser.error("--pose_view_selection requires odd --num_views")
     if args.pose_move_threshold <= 0:
         parser.error("--pose_move_threshold must be > 0")
-    if args.recurrent and args.num_views != 1:
-        parser.error("--recurrent only supports single-view input; use --num_views 1")
-    if args.recurrent and args.pose_view_selection:
-        parser.error("--recurrent cannot be combined with --pose_view_selection")
-    if args.recurrent and args.predict_uncertainty:
-        parser.error("--recurrent currently supports the depth head only, not --predict_uncertainty")
     for loss_flag in ("lambda_grad", "lambda_normal"):
         if getattr(args, loss_flag) < 0:
             parser.error(f"--{loss_flag} must be >= 0")
-    if args.recurrent_enrollment_range < 0:
-        parser.error("--recurrent_enrollment_range must be >= 0")
     if args.ema_decay < 0 or args.ema_decay >= 1:
         parser.error("--ema_decay must be in [0, 1)")
 
@@ -761,8 +763,6 @@ def main() -> None:
         pose_view_selection=args.pose_view_selection,
         pose_move_threshold=args.pose_move_threshold,
         allow_unbalanced_pose_views=args.allow_unbalanced_pose_views,
-        recurrent=args.recurrent,
-        recurrent_enrollment_range=args.recurrent_enrollment_range,
     )
     train_sets = [TablePriorDataset(d, **ds_kw) for d in train_seqs]
     val_sets = [TablePriorDataset(d, **ds_kw) for d in val_seqs]
@@ -822,12 +822,7 @@ def main() -> None:
     in_ch = args.num_views * per_view_channels
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     base_channels = max(1, int(round(args.base_channels * args.model_scale)))
-    if args.recurrent:
-        model = RecurrentUNet(in_ch=in_ch, base=base_channels).to(device)
-    elif args.predict_uncertainty:
-        model = UncertaintyUNet(in_ch=in_ch, base=base_channels).to(device)
-    else:
-        model = UNet(in_ch=in_ch, base=base_channels).to(device)
+    model = UNet(in_ch=in_ch, base=base_channels).to(device)
 
     # K for loss: use the canonical native center crop followed by resize.
     resize_hw = PREPROCESS_RESIZE_HW
@@ -838,10 +833,7 @@ def main() -> None:
     K_tensor = torch.from_numpy(K_loss).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    if args.recurrent:
-        model_name = "RecurrentUNet"
-    else:
-        model_name = "UNet+uncertainty" if args.predict_uncertainty else "UNet"
+    model_name = "UNet"
     print(
         f"{model_name}  in_ch={in_ch}  model_scale={args.model_scale:g}  "
         f"base={base_channels}  parameters: {n_params:,}"
@@ -857,9 +849,6 @@ def main() -> None:
             else f"view_interval={args.view_interval}"
         )
     )
-    if args.predict_uncertainty:
-        print(f"  Uncertainty head enabled; primary NLL weight = {args.uncertainty_weight:g}")
-        print(f"  Auxiliary depth-loss weight = {args.depth_aux_weight:g}")
     print(
         f"  Depth-loss weights: gradient={args.lambda_grad:g}, "
         f"normal={args.lambda_normal:g}"
@@ -868,11 +857,6 @@ def main() -> None:
         f"  Optimizer: AdamW, lr={args.lr:g}, "
         f"weight_decay={args.weight_decay:g}"
     )
-    if args.recurrent:
-        print(
-            f"  Recurrent mode: ConvGRU bottleneck, enrollment_range="
-            f"{args.recurrent_enrollment_range} previous frame(s)"
-        )
     print(f"Device: {device}\n")
 
     optimizer = torch.optim.AdamW(
@@ -903,19 +887,6 @@ def main() -> None:
     error_val = ErrorDistributionSpatialLogger(
         writer, tag="error/val", images_only=False
     )
-    uncertainty_train = (
-        UncertaintyErrorLogger(
-            writer, tag="uncertainty/train", images_only=True
-        )
-        if args.predict_uncertainty else None
-    )
-    uncertainty_val = (
-        UncertaintyErrorLogger(
-            writer, tag="uncertainty/val", images_only=True
-        )
-        if args.predict_uncertainty else None
-    )
-
     # ── Training loop ─────────────────────────────────────────────────────
     best_val_l1 = float("inf")
     best_val_p95 = float("inf")
@@ -927,9 +898,6 @@ def main() -> None:
                                     K_tensor, viz=viz_train,
                                     activity_diag=activity_train,
                                     error_diag=error_train,
-                                    uncertainty_diag=uncertainty_train,
-                                    uncertainty_weight=args.uncertainty_weight,
-                                    depth_aux_weight=args.depth_aux_weight,
                                     lambda_grad=args.lambda_grad,
                                     lambda_normal=args.lambda_normal,
                                     ema_model=ema)
@@ -938,9 +906,6 @@ def main() -> None:
                                     K_tensor, viz=viz_val,
                                     activity_diag=activity_val,
                                     error_diag=error_val,
-                                    uncertainty_diag=uncertainty_val,
-                                    uncertainty_weight=args.uncertainty_weight,
-                                    depth_aux_weight=args.depth_aux_weight,
                                     lambda_grad=args.lambda_grad,
                                     lambda_normal=args.lambda_normal)
         scheduler.step()
@@ -951,10 +916,6 @@ def main() -> None:
         activity_val.flush(step=epoch)
         error_train.flush(step=epoch)
         error_val.flush(step=epoch)
-        if uncertainty_train is not None:
-            uncertainty_train.flush(step=epoch)
-        if uncertainty_val is not None:
-            uncertainty_val.flush(step=epoch)
 
         vram_a = torch.cuda.memory_allocated() / 1024**2 if torch.cuda.is_available() else 0.0
         vram_r = torch.cuda.memory_reserved()  / 1024**2 if torch.cuda.is_available() else 0.0
@@ -997,14 +958,9 @@ def main() -> None:
             "allow_fewer_pose_views": args.allow_unbalanced_pose_views,
             "pose_channels": args.pose_channels,
             "pose_channel_count": pose_channel_count,
-            "recurrent": args.recurrent,
-            "recurrent_enrollment_range": args.recurrent_enrollment_range,
             "early_fusion_views": True,
             "intrinsics_transform": INTRINSICS_TRANSFORM,
             "table_z": table_z_ckpt,
-            "predict_uncertainty": args.predict_uncertainty,
-            "uncertainty_weight": args.uncertainty_weight,
-            "depth_aux_weight": args.depth_aux_weight,
             "lambda_grad": args.lambda_grad,
             "lambda_normal": args.lambda_normal,
             "optimizer": "adamw",

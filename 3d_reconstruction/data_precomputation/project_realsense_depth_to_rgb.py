@@ -43,6 +43,7 @@ from config import (
     FPS as DEFAULT_FPS,
     DEPTH_BLEED_RADIUS,
 )
+from helpers import depth_pixel_rays
 
 _CFG_ROOT = _Path_cfg(__file__).resolve().parent.parent
 CALIB_DIR = _CFG_ROOT / _CALIB_DIR
@@ -77,21 +78,6 @@ def load_calibration(calib_dir: Path) -> dict:
         "rgb_h": int(rgb_size[1]),
         "T_color_from_depth": T_color_from_depth,
     }
-
-
-def build_depth_pixel_grid(K_depth: np.ndarray, h: int, w: int) -> np.ndarray:
-    """
-    Pre-compute normalised ray directions for every depth pixel.
-
-    Returns (h*w, 3) array where each row is [(u-cx)/fx, (v-cy)/fy, 1].
-    """
-    fx, fy = K_depth[0, 0], K_depth[1, 1]
-    cx, cy = K_depth[0, 2], K_depth[1, 2]
-    u = np.arange(w, dtype=np.float64)
-    v = np.arange(h, dtype=np.float64)
-    uu, vv = np.meshgrid(u, v)
-    rays = np.stack([(uu - cx) / fx, (vv - cy) / fy, np.ones_like(uu)], axis=-1)
-    return rays.reshape(-1, 3)
 
 
 def project_depth_to_rgb_frame(
@@ -222,7 +208,7 @@ def process_recording(
     dep_h, dep_w = calib["dep_h"], calib["dep_w"]
     depth_scale = calib["depth_scale"]
 
-    rays = build_depth_pixel_grid(K_depth, dep_h, dep_w)
+    rays = depth_pixel_rays(K_depth, dep_h, dep_w)
 
     with h5py.File(rs_h5_path, "r") as rs_h5:
         depth_ds = rs_h5["depth"]

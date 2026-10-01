@@ -245,8 +245,6 @@ class MultiViewTableDataset(Dataset):
         linear_depth_candidates: bool = False,
         fill_invalid: bool = False,
         pose_channels: bool = False,
-        recurrent: bool = False,
-        recurrent_enrollment_range: int = 0,
         split_indices: np.ndarray | None = None,
         aug: MultiViewAugConfig | None = None,
     ):
@@ -260,13 +258,6 @@ class MultiViewTableDataset(Dataset):
             )
         if pose_move_threshold <= 0:
             raise ValueError(f"--pose_move_threshold must be > 0, got {pose_move_threshold}")
-        if recurrent and num_views != 1:
-            raise ValueError("--recurrent only supports single-view input; set --num_views 1")
-        if recurrent and pose_view_selection:
-            raise ValueError("--recurrent cannot be combined with --pose_view_selection")
-        if recurrent_enrollment_range < 0:
-            raise ValueError("--recurrent_enrollment_range must be >= 0")
-
         self.seq_dir = Path(seq_dir)
         self.num_views = num_views
         self.view_interval = view_interval
@@ -275,8 +266,6 @@ class MultiViewTableDataset(Dataset):
         self.allow_unbalanced_pose_views = bool(allow_unbalanced_pose_views)
         self.fill_invalid = fill_invalid
         self.pose_channels = bool(pose_channels)
-        self.recurrent = bool(recurrent)
-        self.recurrent_enrollment_range = int(recurrent_enrollment_range)
         self.aug = aug or MultiViewAugConfig(enabled=False)
         expected_transform = INTRINSICS_TRANSFORM
 
@@ -360,10 +349,7 @@ class MultiViewTableDataset(Dataset):
         self.pose_view_ids: dict[int, list[int]] = {}
         if num_views == 1:
             self.src_offsets = []
-            if self.recurrent:
-                valid = np.arange(self.recurrent_enrollment_range, self.n_frames, dtype=np.int64)
-            else:
-                valid = np.arange(self.n_frames, dtype=np.int64)
+            valid = np.arange(self.n_frames, dtype=np.int64)
         elif self.pose_view_selection:
             valid = self._make_pose_view_ids(num_views, self.pose_move_threshold)
         else:
@@ -548,9 +534,7 @@ class MultiViewTableDataset(Dataset):
     def __getitem__(self, item: int):
         self._open()
         idx = int(self.valid_indices[item])
-        if self.recurrent:
-            view_ids = list(range(idx - self.recurrent_enrollment_range, idx + 1))
-        elif self.num_views == 1:
+        if self.num_views == 1:
             view_ids = [idx]
         elif self.pose_view_selection:
             view_ids = self.pose_view_ids[idx]
@@ -583,8 +567,7 @@ class MultiViewTableDataset(Dataset):
             msk_t = F.interpolate(msk_t.unsqueeze(0), (h, w), mode="nearest").squeeze(0)
 
         if self.fill_invalid:
-            target_view = -1 if self.recurrent else 0
-            tbl_m = imgs[target_view, NUM_BINS:NUM_BINS + 1] * (D_MAX - DEPTH_MIN) + DEPTH_MIN
+            tbl_m = imgs[0, NUM_BINS:NUM_BINS + 1] * (D_MAX - DEPTH_MIN) + DEPTH_MIN
             dep_t = torch.where(msk_t > 0.5, dep_t, tbl_m)
             msk_t = torch.ones_like(msk_t)
 

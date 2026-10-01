@@ -5,7 +5,7 @@ Precompute frame-aligned voxel grids from raw events.
 Raw event-camera recordings are split by the RealSense hardware-trigger
 timestamps and accumulated into temporal bins. Trigger data are read from the
 RAW recording, with the event HDF5 copy used as a fallback. Each grid receives
-the same resize and centred crop used by depth projection and model inference.
+the same centred crop and resize used by depth projection and model inference.
 The resulting ``hdf5/voxels.h5`` can be loaded directly during training.
 
 Usage:
@@ -34,6 +34,7 @@ from config import (
     DATA_ROOT as _DATA_ROOT, NUM_BINS, PREPROCESS_CROP_HW,
     PREPROCESS_RESIZE_HW,
 )
+from helpers import INTRINSICS_TRANSFORM, resolve_path
 
 
 DATA_ROOT = _HERE.parent / _DATA_ROOT
@@ -350,7 +351,7 @@ def process_sequence(
                 ds.attrs["resize_w"] = output_hw[1]
                 ds.attrs["crop_h"] = crop_hw[0]
                 ds.attrs["crop_w"] = crop_hw[1]
-                ds.attrs["intrinsics_transform"] = "center_crop_resize"
+                ds.attrs["intrinsics_transform"] = INTRINSICS_TRANSFORM
                 ds.attrs["normalized"] = bool(normalize)
                 vf.create_dataset("hw_trigger_times_us", data=hw_trig_us[:n_frames])
                 trig = hw_trig_us[:n_frames]
@@ -441,12 +442,6 @@ def main():
                        help="Store raw accumulated voxel event counts without mean/std normalization.")
     args = parser.parse_args()
 
-    def _resolve_data_path(path_str: str) -> Path:
-        path = Path(path_str)
-        if path.is_absolute():
-            return path
-        return (_HERE.parent / path).resolve()
-
     output_hw = (args.output_h, args.output_w)
     crop_hw = (args.crop_h, args.crop_w)
     if min(*output_hw, *crop_hw) <= 0:
@@ -459,9 +454,9 @@ def main():
     EV_W = 1280
 
     if args.data_dir:
-        candidate_dirs = [_resolve_data_path(d) for d in args.data_dir]
+        candidate_dirs = [resolve_path(d, _HERE.parent) for d in args.data_dir]
     else:
-        candidate_dirs = [_resolve_data_path(args.data_root)]
+        candidate_dirs = [resolve_path(args.data_root, _HERE.parent)]
 
     for candidate in candidate_dirs:
         if not candidate.exists():
@@ -486,10 +481,10 @@ def main():
         sequence_dirs = sorted({
             sequence
             for data_dir in args.data_dir
-            for sequence in find_sequence_dirs(_resolve_data_path(data_dir))
+            for sequence in find_sequence_dirs(resolve_path(data_dir, _HERE.parent))
         })
     else:
-        data_root = _resolve_data_path(args.data_root)
+        data_root = resolve_path(args.data_root, _HERE.parent)
         print(f"Data root: {data_root}")
         sequence_dirs = find_sequence_dirs(data_root)
 
