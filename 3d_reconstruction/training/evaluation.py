@@ -3,7 +3,7 @@
 
 Example:
     python3 evaluation.py \
-        --checkpoint checkpoints/multiview/best_model.pth \
+        --checkpoint checkpoints/mvs/best_model.pth \
         --data_dir ../data/real/eval
 
 The data directory may be either a folder containing multiple sequence
@@ -31,7 +31,7 @@ from torch.utils.data import DataLoader
 
 _CAMERA_DATA_DIR = Path(__file__).resolve().parent.parent / "camera_data"
 
-from multiview import (
+from train_mvs import (
     MultiViewAugConfig,
     ModernMVSNet,
     MultiViewTableDataset,
@@ -503,7 +503,7 @@ def _required_metadata(metadata: dict[str, Any], key: str, default: Any = None) 
     if default is not None:
         return default
     raise KeyError(
-        f"Checkpoint is missing '{key}'. Use a checkpoint saved by the current multiview.py."
+        f"Checkpoint is missing '{key}'. Use a checkpoint saved by the current train_mvs.py."
     )
 
 

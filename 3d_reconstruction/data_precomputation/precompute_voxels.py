@@ -234,20 +234,13 @@ def process_sequence(
         else:
             n_frames = f['t_sys_ns'].shape[0]
 
-    # Event camera native resolution (read from the aligned HDF5 file)
-    # We must NOT use the RealSense depth resolution here — raw event
-    # x/y are in the event camera's own coordinate system.
-    ev_h5_path = sequence_dir / "hdf5" / "events_cam0.h5"
-    if ev_h5_path.exists():
-        with h5py.File(ev_h5_path, 'r') as f:
-            EV_H = int(f["events"].attrs["height"])
-            EV_W = int(f["events"].attrs["width"])
-    else:
-        # Fallback: read from raw file via EventsIterator
-        from metavision_core.event_io import EventsIterator as _EI
-        _it = _EI(str(raw_event_files[0]), delta_t=1_000_000)
-        EV_H, EV_W = _it.get_size()
-        del _it
+    # Read the event-camera native resolution directly from the raw recording.
+    # Do not use the RealSense resolution: raw event coordinates are expressed
+    # in the event camera's own image frame.
+    from metavision_core.event_io import EventsIterator as _EI
+    _it = _EI(str(raw_event_files[0]), delta_t=1_000_000)
+    EV_H, EV_W = _it.get_size()
+    del _it
 
     # Fast-path: all cameras already processed
     if not overwrite:
@@ -264,12 +257,9 @@ def process_sequence(
             return result
 
     # Time alignment strategy:
-    #   The aligned events_cam{k}.h5 already has per-frame timestamps
-    #   (t_ev_start_us, t_ev_end_us) in event-camera internal µs — the
-    #   exact same clock domain as the raw .raw file.  We read those
-    #   timestamps and use them directly to slice the raw event stream.
-    #   This avoids any fragile cross-clock (system ↔ event-camera)
-    #   conversion entirely.
+    #   RealSense hardware-trigger timestamps are stored in the raw event file
+    #   in the same clock domain as the events. Build one trigger-centred event
+    #   window per RealSense frame directly from those timestamps.
 
     try:
         for cam_idx, raw_path in enumerate(raw_event_files):
@@ -281,16 +271,7 @@ def process_sequence(
                     if int(_f["voxels"].shape[0]) >= n_frames:
                         continue
 
-            # Read per-frame time windows from the aligned HDF5
-            aligned_h5 = sequence_dir / "hdf5" / f"events_cam{cam_idx}.h5"
-            if not aligned_h5.exists():
-                result["error"] = f"cam{cam_idx}: aligned HDF5 not found: {aligned_h5}"
-                return result
-            with h5py.File(aligned_h5, 'r') as f:
-                ev_t_start_us = f['events/t_ev_start_us'][:]  # (N,) int64
-                ev_t_end_us   = f['events/t_ev_end_us'][:]    # (N,) int64
-
-            # Read triggers from RAW first, then use the HDF5 copy as fallback.
+            # Read hardware triggers directly from the raw recording.
             hw_trig_us = None
             try:
                 from metavision_core.event_io import RawReader as _RR
@@ -307,22 +288,12 @@ def process_sequence(
             except Exception as _e:
                 print(f"  [cam{cam_idx}] WARNING: could not read triggers from raw file: {_e}")
 
-            if hw_trig_us is None:
-                with h5py.File(aligned_h5, 'r') as f:
-                    if 'events/hw_trigger_times_us' in f:
-                        hw_trig_us = f['events/hw_trigger_times_us'][:].astype(np.int64)
-                        print(f"  [cam{cam_idx}] HW triggers: {len(hw_trig_us)} from HDF5 fallback")
-
             if hw_trig_us is None or len(hw_trig_us) < n_frames:
                 result["error"] = (
                     f"cam{cam_idx}: need {n_frames} rising-edge hardware triggers, "
                     f"found {0 if hw_trig_us is None else len(hw_trig_us)}"
                 )
                 return result
-
-            if len(ev_t_start_us) != n_frames:
-                print(f"  [cam{cam_idx}] WARNING: HDF5 has {len(ev_t_start_us)} frames "
-                      f"but depth has {n_frames}")
 
             (sequence_dir / "events").mkdir(parents=True, exist_ok=True)
 
@@ -447,9 +418,8 @@ def main():
     if min(*output_hw, *crop_hw) <= 0:
         parser.error("crop and output dimensions must be positive")
 
-    # Resolve the native event-camera size before any crop validation. For the
-    # current pipeline this is always 1280x720 (W x H); if a sequence-specific HDF5 is
-    # already present, prefer that metadata to remain consistent with the data.
+    # Resolve the native event-camera size before crop validation. Fall back to
+    # the known camera size only when no raw recording is available yet.
     EV_H = 720
     EV_W = 1280
 
@@ -461,16 +431,17 @@ def main():
     for candidate in candidate_dirs:
         if not candidate.exists():
             continue
-        direct_event_file = candidate / "hdf5" / "events_cam0.h5"
-        event_files = (
-            [direct_event_file]
-            if direct_event_file.is_file()
-            else sorted(candidate.rglob("hdf5/events_cam0.h5"))
+        direct_raw_file = candidate / "raw_event_data" / "events_cam0.raw"
+        raw_files = (
+            [direct_raw_file]
+            if direct_raw_file.is_file()
+            else sorted(candidate.rglob("raw_event_data/events_cam0.raw"))
         )
-        if event_files:
-            with h5py.File(event_files[0], "r") as f:
-                EV_H = int(f["events"].attrs["height"])
-                EV_W = int(f["events"].attrs["width"])
+        if raw_files:
+            from metavision_core.event_io import EventsIterator as _EI
+            _it = _EI(str(raw_files[0]), delta_t=1_000_000)
+            EV_H, EV_W = _it.get_size()
+            del _it
             break
 
     if crop_hw[0] > EV_H or crop_hw[1] > EV_W:

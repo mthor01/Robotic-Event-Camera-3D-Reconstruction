@@ -18,7 +18,7 @@ BATCH_SIZE=15
 CHECKPOINTS=(
     "checkpoints/unet_table/Single-View_U-Net.pth"
     "checkpoints/unet_table/Multi-View_U-Net.pth"
-    "checkpoints/multiview/best_l1_best_run_feat_pyramid_128_32_no_1x1.pth"
+    "checkpoints/mvs/best_l1_best_run_feat_pyramid_128_32_no_1x1.pth"
 )
 CHECKPOINT_LABELS=(
     "Single-view U-Net"

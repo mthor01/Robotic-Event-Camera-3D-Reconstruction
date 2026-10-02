@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run multiview training locally inside the training-and-reconstruction image.
+# Run MVS training locally inside the training-and-reconstruction image.
 
 set -euo pipefail
 
@@ -70,5 +70,5 @@ ARGS=(
 )
 
 # Extra command-line arguments are appended, for example:
-#   ./multiview.sh --epochs 5 --name local_smoke_test
-exec python3 -u multiview.py "${ARGS[@]}" "$@"
+#   ./train_mvs.sh --epochs 5 --name local_smoke_test
+exec python3 -u train_mvs.py "${ARGS[@]}" "$@"

@@ -13,7 +13,7 @@ DATA_DIR="data/new_2/eval"
 CHECKPOINTS=(
     "training/checkpoints/unet_table/Single-View_U-Net.pth"
     "training/checkpoints/unet_table/Multi-View_U-Net.pth"
-    "training/checkpoints/multiview/best_l1_best_run_feat_pyramid_128_32_no_1x1.pth"
+    "training/checkpoints/mvs/best_l1_best_run_feat_pyramid_128_32_no_1x1.pth"
 )
 
 ARGS=(

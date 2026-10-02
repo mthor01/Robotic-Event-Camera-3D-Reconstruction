@@ -5,13 +5,15 @@ Depth-map, point-cloud, and TSDF reconstruction from trained depth models.
 Supports single- and multi-view early-fusion U-Net checkpoints and geometric
 multiview checkpoints produced by the two
 current training entry points: ``training/train_unet.py`` and
-``training/multiview.py``.
+``training/train_mvs.py``.
 Uses the precomputed table-plane channel stored in hdf5/table_plane.h5
 (produced by data_precomputation/precompute_table_plane.py) instead of
 computing it on-the-fly.
 
-Outputs are written by default to
-training/results/<checkpoint_name>/ (or to --out_dir):
+Outputs are written by default into each sequence directory, under
+<sequence>/reconstruction_output/<checkpoint_name>/ (or to --out_dir).
+When --data_dir is a parent folder, the cross-sequence summary is written to
+<data_dir>/reconstruction_output/<checkpoint_name>/. Each output folder contains:
   frame_NNNNN/depth_pred.png   — colourised predicted depth
   frame_NNNNN/depth_gt.png     — colourised GT depth
   frame_NNNNN/pointcloud.ply   — predicted depth backprojected to 3-D
@@ -23,10 +25,10 @@ training/results/<checkpoint_name>/ (or to --out_dir):
 
 Usage:
     # Compare several checkpoints using identical uniform-TSDF settings.
+    # The comparison summary is written to data/new/eval/reconstruction_output/.
     python3 reconstruction.py \\
         --checkpoint model_single.pth model_early_fusion.pth model_mvs.pth \\
-        --data_dir data/new/eval \\
-        --out_dir training/results/reconstruction_model_comparison
+        --data_dir data/new/eval
 
     python3 reconstruction.py \\
         --checkpoint training/checkpoints/unet_table/best_myrun.pth \\
@@ -83,7 +85,7 @@ from helpers import (
     transform_intrinsics,
 )
 from train_unet import UNet
-from multiview import (
+from train_mvs import (
     ModernMVSNet,
     _inverse_depth_candidates,
     _linear_depth_candidates,
@@ -91,6 +93,7 @@ from multiview import (
 
 CALIB_DIR = _HERE / _CALIB_DIR
 RAISED_OBJECT_BOTTOM_Z_M = 0.015
+OUTPUT_DIRNAME = "reconstruction_output"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -278,7 +281,7 @@ def load_model(ckpt_path: Path, device: torch.device):
             f"Checkpoint does not appear to be a supported table-prior checkpoint: {ckpt_path}\n"
             "Expected a table-prior U-Net checkpoint ('table_z' or 'in_ch' > NUM_BINS) "
             "an EReFormer checkpoint ('embed_dim'/'window_size' metadata or patch_embed weights), "
-            "or a multiview.py checkpoint "
+            "or a train_mvs.py checkpoint "
             "('num_views'/'coarse_depths' metadata)."
         )
     raise AssertionError(f"Unhandled checkpoint type: {ckpt_type}")
@@ -504,7 +507,7 @@ def _multiview_view_ids(
     ckpt: dict,
     centers_world: Optional[np.ndarray],
 ) -> List[int]:
-    """Select target/source frames using the same conventions as multiview.py.
+    """Select target/source frames using the same conventions as train_mvs.py.
 
     Edge frames can lack the exact training-time source layout. In that case we
     keep reconstruction running by filling the missing source slots with nearest
@@ -1488,6 +1491,11 @@ def _is_reconstruction_sequence(path: Path) -> bool:
     )
 
 
+def _default_output_dir(data_dir: str | Path, out_subdir: str | Path) -> Path:
+    """Return the default output folder stored inside a data directory."""
+    return Path(data_dir) / OUTPUT_DIRNAME / out_subdir
+
+
 def _set_cli_option(argv: list[str], option: str, value: str) -> list[str]:
     """Replace one single-valued CLI option, accepting --option=value too."""
     updated: list[str] = []
@@ -1709,7 +1717,7 @@ def _run_checkpoint_comparison(args: argparse.Namespace) -> bool:
     output_root = (
         Path(args.out_dir)
         if args.out_dir is not None
-        else _HERE / "training" / "results" / "reconstruction_model_comparison"
+        else _default_output_dir(args.data_dir, "")
     )
     output_root.mkdir(parents=True, exist_ok=True)
     stems = [checkpoint.stem for checkpoint in checkpoints]
@@ -1725,7 +1733,13 @@ def _run_checkpoint_comparison(args: argparse.Namespace) -> bool:
         child_args = _set_cli_values(
             sys.argv[1:], "--checkpoint", [str(checkpoint)]
         )
-        child_args = _set_cli_option(child_args, "--out_dir", str(model_dir))
+        if args.out_dir is not None:
+            child_args = _set_cli_option(child_args, "--out_dir", str(model_dir))
+        else:
+            # Let the child place per-sequence outputs inside each sequence.
+            child_args = _set_cli_option(
+                child_args, "--out_subdir", checkpoint.stem
+            )
         comparison_dir = model_dir
         uncertainty_requested = bool(
             args.uncertainty_weighted_tsdf or args.compare_uncertainty_tsdf
@@ -1899,11 +1913,11 @@ def _run_uncertainty_tsdf_comparison(args: argparse.Namespace) -> bool:
     if not args.compare_uncertainty_tsdf:
         return False
 
-    checkpoint_stem = Path(args.checkpoint).stem
+    out_subdir = args.out_subdir or Path(args.checkpoint).stem
     output_root = (
         Path(args.out_dir)
         if args.out_dir is not None
-        else _HERE / "training" / "results" / checkpoint_stem
+        else _default_output_dir(args.data_dir, out_subdir)
     )
     output_root.mkdir(parents=True, exist_ok=True)
     base_args = _remove_cli_flag(
@@ -1916,8 +1930,14 @@ def _run_uncertainty_tsdf_comparison(args: argparse.Namespace) -> bool:
         ("uncertainty_weighted_tsdf", True),
     )
     for variant_name, weighted in variants:
-        variant_dir = output_root / variant_name
-        child_args = _set_cli_option(base_args, "--out_dir", str(variant_dir))
+        if args.out_dir is not None:
+            child_args = _set_cli_option(
+                base_args, "--out_dir", str(output_root / variant_name)
+            )
+        else:
+            child_args = _set_cli_option(
+                base_args, "--out_subdir", str(Path(out_subdir) / variant_name)
+            )
         if weighted:
             child_args.append("--uncertainty_weighted_tsdf")
         command = [sys.executable, str(Path(__file__).resolve()), *child_args]
@@ -1942,13 +1962,15 @@ def _run_uncertainty_tsdf_comparison(args: argparse.Namespace) -> bool:
     return True
 
 
-def _write_reconstruction_summary(output_root: Path, sequence_dirs: list[Path]) -> None:
+def _write_reconstruction_summary(
+    output_root: Path, sequence_outputs: list[tuple[str, Path]]
+) -> None:
     """Aggregate per-sequence two-mask metrics and write plots/mean values."""
     runs = []
-    for sequence_dir in sequence_dirs:
-        path = output_root / sequence_dir.name / "reconstruction_metrics.json"
+    for sequence_name, sequence_out in sequence_outputs:
+        path = sequence_out / "reconstruction_metrics.json"
         if path.is_file():
-            runs.append((sequence_dir.name, json.loads(path.read_text(encoding="utf-8"))))
+            runs.append((sequence_name, json.loads(path.read_text(encoding="utf-8"))))
     if not runs:
         return
 
@@ -2090,22 +2112,32 @@ def _run_sequence_directory(args: argparse.Namespace) -> bool:
             "valid sequence subdirectories"
         )
 
-    checkpoint_stem = Path(args.checkpoint).stem
+    out_subdir = args.out_subdir or Path(args.checkpoint).stem
     output_root = (
         Path(args.out_dir)
         if args.out_dir is not None
-        else _HERE / "training" / "results" / checkpoint_stem
+        else _default_output_dir(data_root, out_subdir)
     )
     output_root.mkdir(parents=True, exist_ok=True)
+    sequence_outputs = [
+        (
+            sequence_dir.name,
+            output_root / sequence_dir.name
+            if args.out_dir is not None
+            else _default_output_dir(sequence_dir, out_subdir),
+        )
+        for sequence_dir in sequence_dirs
+    ]
     print(
         f"Detected sequence parent: {data_root}\n"
-        f"Reconstructing {len(sequence_dirs)} sequences into: {output_root}",
+        f"Reconstructing {len(sequence_dirs)} sequences; summary: {output_root}",
         flush=True,
     )
 
     failures: list[tuple[Path, int]] = []
-    for sequence_number, sequence_dir in enumerate(sequence_dirs, start=1):
-        sequence_out = output_root / sequence_dir.name
+    for sequence_number, (sequence_dir, (_, sequence_out)) in enumerate(
+        zip(sequence_dirs, sequence_outputs), start=1
+    ):
         child_args = _set_cli_option(sys.argv[1:], "--data_dir", str(sequence_dir))
         child_args = _set_cli_option(child_args, "--out_dir", str(sequence_out))
         command = [sys.executable, str(Path(__file__).resolve()), *child_args]
@@ -2128,7 +2160,7 @@ def _run_sequence_directory(args: argparse.Namespace) -> bool:
             f"sequences: {failure_text}"
         )
 
-    _write_reconstruction_summary(output_root, sequence_dirs)
+    _write_reconstruction_summary(output_root, sequence_outputs)
 
     print(
         f"\nCompleted reconstruction for all {len(sequence_dirs)} sequences. "
@@ -2150,7 +2182,8 @@ def main() -> None:
         required=True,
         help=(
             "One or more table-prior checkpoints (.pth). Multiple checkpoints "
-            "are reconstructed independently and compared under --out_dir."
+            "are reconstructed independently and compared under --out_dir "
+            "(default: <data_dir>/reconstruction_output/)."
         ),
     )
     parser.add_argument(
@@ -2176,7 +2209,10 @@ def main() -> None:
     parser.add_argument("--indices", type=int, nargs="+", default=None,
                         help="Explicit visualisation frame indices (overrides --n_frames)")
     parser.add_argument("--out_dir", type=str, default=None,
-                        help="Output directory (default: training/results/<checkpoint_name>)")
+                        help="Output directory (default: <data_dir>/reconstruction_output/<checkpoint_name>)")
+    # Internal: path below reconstruction_output/ that parent runs pass to
+    # child processes when --out_dir is not set.
+    parser.add_argument("--out_subdir", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--depth_min", type=float, default=DEPTH_MIN)
     parser.add_argument("--depth_max", type=float, default=D_MAX)
     parser.add_argument("--resize_h", type=int, default=PREPROCESS_RESIZE_HW[0])
@@ -2342,7 +2378,7 @@ def main() -> None:
         parser.error("crop and resize dimensions must be positive")
 
     if args.out_dir is None:
-        out_dir = _HERE / "training" / "results" / ckpt_path.stem
+        out_dir = _default_output_dir(data_dir, args.out_subdir or ckpt_path.stem)
     else:
         out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2414,10 +2450,10 @@ def main() -> None:
     use_learned_uncertainty = args.uncertainty_weighted_tsdf
     if use_learned_uncertainty:
         if ckpt_type != "multiview":
-            parser.error("Learned uncertainty is only supported for multiview.py checkpoints")
+            parser.error("Learned uncertainty is only supported for train_mvs.py checkpoints")
         if not bool(ckpt.get("uncertainty", False)):
             parser.error(
-                "Learned uncertainty requires a multiview.py checkpoint trained with --uncertainty"
+                "Learned uncertainty requires a train_mvs.py checkpoint trained with --uncertainty"
             )
         if not any(key.startswith("confidence_head.") for key in ckpt.get("model", {})):
             parser.error(

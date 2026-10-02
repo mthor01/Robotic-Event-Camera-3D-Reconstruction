@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-multiview.py - Three-stage multi-view event-depth training with a table-plane prior.
+train_mvs.py - Three-stage multi-view event-depth training with a table-plane prior.
 
 This is the multi-view counterpart to train_unet.py. Each sample uses a
 target event voxel frame plus neighbouring source frames:
@@ -20,11 +20,11 @@ can optionally be predicted from target features. Only the final prediction is
 supervised and returned.
 
 Usage:
-    python3 training/multiview.py --data_dir data/new/train
-    python3 training/multiview.py --data_dir data/new/train --num_views 5
-    python3 training/multiview.py --coarse_depths 32 --fine_depths 5 --view_interval 5
-    python3 training/multiview.py --pose_view_selection --pose_move_threshold 0.01 --num_views 5
-    python3 training/multiview.py --base_channels 64 --feature_channels 256 --cost_channels 32
+    python3 training/train_mvs.py --data_dir data/new/train
+    python3 training/train_mvs.py --data_dir data/new/train --num_views 5
+    python3 training/train_mvs.py --coarse_depths 32 --fine_depths 5 --view_interval 5
+    python3 training/train_mvs.py --pose_view_selection --pose_move_threshold 0.01 --num_views 5
+    python3 training/train_mvs.py --base_channels 64 --feature_channels 256 --cost_channels 32
 """
 
 from __future__ import annotations
@@ -1931,7 +1931,7 @@ def main() -> None:
         ),
     )
     parser.add_argument("--out_dir", type=Path,
-                        default=_SCRIPT_DIR / "checkpoints" / "multiview")
+                        default=_SCRIPT_DIR / "checkpoints" / "mvs")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fill_invalid", action="store_true",
                         help="Fill pixels with no depth measurement using the table-plane prior")
@@ -1950,13 +1950,13 @@ def main() -> None:
     parser.add_argument("--name", type=str, default=None,
                         help="Run name used in checkpoint filenames. Prompted if not provided.")
     parser.add_argument("--tb_root", type=Path, default=DEFAULT_TB_ROOT,
-                        help="Shared TensorBoard root. Runs are logged under <tb_root>/multiview/<name>.")
+                        help="Shared TensorBoard root. Runs are logged under <tb_root>/mvs/<name>.")
     parser.add_argument("--debug_views", action="store_true",
                         help="Save target/source event images and camera-pose plots, then exit.")
     parser.add_argument("--debug_samples", type=int, default=4,
                         help="Number of target samples to visualise with --debug_views.")
     parser.add_argument("--debug_out", type=Path,
-                        default=_SCRIPT_DIR / "debug" / "multiview",
+                        default=_SCRIPT_DIR / "debug" / "mvs",
                         help="Output directory for --debug_views PNGs and pose matrices.")
     args = parser.parse_args()
 
@@ -2302,7 +2302,7 @@ def main() -> None:
         print(f"EMA: enabled (decay={args.ema_decay:g}); validation/checkpoints use EMA weights")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    tb_log_dir = tensorboard_run_dir("multiview", args.name, args.tb_root)
+    tb_log_dir = tensorboard_run_dir("mvs", args.name, args.tb_root)
     writer = SummaryWriter(log_dir=str(tb_log_dir))
     print(f"TensorBoard: {tb_log_dir}")
 

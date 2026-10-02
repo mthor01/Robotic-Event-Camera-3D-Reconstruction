@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Extract raw-recorder and compact training datasets from a processed dataset.
+"""Extract raw-recorder and minimal precomputation-source datasets.
 
 The source is expected to contain sequence directories, normally below
 ``train/`` and ``eval/``. Two independent copies are produced:
 
 * ``dataset`` contains only files written by ``data_recording/rec_data.py``.
-* ``core_dataset`` contains only the four inputs required by the model loaders.
+* ``core_dataset`` contains only the recorder inputs required to run the full
+  precomputation pipeline.
 
 Precomputation products are selected explicitly for the core dataset and are
 never copied into the raw recorder dataset.
@@ -36,10 +37,9 @@ RAW_OPTIONAL = (
 )
 
 CORE_REQUIRED = (
-    Path("events/voxels_cam0.h5"),
-    Path("hdf5/depth_in_event_frame.h5"),
+    Path("raw_event_data/events_cam0.raw"),
+    Path("hdf5/realsense.h5"),
     Path("hdf5/poses.h5"),
-    Path("hdf5/table_plane.h5"),
 )
 
 
@@ -141,7 +141,7 @@ def format_size(byte_count: int) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Create raw-recorder and compact training datasets."
+        description="Create raw-recorder and minimal precomputation-source datasets."
     )
     parser.add_argument(
         "--source",
@@ -156,12 +156,17 @@ def main() -> None:
     parser.add_argument(
         "--core-output",
         default="data/core_dataset",
-        help="Compact training-ready output (default: data/core_dataset).",
+        help="Minimal precomputation-source output (default: data/core_dataset).",
     )
     parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Delete and replace existing output directories.",
+    )
+    parser.add_argument(
+        "--core-only",
+        action="store_true",
+        help="Create only core_dataset and leave dataset untouched.",
     )
     parser.add_argument(
         "--dry-run",
@@ -176,12 +181,19 @@ def main() -> None:
 
     if not source.is_dir():
         parser.error(f"Source dataset does not exist: {source}")
-    if dataset_output == core_output:
+    if not args.core_only and dataset_output == core_output:
         parser.error("--dataset-output and --core-output must differ")
-    if dataset_output in core_output.parents or core_output in dataset_output.parents:
+    if (
+        not args.core_only
+        and (
+            dataset_output in core_output.parents
+            or core_output in dataset_output.parents
+        )
+    ):
         parser.error("Dataset outputs must not contain one another")
     try:
-        validate_output(source, dataset_output, "dataset")
+        if not args.core_only:
+            validate_output(source, dataset_output, "dataset")
         validate_output(source, core_output, "core dataset")
     except ValueError as error:
         parser.error(str(error))
@@ -191,13 +203,15 @@ def main() -> None:
         parser.error(f"No sequences containing hdf5/realsense.h5 found below {source}")
 
     # Validate everything before creating or deleting either output.
-    validate_manifest(sequences, source, RAW_REQUIRED, "recorder dataset")
+    if not args.core_only:
+        validate_manifest(sequences, source, RAW_REQUIRED, "recorder dataset")
     validate_manifest(sequences, source, CORE_REQUIRED, "core dataset")
 
     if not args.overwrite:
-        existing_outputs = [
-            output for output in (dataset_output, core_output) if output.exists()
-        ]
+        requested_outputs = (
+            (core_output,) if args.core_only else (dataset_output, core_output)
+        )
+        existing_outputs = [output for output in requested_outputs if output.exists()]
         if existing_outputs:
             formatted = "\n".join(f"  - {output}" for output in existing_outputs)
             parser.error(
@@ -207,21 +221,23 @@ def main() -> None:
 
     print(f"Source:       {source}")
     print(f"Sequences:    {len(sequences)}")
-    print(f"Dataset:      {dataset_output}")
+    print(f"Dataset:      {'skipped' if args.core_only else dataset_output}")
     print(f"Core dataset: {core_output}")
     print(f"Mode:         {'dry run' if args.dry_run else 'copy'}")
 
-    prepare_output(dataset_output, args.overwrite, args.dry_run)
+    if not args.core_only:
+        prepare_output(dataset_output, args.overwrite, args.dry_run)
     prepare_output(core_output, args.overwrite, args.dry_run)
 
-    print("\nRecorder dataset files:")
-    raw_files, raw_bytes = copy_manifest(
-        sequences,
-        source,
-        dataset_output,
-        RAW_REQUIRED + RAW_OPTIONAL,
-        args.dry_run,
-    )
+    if not args.core_only:
+        print("\nRecorder dataset files:")
+        raw_files, raw_bytes = copy_manifest(
+            sequences,
+            source,
+            dataset_output,
+            RAW_REQUIRED + RAW_OPTIONAL,
+            args.dry_run,
+        )
     print("\nCore dataset files:")
     core_files, core_bytes = copy_manifest(
         sequences,
@@ -231,16 +247,17 @@ def main() -> None:
         args.dry_run,
     )
 
-    missing_optional = sum(
-        not (sequence / relative).is_file()
-        for sequence in sequences
-        for relative in RAW_OPTIONAL
-    )
     print("\nExtraction complete." if not args.dry_run else "\nDry run complete.")
-    print(f"  dataset:      {raw_files} files, {format_size(raw_bytes)}")
+    if not args.core_only:
+        missing_optional = sum(
+            not (sequence / relative).is_file()
+            for sequence in sequences
+            for relative in RAW_OPTIONAL
+        )
+        print(f"  dataset:      {raw_files} files, {format_size(raw_bytes)}")
+        if missing_optional:
+            print(f"  optional recorder files absent: {missing_optional}")
     print(f"  core_dataset: {core_files} files, {format_size(core_bytes)}")
-    if missing_optional:
-        print(f"  optional recorder files absent: {missing_optional}")
 
 
 if __name__ == "__main__":
