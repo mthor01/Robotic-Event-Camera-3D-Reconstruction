@@ -8,8 +8,7 @@
 #   ./precompute_all.sh                                         # all objects, default settings
 #   ./precompute_all.sh --data_dir data/real/bottle             # single object
 #   ./precompute_all.sh --data_dir data/real/bottle data/real/cube
-#   ./precompute_all.sh --data_root data/real                   # explicit root (default)
-#   ./precompute_all.sh --data_root data/real                   # all recordings below root
+#   ./precompute_all.sh --data_root data/Event_and_Depth        # all recordings below root (default)
 #
 # Per-step flags:
 #   Use --project, --table, --voxel as section markers.
@@ -80,12 +79,12 @@ while [[ $i -le $# ]]; do
     esac
 done
 
-# Default to data/real if nothing was specified
+# Default to data/Event_and_Depth if nothing was specified
 if [[ ${#DATA_ARGS[@]} -eq 0 ]]; then
-    DATA_ARGS=("--data_root" "data/real")
+    DATA_ARGS=("--data_root" "data/Event_and_Depth")
 fi
 
-# Change to the 3d_reconstruction root so that relative data paths (data/real/...)
+# Change to the repository root so that relative data paths (data/...)
 # resolve correctly.  The individual scripts are invoked by sub-path.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/.."

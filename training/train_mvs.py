@@ -21,8 +21,8 @@ returned. Source views are selected by camera motion between frames.
 All defaults reproduce the configuration of the model used in the thesis.
 
 Usage:
-    python3 training/train_mvs.py --data_dir data/new --name my_run
-    python3 training/train_mvs.py --data_dir data/new --name small --num_views 5 --feature_channels 64
+    python3 training/train_mvs.py --data_dir data/Event_and_Depth --name my_run
+    python3 training/train_mvs.py --name small --num_views 5 --feature_channels 64
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ from torch.utils.tensorboard import SummaryWriter
 _SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SCRIPT_DIR.parent))
 
-from config import DEPTH_MIN, D_MAX, NUM_BINS
+from config import DATA_ROOT as _DATA_ROOT, DEPTH_MIN, D_MAX, NUM_BINS
 from depth_losses import (
     charbonnier_loss,
     gradient_loss,
@@ -69,7 +69,7 @@ from helpers import (
 )
 
 _CAM_DATA = _SCRIPT_DIR.parent / "camera_data"
-DATA_ROOT = _SCRIPT_DIR.parent / "data" / "lego"
+DATA_ROOT = _SCRIPT_DIR.parent / _DATA_ROOT
 
 
 @dataclass(frozen=True)

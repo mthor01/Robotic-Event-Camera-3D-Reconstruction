@@ -34,7 +34,7 @@ import numpy as np
 from tqdm import tqdm
 
 _HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(_HERE.parent))   # 3d_reconstruction/
+sys.path.insert(0, str(_HERE.parent))   # repository root
 
 from config import (
     CALIB_DIR as _CALIB_DIR,

@@ -51,7 +51,8 @@ RUN python3 -m pip install --upgrade pip \
     matplotlib \
     seaborn \
     scipy \
-    open3d==0.19.0
+    open3d==0.19.0 \
+    huggingface_hub
 
 
 # Optional: HDF5 plugin path for Ubuntu 22.04 (doc gives this exact path)

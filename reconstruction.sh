@@ -9,7 +9,7 @@ cd "$SCRIPT_DIR"
 # ---------------------------------------------------------------------------
 # Configuration: edit dataset, checkpoint, TSDF, and output settings here.
 # ---------------------------------------------------------------------------
-DATA_DIR="data/new_2/eval"
+DATA_DIR="data/Event_and_Depth/eval"
 CHECKPOINT="training/checkpoints/mvs/best_l1_best_run_feat_pyramid_128_32_no_1x1.pth"
 
 ARGS=(

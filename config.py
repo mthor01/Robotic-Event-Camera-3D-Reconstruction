@@ -14,7 +14,9 @@ from pathlib import Path
 #  Default paths
 # ═══════════════════════════════════════════════════════════════════
 CALIB_DIR = Path("camera_data")
-DATA_ROOT = Path("data/real")
+# Dataset root relative to the repository; download_dataset.py stores the
+# published dataset here.
+DATA_ROOT = Path("data/Event_and_Depth")
 
 # ═══════════════════════════════════════════════════════════════════
 #  Recording frame rate

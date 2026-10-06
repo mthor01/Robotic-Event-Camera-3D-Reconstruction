@@ -10,7 +10,7 @@ cd "$SCRIPT_DIR"
 # Configuration: edit these values for your machine, dataset, and experiment.
 # ---------------------------------------------------------------------------
 RUN_NAME="after_master_test"
-DATA_DIR="../data/new_2"
+DATA_DIR="../data/Event_and_Depth"
 BATCH_SIZE=14
 WORKERS=8
 

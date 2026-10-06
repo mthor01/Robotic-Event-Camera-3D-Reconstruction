@@ -9,7 +9,7 @@ cd "$SCRIPT_DIR"
 # ---------------------------------------------------------------------------
 # Configuration: edit paths, examples, and resource-related settings.
 # ---------------------------------------------------------------------------
-DATA_DIR="../data/new_2/eval"
+DATA_DIR="../data/Event_and_Depth/eval"
 CHECKPOINT="checkpoints/mvs/best_l1_best_run_feat_pyramid_128_32_no_1x1.pth"
 WORKERS=8
 BATCH_SIZE=15

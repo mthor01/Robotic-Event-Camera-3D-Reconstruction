@@ -4,7 +4,7 @@
 Example:
     python3 evaluation.py \\
         --checkpoint checkpoints/mvs/best_model.pth \\
-        --data_dir ../data/real/eval
+        --data_dir ../data/Event_and_Depth/eval
 
 The data directory may be either a folder containing multiple sequence
 folders or one sequence folder. Depth metrics are reported for the whole
@@ -26,7 +26,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-_CAMERA_DATA_DIR = Path(__file__).resolve().parent.parent / "camera_data"
+_REPO_DIR = Path(__file__).resolve().parent.parent
+_CAMERA_DATA_DIR = _REPO_DIR / "camera_data"
 
 from train_mvs import (
     MultiViewAugConfig,
@@ -40,6 +41,7 @@ from helpers import (
     load_event_calibration,
 )
 from config import (
+    DATA_ROOT,
     DEPTH_MIN,
     D_MAX,
     NUM_BINS,
@@ -902,7 +904,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data_dir",
         type=Path,
-        default=Path("../data/real/eval"),
+        default=_REPO_DIR / DATA_ROOT / "eval",
         help=(
             "Final evaluation-data folder: either one sequence or a folder "
             "containing multiple sequence folders."

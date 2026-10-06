@@ -116,12 +116,14 @@ produce coherent surfaces after fusion.
 
 | Path | Purpose |
 | --- | --- |
-| `3d_reconstruction/config.py`, `helpers.py` | Shared constants, camera geometry, dataset discovery, workspace masks, and view selection. |
-| `3d_reconstruction/camera_data/` | Camera intrinsics, extrinsics, depth scale, and recorded end-effector poses for the original hardware setup. |
-| `3d_reconstruction/data_precomputation/` | Scripts that project depth into event-camera geometry, create table priors, and build event voxel grids. |
-| `3d_reconstruction/training/` | MVS depth network and training loop, evaluation, losses, and TensorBoard helpers. |
-| `3d_reconstruction/reconstruction.py` | Depth prediction, (confidence-weighted) TSDF reconstruction, and surface metrics. |
+| `config.py`, `helpers.py` | Shared constants, camera geometry, dataset discovery, workspace masks, and view selection. |
+| `download_dataset.py` | Downloads the published dataset from the Hugging Face Hub into `data/`. |
+| `camera_data/` | Camera intrinsics, extrinsics, depth scale, and recorded end-effector poses for the original hardware setup. |
+| `data_precomputation/` | Scripts that project depth into event-camera geometry, create table priors, and build event voxel grids. |
+| `training/` | MVS depth network and training loop, evaluation, losses, and TensorBoard helpers. |
+| `reconstruction.py` | Depth prediction, (confidence-weighted) TSDF reconstruction, and surface metrics. |
 | `docker_installation/training_and_reconstruction/` | Dockerfile for the preprocessing, training, and reconstruction environment. |
+| `data/` | Datasets (not tracked by git); `download_dataset.py` stores the published dataset in `data/Event_and_Depth/`. |
 
 ## Requirements
 
@@ -150,12 +152,37 @@ docker run --rm -it \
   --ipc=host \
   --shm-size=16g \
   -v "$(pwd):/workspace" \
-  -w /workspace/3d_reconstruction \
+  -w /workspace \
   robot-record-reconstruction bash
 ```
 
 The commands below are executed from this container shell. Adjust `--shm-size`,
 batch sizes, and worker counts to the available RAM, shared memory, and GPU.
+
+## Downloading the dataset
+
+The recorded dataset is published on the Hugging Face Hub as
+[`mthor/Event_and_Depth`](https://huggingface.co/datasets/mthor/Event_and_Depth).
+It contains the 42 training and 6 evaluation sequences in the `train/` and
+`eval/` layout described below, including the precomputed model inputs, so the
+preprocessing step can be skipped. Download it into `data/Event_and_Depth/`,
+which is the default dataset location of all scripts and launchers, with:
+
+```bash
+python3 download_dataset.py
+```
+
+| Option | Effect |
+| --- | --- |
+| `--files precomputed` (default) | Voxel grids, projected depth, poses, and table priors: everything needed for training, evaluation, and reconstruction (about 60 GB for `train` and `eval`). |
+| `--files raw` | Raw event streams, RealSense recordings, and poses: the inputs of `precompute_all.sh` (about 91 GB). |
+| `--files all` | Every file of the selected sequences (about 154 GB for `train` and `eval`). |
+| `--splits train eval special eval_and_special` | Dataset folders to download (default: `train eval`). `special/` holds two further sequences (40 and 60); `eval_and_special/` combines them with the evaluation sequences. |
+| `--sequences 20 25` | Download only the named sequences. |
+| `--dry_run` | Print the number of files and the download size without downloading. |
+
+Complete files are skipped, so an interrupted download can simply be restarted.
+The script uses `huggingface_hub`, which is installed in the Docker image.
 
 ## Input data format
 
@@ -165,7 +192,7 @@ Each recording of one object is one **sequence directory**. The recorder
 (`data_recording/rec_data.py` on the `main` branch) creates that directory as:
 
 ```text
-3d_reconstruction/data/real/<object-name>/
+data/real/<object-name>/
 ├── raw_event_data/
 │   └── events_cam0.raw
 ├── hdf5/
@@ -191,7 +218,7 @@ following exact split layout. Moving a sequence means moving its entire
 `<object-name>/` directory, without changing anything inside it:
 
 ```text
-3d_reconstruction/data/<dataset-name>/
+data/<dataset-name>/
 ├── train/
 │   ├── <training-object-1>/
 │   │   ├── raw_event_data/events_cam0.raw
@@ -212,13 +239,14 @@ following exact split layout. Moving a sequence means moving its entire
         └── ...
 ```
 
-For example, `DATA_DIR="../data/my_dataset"` in `training/train_mvs.sh`
-means that the script reads sequences from `data/my_dataset/train/` and
-validates on sequences from `data/my_dataset/eval/`. The split directory names
-must literally be `train` and `eval`. Evaluation and reconstruction instead
-receive the evaluation split itself, for example
-`DATA_DIR="../data/my_dataset/eval"` in `training/eval.sh` and
-`DATA_DIR="data/my_dataset/eval"` in `reconstruction.sh`.
+The downloaded dataset uses exactly this layout. For example, the default
+`DATA_DIR="../data/Event_and_Depth"` in `training/train_mvs.sh` means that the
+script reads sequences from `data/Event_and_Depth/train/` and validates on
+sequences from `data/Event_and_Depth/eval/`. The split directory names must
+literally be `train` and `eval`. Evaluation and reconstruction instead receive
+the evaluation split itself: `DATA_DIR="../data/Event_and_Depth/eval"` in
+`training/eval.sh` and `DATA_DIR="data/Event_and_Depth/eval"` in
+`reconstruction.sh`. For another dataset, change these three values.
 
 `precompute_all.sh` accepts one or more complete sequence directories through
 `--data_dir`, or searches recursively beneath `--data_root`. A directory is
@@ -303,9 +331,9 @@ inputs to `precompute_all.sh`.
 
 ### Calibration files
 
-Place the calibration in `3d_reconstruction/camera_data/`. To use another
+Place the calibration in `camera_data/`. To use another
 location for the complete pipeline, update `CALIB_DIR` in
-`3d_reconstruction/config.py`; the projection script's `--calib_dir` flag only
+`config.py`; the projection script's `--calib_dir` flag only
 changes the projection stage. The complete pipeline expects:
 
 | File | Required arrays |
@@ -325,8 +353,10 @@ and reconstruction.
 
 ## Preprocessing
 
-From `/workspace/3d_reconstruction` inside the Docker container, process an
-entire dataset with:
+The downloaded dataset already contains the preprocessing outputs. This step is
+only needed for raw data, for example after `download_dataset.py --files raw`
+or for your own recordings. From `/workspace` inside the Docker container,
+process an entire dataset with:
 
 ```bash
 ./data_precomputation/precompute_all.sh --data_root data/my_dataset
