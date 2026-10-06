@@ -11,7 +11,7 @@ cd "$SCRIPT_DIR"
 # ---------------------------------------------------------------------------
 RUN_NAME="after_master_test"
 DATA_DIR="../data/Event_and_Depth"
-BATCH_SIZE=14
+BATCH_SIZE=10
 WORKERS=8
 
 # The values below are the defaults of train_mvs.py, i.e. the configuration

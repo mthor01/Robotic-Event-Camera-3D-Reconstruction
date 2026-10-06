@@ -1,18 +1,10 @@
-# Robot Recording and Event-Based 3-D Reconstruction (light)
+# Robot Recording and Event-Based 3-D Reconstruction
 
-This is the **light** branch: a concise version of the research pipeline
-developed for my master's thesis that contains only what is needed to
-preprocess recorded data, train and evaluate the MVS-inspired event-based depth
-model, and reconstruct meshes through TSDF fusion.
-
-The [`main` branch](https://github.com/mthor01/robot_and_record/tree/main)
-contains the complete project, including synchronized data recording, camera
-calibration, Franka robot control, the U-Net baselines and model comparisons,
-the architecture and training variants explored during development, additional
-evaluation and reconstruction analyses, and the visualization and diagnostic
-tools.
+This repository contains the code of my master's thesis on event-based
+multi-view depth estimation and 3-D reconstruction.
 
 **[Read the master's thesis (PDF)](https://github.com/mthor01/robot_and_record/blob/main/docs/Masters_Thesis_github.pdf)**
+· **[Dataset on Hugging Face](https://huggingface.co/datasets/mthor/Event_and_Depth)**
 
 The main contribution is an event-based depth-estimation method inspired by
 RGB multi-view stereo (MVS). Instead of matching conventional RGB images, the
@@ -21,120 +13,128 @@ approximate table-plane prior. It uses camera geometry to construct
 coarse-to-fine cost volumes, predicts a dense depth map and confidence map for
 each reference view, and fuses the resulting predictions into a 3-D mesh.
 
-## Experimental setup and recorded dataset
+## Two versions of this repository
+
+| Branch | Contents | Intended use |
+| --- | --- | --- |
+| [`main`](https://github.com/mthor01/robot_and_record/tree/main) | The complete thesis project: Franka robot-arm control, trajectory execution, synchronized data recording, camera and hand-eye calibration, the U-Net baselines and model comparisons, the architecture and training variants explored during development, and many analysis, visualization, and test scripts used throughout the thesis. | Documents and reproduces the full experimental system. |
+| **`light`** (this branch) | Everything needed to work with the published dataset: preprocessing, training, evaluation, and TSDF reconstruction of the MVS model. | Using, retraining, and extending the method. |
+
+The `main` branch is very setup specific. Its recording and robot-control code
+depends on our particular hardware: a Franka Emika Panda with the Deoxys
+control stack, a hardware-synchronized Intel RealSense D435 and IDS event
+camera on a custom end-effector mount, and our calibration, network
+configuration, and vendor drivers. It is not intended as a generic
+data-collection system for arbitrary robots or cameras, and much of it only
+runs on that setup.
+
+For convenience, we therefore provide this **light** version. It starts from
+the recorded dataset, which can be downloaded with a single command, and
+contains only the code of the final method, without the hardware-specific
+parts and the experimental variants. Its defaults reproduce the configuration
+of the model reported in the thesis.
+
+## What you can do with the light version
+
+- **Download the dataset** of 50 recorded sequences, either with precomputed
+  model inputs or as raw recordings ([Dataset](#dataset)).
+- **Preprocess raw recordings** into event voxel grids, ground-truth depth in
+  the event-camera frame, and table-plane priors, for the published raw files
+  or your own recordings in the same format
+  ([Preprocessing](#preprocessing-optional)).
+- **Train the MVS model** with the thesis configuration or with your own
+  hyperparameters, and monitor training in TensorBoard
+  ([Training](#training)).
+- **Evaluate depth predictions** with standard depth metrics for the whole
+  frame and for spatial regions around the object ([Evaluation](#evaluation)).
+- **Reconstruct 3-D meshes** by fusing predicted depth maps with uniform or
+  confidence-weighted TSDF integration, and compare them with meshes from the
+  ground-truth depth ([Reconstruction](#reconstruction)).
+
+## Method overview
 
 An Intel RealSense D435 RGB-D camera and an IDS UE-39B0XCP-E event camera are
 rigidly attached to the end effector of a Franka Emika Panda robot. The cameras
 are hardware synchronized, while the robot publishes timestamped end-effector
-poses. Camera, hand-eye, and robot calibration provide the transformations
-needed both to project RealSense depth into the event-camera frame and to place
-all event-camera observations in a common world coordinate system.
+poses. Calibration provides the transformations needed both to project
+RealSense depth into the event-camera frame and to place all event-camera
+observations in a common world coordinate system, the robot base frame. The
+RealSense depth serves only as supervision; the model sees only events and the
+table prior.
 
-The recorded dataset contains **48 object-specific sequences** of static,
-colored building-block structures on a mostly textureless white table. For
-each sequence, the robot moves the camera rig along a smooth path through
-randomly sampled, reachable viewpoints on a restricted hemisphere around the
-object. Each trajectory is constructed from 30 target poses and is recorded
-continuously, producing synchronized event streams, RGB-D measurements, and
-camera poses. The split contains **42 training sequences** and **6 held-out
-evaluation sequences**; there is no separate test set.
-
-The RealSense depth measurements serve as supervision rather than model input:
-after calibration they are projected into the event-camera frame to form
-ground-truth depth maps. The event camera records at 1280 x 720 pixels, while
-RealSense depth is captured at 640 x 480 pixels and 30 Hz. An optical filter in
-front of the event-camera lens suppresses events caused by the RealSense
-infrared projector.
-
-## End-to-end reconstruction pipeline
-
-The project covers all stages from physical recording to a reconstructed
-surface. This branch starts from already recorded data (stage 2); the recording
-and calibration code is on the `main` branch.
-
-1. **Synchronized recording.** The robot follows a multi-view trajectory around
-   a static object. Event data, RealSense RGB-D frames, and end-effector poses
-   are recorded and associated through hardware triggering and ZeroMQ-based
-   synchronization.
-2. **Calibration and preprocessing.** Hand-eye and multi-camera calibration
-   determine the event-camera poses and the transformation between both
-   cameras. RealSense depth is projected into the event-camera frame, raw
-   events are accumulated into five-bin voxel grids, and a view-dependent
-   table-plane depth prior is generated.
-3. **MVS-inspired depth prediction.** One event observation is selected as the
-   reference view and up to eight displaced observations of the same scene are
-   used as source views. A shared feature pyramid extracts multi-scale features
-   from each event voxel grid and table prior. As in RGB MVS methods, calibrated
-   camera geometry warps source-view features across depth hypotheses. Cascaded
-   cost volumes progressively narrow the depth interval, after which a
-   refinement network predicts full-resolution reference-view depth and a
-   per-pixel confidence map.
+1. **Recording** (`main` branch). The robot moves the cameras along a smooth
+   multi-view trajectory around a static object.
+2. **Preprocessing.** RealSense depth is projected into the event-camera
+   frame, events are accumulated into five-bin voxel grids per frame, and a
+   view-dependent table-plane depth prior is generated.
+3. **MVS-inspired depth prediction.** One event observation is the reference
+   view and up to eight displaced observations of the same scene are source
+   views. A shared feature pyramid extracts multi-scale features, calibrated
+   camera geometry warps source-view features across depth hypotheses, and
+   three cascaded cost volumes progressively narrow the depth interval. A
+   refinement network predicts full-resolution depth and a per-pixel
+   confidence map.
 4. **TSDF reconstruction.** Predicted depth maps are transformed into the
-   common world frame and integrated into a truncated signed distance field.
+   world frame and integrated into a truncated signed distance field.
    Confidence-weighted fusion reduces the influence of unreliable predictions,
-   and the final surface is extracted as a triangle mesh.
+   and the surface is extracted as a triangle mesh.
 
 ```text
-Event camera + RGB-D supervision + robot poses
+event streams + RealSense depth + robot poses        (recording, main branch)
                       |
                       v
-       calibration and synchronized recording
+ event voxel grids + table priors + ground-truth depth       (preprocessing)
                       |
                       v
- event voxel grids + table priors + ground-truth depth
+ geometry-aware multi-view depth and confidence prediction      (MVS model)
                       |
                       v
- geometry-aware multi-view depth and confidence prediction
-                      |
-                      v
-        confidence-weighted TSDF fusion -> 3-D mesh
+        confidence-weighted TSDF fusion -> 3-D mesh          (reconstruction)
 ```
 
-## Results on the recorded dataset
+## Results
 
-The following results are measured on the six held-out recording sequences,
-whose objects were not used for training. Evaluation is restricted to the
-workspace cube surrounding the recording area. In this region, the
-geometry-based multiview model achieves a mean absolute depth error (MAE) of
-**0.180 cm** and a root mean squared error (RMSE) of **0.630 cm**.
+The results are measured on the six held-out evaluation sequences, whose
+objects were not used for training, inside the workspace cube around the
+object. The model achieves a mean absolute depth error (MAE) of **0.180 cm**
+and a root mean squared error (RMSE) of **0.630 cm**.
 
 For reconstruction, the predicted depth maps are fused with confidence-weighted
-TSDF integration and compared with reference meshes reconstructed from the
-ground-truth depth maps. The values below are averages over the same six
-held-out objects. Accuracy measures predicted-to-reference surface distance,
-completeness measures reference-to-predicted distance, and their symmetric mean
-is the Chamfer distance; lower is better. Normal consistency is better when
-closer to one.
-
-Inside the workspace cube, the reconstructed meshes achieve a mean accuracy of
-**0.108 cm**, completeness of **0.108 cm**, Chamfer distance of **0.108 cm**,
-and normal consistency of **0.966**. These results show that the predicted
-event-based depth maps remain sufficiently consistent across viewpoints to
-produce coherent surfaces after fusion.
+TSDF integration and compared with reference meshes fused from the
+ground-truth depth maps. Accuracy measures predicted-to-reference surface
+distance, completeness measures reference-to-predicted distance, and their
+symmetric mean is the Chamfer distance; lower is better. Normal consistency is
+better when closer to one. Averaged over the six evaluation objects, the
+reconstructed meshes achieve an accuracy of **0.108 cm**, completeness of
+**0.108 cm**, Chamfer distance of **0.108 cm**, and normal consistency of
+**0.966**.
 
 ## Repository layout
 
 | Path | Purpose |
 | --- | --- |
-| `config.py`, `helpers.py` | Shared constants, camera geometry, dataset discovery, workspace masks, and view selection. |
-| `download_dataset.py` | Downloads the published dataset from the Hugging Face Hub into `data/`. |
-| `camera_data/` | Camera intrinsics, extrinsics, depth scale, and recorded end-effector poses for the original hardware setup. |
-| `data_precomputation/` | Scripts that project depth into event-camera geometry, create table priors, and build event voxel grids. |
-| `training/` | MVS depth network and training loop, evaluation, losses, and TensorBoard helpers. |
-| `reconstruction.py` | Depth prediction, (confidence-weighted) TSDF reconstruction, and surface metrics. |
-| `docker_installation/training_and_reconstruction/` | Dockerfile for the preprocessing, training, and reconstruction environment. |
-| `data/` | Datasets (not tracked by git); `download_dataset.py` stores the published dataset in `data/Event_and_Depth/`. |
+| `download_dataset.py` | Downloads the dataset from the Hugging Face Hub into `data/`. |
+| `config.py` | Shared constants: dataset location, input resolution, depth range, workspace cube, and TSDF settings. |
+| `helpers.py` | Camera geometry, dataset discovery, workspace masks, and source-view selection. |
+| `camera_data/` | Calibration of the recording setup (intrinsics, extrinsics, depth scale). |
+| `data_precomputation/` | Preprocessing of raw recordings into model inputs. |
+| `training/train_mvs.py`, `train_mvs.sh` | MVS network, dataset loader, and training loop, with its launcher. |
+| `training/evaluation.py`, `evaluation.sh` | Depth evaluation, with its launcher. |
+| `training/depth_losses.py`, `tensorboard_helper.py` | Training losses and TensorBoard logging. |
+| `reconstruction.py`, `reconstruction.sh` | TSDF reconstruction and surface metrics, with its launcher. |
+| `docker_installation/training_and_reconstruction/` | Dockerfile of the software environment. |
+| `data/` | Datasets (created by `download_dataset.py`, not tracked by git). |
 
-## Requirements
+## Installation
 
-Everything in this branch runs inside the `training_and_reconstruction` Docker
-image: raw-data preprocessing, MVS-inspired training, quantitative evaluation,
-and TSDF reconstruction. A
-Linux machine is recommended, and model training and reconstruction require an
-NVIDIA GPU with a working NVIDIA Container Toolkit installation.
+Everything runs inside the Docker image defined in
+`docker_installation/training_and_reconstruction/`. It contains PyTorch,
+Open3D, the Metavision SDK (needed only to read raw event files during
+preprocessing), and `huggingface_hub`. A Linux machine with an NVIDIA GPU and
+the NVIDIA Container Toolkit is recommended for training and reconstruction.
 
 Build the image from the repository root. Supplying the local user and group
-IDs keeps bind-mounted outputs writable by the host user:
+IDs keeps files written into the mounted repository owned by you:
 
 ```bash
 docker build \
@@ -144,369 +144,360 @@ docker build \
   docker_installation/training_and_reconstruction
 ```
 
-Start an interactive container with the repository mounted at `/workspace`:
+Start a container with the repository mounted at `/workspace`. The port
+mapping is only needed for TensorBoard:
 
 ```bash
 docker run --rm -it \
   --gpus all \
   --ipc=host \
   --shm-size=16g \
+  -p 6006:6006 \
   -v "$(pwd):/workspace" \
   -w /workspace \
   robot-record-reconstruction bash
 ```
 
-The commands below are executed from this container shell. Adjust `--shm-size`,
-batch sizes, and worker counts to the available RAM, shared memory, and GPU.
+All commands below are run from this container shell in `/workspace`. Adjust
+`--shm-size`, batch sizes, and worker counts to the available memory and GPU.
 
-## Downloading the dataset
+## Dataset
 
-The recorded dataset is published on the Hugging Face Hub as
+### Download
+
+The dataset is published on the Hugging Face Hub as
 [`mthor/Event_and_Depth`](https://huggingface.co/datasets/mthor/Event_and_Depth).
-It contains the 42 training and 6 evaluation sequences in the `train/` and
-`eval/` layout described below, including the precomputed model inputs, so the
-preprocessing step can be skipped. Download it into `data/Event_and_Depth/`,
-which is the default dataset location of all scripts and launchers, with:
+Download it into `data/Event_and_Depth/`, the default dataset location of all
+scripts and launchers, with:
 
 ```bash
 python3 download_dataset.py
 ```
 
+By default this downloads the training and evaluation sequences with the
+precomputed model inputs (about 60 GB), which is all that training,
+evaluation, and reconstruction need. Options:
+
 | Option | Effect |
 | --- | --- |
-| `--files precomputed` (default) | Voxel grids, projected depth, poses, and table priors: everything needed for training, evaluation, and reconstruction (about 60 GB for `train` and `eval`). |
-| `--files raw` | Raw event streams, RealSense recordings, and poses: the inputs of `precompute_all.sh` (about 91 GB). |
+| `--files precomputed` (default) | Voxel grids, ground-truth depth, poses, and table priors (about 60 GB for `train` and `eval`). |
+| `--files raw` | Raw event streams, RealSense recordings, and poses: the inputs of the preprocessing (about 91 GB). |
 | `--files all` | Every file of the selected sequences (about 154 GB for `train` and `eval`). |
-| `--splits train eval special eval_and_special` | Dataset folders to download (default: `train eval`). `special/` holds two further sequences (40 and 60); `eval_and_special/` combines them with the evaluation sequences. |
+| `--splits train eval special eval_and_special` | Dataset folders to download (default: `train eval`). |
 | `--sequences 20 25` | Download only the named sequences. |
 | `--dry_run` | Print the number of files and the download size without downloading. |
 
-Complete files are skipped, so an interrupted download can simply be restarted.
-The script uses `huggingface_hub`, which is installed in the Docker image.
+The script checks the free disk space before downloading. Complete files are
+skipped, so an interrupted download can simply be restarted.
 
-## Input data format
+### Recordings
 
-The directory and file names in this section are part of the data interface;
-they are not placeholders except for names written inside angle brackets.
-Each recording of one object is one **sequence directory**. The recorder
-(`data_recording/rec_data.py` on the `main` branch) creates that directory as:
+The dataset contains 50 object-specific recordings of static, colored
+building-block structures on a mostly textureless white table. For every
+recording, the robot moves the camera rig along a smooth path through randomly
+sampled, reachable viewpoints on a restricted hemisphere around the object.
+Each trajectory is constructed from 30 target poses and is recorded
+continuously, producing synchronized event streams, RGB-D measurements, and
+camera poses at 30 frames per second.
+
+The recordings are organized into four folders. Each recording is one
+**sequence directory**, named by its recording number:
+
+| Folder | Sequences | Frames per sequence | Use |
+| --- | --- | --- | --- |
+| `train/` | 42: 21–24, 26–29, 31–39, 41–44, 46–49, 51–59, 61–64, 66–69 | 798–1571 (43,543 in total) | Training |
+| `eval/` | 6: 20, 25, 30, 50, 65, 70 | 922–1590 (6,959 in total) | Validation during training and the evaluation reported in the thesis |
+| `special/` | 2: 40, 60 | 989 and 999 | Two additional recordings outside the training/evaluation split |
+| `eval_and_special/` | 8: the sequences of `eval/` and `special/` | | All eight non-training sequences in one folder, for example to evaluate them in one run |
+
+The objects of the evaluation sequences do not appear in the training
+sequences, and there is no separate test set. `eval_and_special/` contains the
+same data as `eval/` and `special/`, so it does not need to be downloaded in
+addition to those two folders.
+
+### Sequence directory
+
+Every sequence directory contains the raw recording and the precomputed model
+inputs derived from it:
 
 ```text
-data/real/<object-name>/
+<split>/<sequence>/
 ├── raw_event_data/
-│   └── events_cam0.raw
-├── hdf5/
-│   ├── realsense.h5
-│   ├── events_cam0.h5
-│   ├── poses.h5
-│   ├── raw_poses.h5              # recorder diagnostics; not precompute input
-│   └── metadata.h5               # recorder metadata; not precompute input
-└── videos/                       # previews; not precompute input
-    ├── events_cam0.mp4
-    ├── realsense_depth.mp4
-    └── realsense_rgb.mp4
-```
-
-`<object-name>` is the name entered when recording; spaces and other special
-characters are replaced with underscores. The three names
-`raw_event_data`, `hdf5`, and `events_cam0.raw`, and the HDF5 filenames shown
-above, must remain exactly as written. Do not place the HDF5 files directly in
-the object directory.
-
-For multiview training, organize the complete sequence directories into the
-following exact split layout. Moving a sequence means moving its entire
-`<object-name>/` directory, without changing anything inside it:
-
-```text
-data/<dataset-name>/
-├── train/
-│   ├── <training-object-1>/
-│   │   ├── raw_event_data/events_cam0.raw
-│   │   └── hdf5/
-│   │       ├── realsense.h5
-│   │       ├── events_cam0.h5
-│   │       └── poses.h5
-│   └── <training-object-2>/
-│       └── ...
-└── eval/
-    ├── <evaluation-object-1>/
-    │   ├── raw_event_data/events_cam0.raw
-    │   └── hdf5/
-    │       ├── realsense.h5
-    │       ├── events_cam0.h5
-    │       └── poses.h5
-    └── <evaluation-object-2>/
-        └── ...
-```
-
-The downloaded dataset uses exactly this layout. For example, the default
-`DATA_DIR="../data/Event_and_Depth"` in `training/train_mvs.sh` means that the
-script reads sequences from `data/Event_and_Depth/train/` and validates on
-sequences from `data/Event_and_Depth/eval/`. The split directory names must
-literally be `train` and `eval`. Evaluation and reconstruction instead receive
-the evaluation split itself: `DATA_DIR="../data/Event_and_Depth/eval"` in
-`training/eval.sh` and `DATA_DIR="data/Event_and_Depth/eval"` in
-`reconstruction.sh`. For another dataset, change these three values.
-
-`precompute_all.sh` accepts one or more complete sequence directories through
-`--data_dir`, or searches recursively beneath `--data_root`. A directory is
-recognized by voxel preprocessing as a raw sequence only when it contains both
-`hdf5/realsense.h5` and at least one
-`raw_event_data/events_cam*.raw` file. Therefore it is safe to run preprocessing
-on the dataset root above: it will find sequences inside both splits.
-
-The recorder-compatible file contents are described below. `N` always denotes
-the number of synchronized RealSense frames in one sequence. Unless explicitly
-marked optional, names, group paths, shapes, and index correspondence are
-required.
-
-### `raw_event_data/events_cam0.raw`
-
-A Metavision-compatible RAW event stream. Events must contain native event
-coordinates, timestamps in microseconds, and polarity. The recorder writes one
-rising-edge external-trigger event for every synchronized RealSense frame. The
-voxel preprocessor reads both events and triggers directly from this file. It
-must contain at least `N` rising-edge triggers, and both timestamp types must
-use the same event-camera clock.
-
-Additional event cameras may be supplied as `events_cam1.raw`,
-`events_cam2.raw`, and so on. The current training pipeline consumes
-`voxels_cam0.h5`.
-
-### `hdf5/realsense.h5`
-
-| Dataset | Shape and type | Use |
-| --- | --- | --- |
-| `depth` | `(N, H_d, W_d)`, `uint16` | **Required.** Raw RealSense depth units. The conversion to metres is stored separately in `camera_data/depth_scale.npz`. |
-| `rgb` | `(N, H_r, W_r, 3)`, `uint8` | Optional BGR color frames. When present, the default projection also creates `rgb_in_event_frame.h5`; omit them when only depth/event processing is needed. |
-| `t_global_ms` | `(N,)`, numeric | **Required by voxel preprocessing.** RealSense global timestamps in milliseconds. Older imported recordings may instead provide `t_sys_ns`; only the array length is used. |
-| `t_rgb_ms` | `(N,)`, numeric | Optional RGB timestamps retained for synchronization diagnostics. |
-| `frame_number` | `(N,)`, integer | Optional RealSense frame identifiers. |
-
-All frame-indexed datasets must be ordered consistently. The supplied recorder
-uses `480 x 640` depth and RGB frames, but preprocessing reads the calibrated
-resolution rather than requiring these literal dimensions.
-
-### `hdf5/events_cam0.h5`
-
-This is an optional frame-aligned preview generated by `rec_data.py`. It is
-included in the full recorder dataset but excluded from the core dataset and
-is not needed by `precompute_all.sh`. When present, it contains an `events`
-group with:
-
-| Dataset or attribute | Shape/value and use |
-| --- | --- |
-| `events/frames` | `(N, H_e, W_e)`, `uint8` event preview frames. |
-| `events/t_ev_start_us` | `(N,)`, integer start time of every aligned event window. |
-| `events/t_ev_end_us` | `(N,)`, integer end time of every aligned event window. |
-| `events/hw_trigger_times_us` | `(N,)` copy of the RAW hardware triggers. |
-| `events/alignment_offset_us` | Optional `(N,)` signed diagnostic offsets between selected event-window centers and triggers. |
-| `events.attrs["height"]`, `events.attrs["width"]` | Native event-camera dimensions as integer attributes. |
-| `events.attrs["fps"]`, `events.attrs["delta_t_us"]` | Optional preview-frame metadata written by the recorder. |
-| `events.attrs["alignment_mode"]` | Optional diagnostic value `"hw_trigger"`. |
-
-Preprocessing does not read this preview file. For an external dataset, place
-the synchronized rising-edge triggers in the RAW stream itself.
-
-### `hdf5/poses.h5`
-
-| Dataset | Required shape and type | Meaning |
-| --- | --- | --- |
-| `ee_T` | `(N, 4, 4)`, floating point | One homogeneous `T_base_from_ee` end-effector pose per synchronized frame. |
-| `nearest_offset_ms` | `(N,)`, floating point | Optional diagnostic time difference to the raw robot pose selected for that frame. |
-
-The frame at index `i` in `poses.h5` must describe the camera pose for frame
-`i` in `realsense.h5`; rising-edge trigger `i` in the RAW event stream defines
-the corresponding event window. In a normal recording, `depth`, `rgb`,
-`t_global_ms`, `ee_T`, and `nearest_offset_ms` therefore have the same leading
-length `N`. When the optional `events_cam0.h5` preview is present, its
-frame-indexed datasets also have length `N`. Preprocessing can truncate
-depth/table generation to an available minimum in some mismatch cases, but
-such a sequence is not the intended input format and should be repaired before
-training.
-
-The supplied recorder additionally creates `raw_poses.h5`, `metadata.h5`, and
-preview videos. These are useful for provenance and diagnostics but are not
-inputs to `precompute_all.sh`.
-
-### Calibration files
-
-Place the calibration in `camera_data/`. To use another
-location for the complete pipeline, update `CALIB_DIR` in
-`config.py`; the projection script's `--calib_dir` flag only
-changes the projection stage. The complete pipeline expects:
-
-| File | Required arrays |
-| --- | --- |
-| `event_intrinsics.npz` | `camera_matrix` `(3,3)`, `dist_coeffs`, and `image_size` `[W,H]` |
-| `rs_depth_intrinsics.npz` | `camera_matrix` `(3,3)` and `image_size` `[W,H]` |
-| `rs_rgb_intrinsics.npz` | `camera_matrix` `(3,3)` and `image_size` `[W,H]` |
-| `depth_scale.npz` | Scalar `scale`, converting stored `uint16` depth to metres |
-| `T_event_from_depth.npz` | Homogeneous transform `T` `(4,4)` |
-| `T_color_from_depth.npz` | Homogeneous transform `T` `(4,4)` |
-| `T_event_from_rgb.npz` | Homogeneous transform `T` `(4,4)` |
-| `T_rgb_from_ee.npz` | Homogeneous transform `T` `(4,4)` |
-
-The last two transforms are composed to obtain the event-camera pose relative
-to the robot end effector for table-prior generation, training, evaluation,
-and reconstruction.
-
-## Preprocessing
-
-The downloaded dataset already contains the preprocessing outputs. This step is
-only needed for raw data, for example after `download_dataset.py --files raw`
-or for your own recordings. From `/workspace` inside the Docker container,
-process an entire dataset with:
-
-```bash
-./data_precomputation/precompute_all.sh --data_root data/my_dataset
-```
-
-Or process one or more explicit sequences:
-
-```bash
-./data_precomputation/precompute_all.sh \
-  --data_dir data/my_dataset/train/object_01 data/my_dataset/eval/object_07
-```
-
-The script runs depth/RGB projection, table-plane prior generation, and event
-voxel generation in the required order. It does not create a new sequence
-directory; it adds the derived files to each existing sequence. After a
-successful run, the complete sequence layout is:
-
-```text
-<sequence>/
-├── raw_event_data/
-│   └── events_cam0.raw             # original input
+│   └── events_cam0.raw          raw    event stream with hardware triggers
 ├── events/
-│   └── voxels_cam0.h5              # generated
-│       ├── /voxels                 # (N, 5, 240, 320), float32 by default
-│       └── /hw_trigger_times_us     # (N,), integer microseconds
+│   └── voxels_cam0.h5           model  event voxel grid per frame
 └── hdf5/
-    ├── realsense.h5                 # original input
-    ├── events_cam0.h5               # optional recorder preview; not in core_dataset
-    ├── poses.h5                     # original input
-    ├── depth_in_event_frame.h5      # generated: /depth, (N,240,320), float32 metres
-    ├── rgb_in_event_frame.h5        # generated if RGB exists: /rgb, (N,240,320,3), uint8
-    └── table_plane.h5               # generated: /table_plane, (N,240,320), float32 [0,1]
+    ├── realsense.h5             raw    RealSense depth and RGB frames
+    ├── poses.h5                 both   robot end-effector pose per frame
+    ├── depth_in_event_frame.h5  model  ground-truth depth in the event-camera frame
+    ├── table_plane.h5           model  table-plane depth prior
+    └── rgb_in_event_frame.h5    other  RGB in the event-camera frame (visualization only)
 ```
 
-All spatial products use the canonical native center crop to `720 x 960`
-followed by resizing to `240 x 320`. `precompute_all.sh` overwrites derived
-files. Its `--project`, `--table`, and `--voxel` section markers can be used to
-forward stage-specific options; run each underlying script with `--help` for
-the available settings.
+Files marked *model* are the precomputed model inputs (`--files precomputed`),
+files marked *raw* are the inputs of the preprocessing (`--files raw`), and
+`poses.h5` belongs to both. A sequence can be used for training, evaluation,
+and reconstruction once its four model inputs exist.
 
-A sequence is ready for training only when these four exact paths exist:
+**All frame-indexed arrays of a sequence share the same frame index:** index
+`i` refers to the same instant and camera pose in every file, and each file
+holds the same number of frames `N` (for example 1,257 for sequence 20).
+Consecutive frames are 1/30 s apart.
 
-```text
-<sequence>/events/voxels_cam0.h5
-<sequence>/hdf5/depth_in_event_frame.h5
-<sequence>/hdf5/poses.h5
-<sequence>/hdf5/table_plane.h5
-```
+All image-like arrays derived from the event camera share one image geometry:
+the native 1280 × 720 event-camera image is center-cropped to 960 × 720 and
+then resized to **320 × 240** (width × height). The camera intrinsics are
+transformed in the same way (`helpers.transform_intrinsics`), and each of these
+files records the transform in its `intrinsics_transform` attribute
+(`"center_crop_resize"`).
 
-The model loader uses the dataset names `/voxels`, `/depth`, `/ee_T`, and
-`/table_plane` inside those files. `rgb_in_event_frame.h5` is useful for
-visualization but is not a model input. Frame index `i` must refer to the same
-instant and camera pose in all four model inputs.
+### File contents
 
-### Extracting distributable datasets
+#### `events/voxels_cam0.h5`: event voxel grids
 
-To extract both dataset variants from the default `data/new_2` source, run:
+| Dataset | Shape and type | Contents |
+| --- | --- | --- |
+| `voxels` | `(N, 5, 240, 320)`, `float16` | Event voxel grid of every frame. |
+| `hw_trigger_times_us` | `(N,)`, `int64` | Hardware-trigger timestamp of every frame in event-camera microseconds. |
+
+The events of frame `i` are taken from a window of one frame period
+(about 33 ms) centered on trigger `i`, so that the middle bin is aligned with
+the RealSense frame. Each event contributes its polarity (+1 or −1) to the two
+nearest of the five temporal bins (bilinear in time). The non-zero entries of
+each grid are then standardized to zero mean and unit variance; empty voxels
+stay zero. The attributes of `voxels` store the native, crop, and output
+resolutions (`native_h`/`native_w`, `crop_h`/`crop_w`, `resize_h`/`resize_w`),
+`normalized`, and `intrinsics_transform`.
+
+#### `hdf5/depth_in_event_frame.h5`: ground-truth depth
+
+| Dataset | Shape and type | Contents |
+| --- | --- | --- |
+| `depth` | `(N, 240, 320)`, `float32`, gzip | Depth along the event camera's optical axis in metres. `0` marks pixels without a measurement. |
+
+The RealSense depth is unprojected, transformed into the event-camera frame,
+projected with the event-camera intrinsics and distortion, and scattered onto
+the event image grid, with corrections for depth bleeding at edges and for
+small holes. Values cover the whole visible scene, beyond 1 m; training and
+evaluation use the range 0.05–0.7 m (`DEPTH_MIN` and `D_MAX` in `config.py`).
+
+#### `hdf5/table_plane.h5`: table-plane prior
+
+| Dataset | Shape and type | Contents |
+| --- | --- | --- |
+| `table_plane` | `(N, 240, 320)`, `float32`, gzip | Depth of the horizontal table plane along every pixel ray, normalized as `(depth − 0.05) / (0.7 − 0.05)` and clipped to [0, 1]. |
+
+The plane lies at `z = −0.02 m` in the robot base frame (attribute
+`table_z_m`); the file also stores `depth_min`, `depth_max`, and
+`intrinsics_transform`. The prior depends only on the camera pose and is the
+second model input besides the events.
+
+#### `hdf5/poses.h5`: camera poses
+
+| Dataset | Shape and type | Contents |
+| --- | --- | --- |
+| `ee_T` | `(N, 4, 4)`, `float64` | Homogeneous end-effector pose `T_base_from_ee` of every frame, in metres, in the robot base frame. |
+| `nearest_offset_ms` | `(N,)`, `float64` | Time difference to the robot pose sample assigned to the frame (diagnostic). |
+
+The robot base frame serves as the world frame. The event-camera pose of frame
+`i` is `T_base_from_event = ee_T[i] @ inv(T_event_from_rgb @ T_rgb_from_ee)`,
+using the hand-eye calibration in `camera_data/`
+(`helpers.load_event_calibration`).
+
+#### `hdf5/realsense.h5`: RealSense recording
+
+| Dataset | Shape and type | Contents |
+| --- | --- | --- |
+| `depth` | `(N, 480, 640)`, `uint16` | Raw depth; multiply by the scale in `camera_data/depth_scale.npz` to obtain metres. |
+| `rgb` | `(N, 480, 640, 3)`, `uint8` | Color frames in BGR channel order. |
+| `t_global_ms` | `(N,)`, `float64` | RealSense global timestamps in milliseconds. |
+| `t_rgb_ms` | `(N,)`, `float64` | Color-frame timestamps in milliseconds. |
+| `frame_number` | `(N,)`, `int64` | RealSense frame numbers. |
+
+#### `hdf5/rgb_in_event_frame.h5`: RGB in the event-camera frame
+
+| Dataset | Shape and type | Contents |
+| --- | --- | --- |
+| `rgb` | `(N, 240, 320, 3)`, `uint8`, gzip | RealSense color projected into the event-camera frame together with the depth; pixels without a sample are black. |
+
+The light version does not use this file; it is useful for visualization.
+
+#### `raw_event_data/events_cam0.raw`: raw events
+
+The raw event stream of the IDS UE-39B0XCP-E camera (Sony IMX636 sensor,
+1280 × 720) in Prophesee EVT 3.0 format, readable with the Metavision SDK.
+Besides the events (pixel coordinates, polarity, and microsecond timestamps),
+it contains one rising-edge external-trigger event per RealSense frame, which
+defines the frame alignment of the voxel grids. Some sequences also include a
+`.tmp_index` file, a cache that the Metavision SDK regenerates automatically;
+the download script skips these.
+
+### Calibration
+
+`camera_data/` contains the calibration of the recording setup, which applies
+to every sequence of the dataset:
+
+| File | Contents |
+| --- | --- |
+| `event_intrinsics.npz` | Event camera: `camera_matrix` (3 × 3), `dist_coeffs`, and `image_size` `[W, H]` = [1280, 720] |
+| `rs_depth_intrinsics.npz`, `rs_rgb_intrinsics.npz` | RealSense depth and color cameras: `camera_matrix` and `image_size` |
+| `depth_scale.npz` | `scale`: metres per RealSense depth unit |
+| `T_event_from_depth.npz`, `T_color_from_depth.npz`, `T_event_from_rgb.npz` | Camera-to-camera transforms `T` (4 × 4) |
+| `T_rgb_from_ee.npz` | Hand-eye calibration `T` (4 × 4) of the RealSense color camera |
+
+The remaining files are intermediate results of the calibration procedure on
+the `main` branch.
+
+## Usage
+
+The three launchers `training/train_mvs.sh`, `training/evaluation.sh`, and
+`reconstruction.sh` collect their settings in a configuration block at the top
+of the file. They work with the downloaded dataset as they are; edit the block
+to change paths, checkpoints, or parameters. Arguments given on the command
+line are appended, which is convenient for short experiments:
 
 ```bash
-python3 data_precomputation/extract_dataset.py
+./training/train_mvs.sh --epochs 5 --name smoke_test
 ```
 
-This creates `data/dataset`, containing only files written by `rec_data.py`,
-and `data/core_dataset`, containing only the three per-recording source files
-needed to run the complete precomputation pipeline:
+The scripts find the repository from their own location, so they can be
+started from any directory. All outputs are written into the mounted
+repository and remain available after the container exits.
 
-```text
-<sequence>/raw_event_data/events_cam0.raw
-<sequence>/hdf5/realsense.h5
-<sequence>/hdf5/poses.h5
-```
+### Preprocessing (optional)
 
-The core dataset deliberately excludes derived files such as
-`hdf5/events_cam0.h5`, `events/voxels_cam0.h5`,
-`hdf5/depth_in_event_frame.h5`, and `hdf5/table_plane.h5`. Both outputs
-preserve the source's split and sequence hierarchy. The extractor validates
-every sequence before copying and refuses to replace an existing output unless
-`--overwrite` is supplied. Use `--dry-run` to validate and report the required
-storage without writing files.
-
-If `data/dataset` is already correct and only the core export must be rebuilt,
-use `--core-only --overwrite`. This replaces `data/core_dataset` without
-touching `data/dataset`.
-
-On Slurm, submit the equivalent launcher:
+The downloaded dataset already contains the model inputs, so this step is only
+needed for raw data: after `download_dataset.py --files raw`, or for your own
+recordings in the format described above. It requires `raw_event_data/`,
+`hdf5/realsense.h5`, and `hdf5/poses.h5` in every sequence and the
+calibration in `camera_data/`.
 
 ```bash
-sbatch data_precomputation/extract_dataset.sbatch
+# every sequence below data/Event_and_Depth (default)
+./data_precomputation/precompute_all.sh
+
+# selected sequences
+./data_precomputation/precompute_all.sh \
+  --data_dir data/Event_and_Depth/train/21 data/Event_and_Depth/eval/20
 ```
 
-The source and both output paths can be edited near the top of the launcher or
-overridden with command-line arguments.
+The script runs depth/RGB projection (`project_realsense_to_event.py`),
+table-plane generation (`precompute_table_plane.py`), and voxel generation
+(`precompute_voxels.py`) in this order and writes their outputs into each
+sequence directory, overwriting existing ones. Stage-specific options can be
+passed after the markers `--project`, `--table`, and `--voxel`, for example
+`./data_precomputation/precompute_all.sh --voxel --float16`; run each script
+with `--help` for its settings.
 
-## Local training, evaluation, and reconstruction
+To use your own dataset, arrange the sequence directories into `train/` and
+`eval/` folders as in the published dataset and set the `DATA_DIR` values of
+the three launchers accordingly. Recordings from another setup also need their
+own calibration in `camera_data/`.
 
-The configuration blocks of the local `.sh` launchers are deliberately near the
-top of each file. Edit the dataset paths, run names, checkpoints, batch sizes,
-workers, and model options there before running them.
-
-Train the MVS-inspired model:
+### Training
 
 ```bash
 ./training/train_mvs.sh
 ```
 
-The defaults of `training/train_mvs.py` reproduce the configuration of the
-thesis model, and `train_mvs.sh` lists the tunable values (network widths,
-depth hypotheses, number of views, loss weights, and optimization settings)
-explicitly. Run `python3 training/train_mvs.py --help` for all options.
-Checkpoints are written to `training/checkpoints/mvs/`, and TensorBoard logs to
-`training/checkpoints/tensorboard/mvs/<run name>/`.
+Training uses the sequences in `data/Event_and_Depth/train/` and validates on
+`data/Event_and_Depth/eval/` after every epoch. For each target frame, the
+source views are selected by camera motion: up to four earlier and four later
+frames, each at least 5 cm away from the previously selected view.
 
-Evaluate a trained checkpoint:
+The defaults of `training/train_mvs.py` reproduce the thesis configuration,
+and `train_mvs.sh` lists the main settings explicitly so they are easy to
+change:
+
+| Group | Options |
+| --- | --- |
+| Network | `--feature_channels`, `--cost_channels`, `--reference_channels`, `--coarse/middle/fine_hourglass_levels`, `--refiner_channels`, `--refiner_max_residual_m` |
+| Depth hypotheses | `--coarse_depths`, `--middle_depths`, `--middle_window`, `--fine_depths`, `--fine_window_min`, `--fine_window_max` |
+| Source views | `--num_views`, `--pose_move_threshold`, `--allow_fewer_pose_views` / `--strict_balanced_pose_views` |
+| Loss | `--lambda_grad`, `--lambda_normal`, `--uncertainty` / `--no-uncertainty`, `--lambda_confidence`, `--confidence_abs_tolerance`, `--confidence_rel_tolerance` |
+| Optimization | `--epochs`, `--batch_size`, `--lr`, `--min_lr`, `--weight_decay`, `--ema_decay` (AdamW with a cosine schedule) |
+| Regularization | `--fpn_dropout`, `--reference_dropout`, `--hourglass_dropout`, `--drop_path_rate`, and the `--no_*` switches of the four data augmentations |
+
+Run `python3 training/train_mvs.py --help` for descriptions and defaults. After
+every epoch, the script saves the checkpoints with the best validation L1,
+p95, and worst-10 % L1 error to `training/checkpoints/mvs/` as
+`best_l1_<name>.pth`, `best_p95_<name>.pth`, and `best_l1_worst10_<name>.pth`,
+and at the end the final state as `last_<name>.pth`. Checkpoints store all
+settings, so evaluation and reconstruction rebuild the network from them
+automatically.
+
+Training writes TensorBoard logs to `training/checkpoints/tensorboard/`. With
+the container started as shown above, run
 
 ```bash
-./training/eval.sh
+tensorboard --logdir training/checkpoints/tensorboard --host 0.0.0.0 --port 6006
 ```
 
-Evaluation reports depth metrics (AbsRel, SqRel, MAE, RMSE, RMSE log, and the
-δ thresholds) for the whole frame, for the workspace cube, and for a raised
-cube that contains only the object. It writes `summary.txt`/`summary.json`,
-per-frame and per-sequence CSV files, one random qualitative frame per
-sequence (`qualitative_depth_results.png`), and the frames selected in
-`eval.sh` (`selected_frames_overview.png`) to
-`training/results/<pose-layout>_<checkpoint name>/`.
+and open <http://localhost:6006> to follow the losses and errors, sample
+predictions (`viz/`), and the relation between predicted confidence and error
+(`uncertainty/`).
 
-Create TSDF reconstructions and compare uniform with confidence-weighted
-fusion:
+### Evaluation
+
+Set `CHECKPOINT` in `training/evaluation.sh` to a trained checkpoint and run:
+
+```bash
+./training/evaluation.sh
+```
+
+Evaluation predicts depth for the evaluation sequences and compares it with
+the ground truth in three regions:
+
+- **Whole frame:** all pixels with valid ground-truth depth.
+- **Workspace cube:** pixels whose ground-truth point lies inside a 32 cm cube
+  around the object, which contains the object and the surrounding table.
+- **Raised cube:** the same cube, raised so that its bottom lies at
+  z = 1.5 cm in the robot base frame, above the table, so that it contains
+  only the object.
+
+For each region it reports AbsRel, SqRel, MAE, RMSE, RMSE log, and the
+δ < 1.25, 1.25², and 1.25³ accuracies. The results are written to
+`training/evaluation_results/`:
+
+| File | Contents |
+| --- | --- |
+| `summary.txt`, `summary.json` | Metrics over all sequences and the evaluation settings |
+| `depth_metrics_by_region.csv` | Metrics over all sequences, one row per region |
+| `per_sequence_metrics.csv`, `per_frame_metrics.csv` | Metrics of every sequence and every frame |
+| `qualitative_depth_results.png` | Events, ground truth, prediction, and error of one random frame per sequence |
+| `selected_frames_overview.png` | The same for the frames chosen with `EXAMPLE_SEQUENCES` and `EXAMPLE_FRAMES` in `evaluation.sh` |
+
+A new run overwrites these files. `--fast_mode N` evaluates only every N-th
+frame for quick checks.
+
+### Reconstruction
+
+Set `CHECKPOINT` in `reconstruction.sh` and run:
 
 ```bash
 ./reconstruction.sh
 ```
 
-For every sequence, the predicted and ground-truth depth maps of evenly spaced
-frames are fused into TSDF meshes cropped to the workspace cube. The predicted
-surface is compared with the ground-truth surface (accuracy, completeness,
-Chamfer distance, normal consistency, and precision/recall/F-score at 1, 2, and
-5 cm). Meshes and per-sequence metrics are written to
-`<data_dir>/reconstruction_output/<checkpoint name>/<sequence>/`, and the means
-over all sequences to `reconstruction_summary.txt` in the folder above.
+For every evaluation sequence, the script predicts depth for evenly spaced
+frames (`--mesh_frame_count`, 200 in `reconstruction.sh`) and fuses the
+predicted and the ground-truth depth maps into TSDF meshes cropped to the
+workspace cube. With `--compare_uncertainty_tsdf`, as in `reconstruction.sh`,
+it creates two predicted meshes, one with uniform and one with
+confidence-weighted fusion, and compares both with the ground-truth mesh:
+accuracy, completeness, Chamfer distance, normal consistency, and
+precision/recall/F-score at 1, 2, and 5 cm. `--save_largest_connected_surface`
+keeps only the largest connected surface of each mesh before computing the
+metrics.
 
-Each launcher also appends arguments supplied on the command line, making short
-temporary overrides possible without editing the file. For example:
+The results are written to
+`data/Event_and_Depth/eval/reconstruction_output/<checkpoint name>/`:
 
-```bash
-./training/train_mvs.sh --epochs 5 --name local_smoke_test
-```
+| File | Contents |
+| --- | --- |
+| `<sequence>/<sequence>_gt_mesh.obj` | Mesh fused from the ground-truth depth |
+| `<sequence>/<sequence>_uniform_mesh.obj`, `..._uncertainty_weighted_mesh.obj` | Meshes fused from the predicted depth |
+| `<sequence>/reconstruction_metrics.json`, `.txt` | Surface metrics of the sequence |
+| `reconstruction_summary.json`, `.txt` | Means over all sequences and the difference between the two fusion variants |
+| `chamfer_by_object.png` | Chamfer distance of every sequence |
 
-The scripts assume they are already running inside the main Docker image. They
-resolve the repository location from their own path, so they can be invoked
-from any working directory. Training outputs, evaluation reports, and
-reconstruction meshes are written into the mounted repository and therefore
-remain available after the container exits.
+The meshes can be inspected with any mesh viewer, for example MeshLab.

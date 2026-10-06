@@ -9,7 +9,7 @@ training/checkpoints/
 !data_precomputation/extract_dataset.sbatch
 **/*.sif
 **/*.def
-training/results
+training/evaluation_results/
 instructions
 .vscode
 **/viz_and_tests

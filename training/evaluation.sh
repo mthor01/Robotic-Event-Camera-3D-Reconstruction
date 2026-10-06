@@ -10,7 +10,7 @@ cd "$SCRIPT_DIR"
 # Configuration: edit paths, examples, and resource-related settings.
 # ---------------------------------------------------------------------------
 DATA_DIR="../data/Event_and_Depth/eval"
-CHECKPOINT="checkpoints/mvs/best_l1_best_run_feat_pyramid_128_32_no_1x1.pth"
+CHECKPOINT="checkpoints/mvs/MVS.pth"
 WORKERS=8
 BATCH_SIZE=15
 
@@ -27,7 +27,7 @@ ARGS=(
     --data_dir "$DATA_DIR"
     --workers "$WORKERS"
     --batch_size "$BATCH_SIZE"
-    --fast_mode 1
+    --fast_mode 100
     --example_sequence "${EXAMPLE_SEQUENCES[@]}"
     --example_frame "${EXAMPLE_FRAMES[@]}"
     --allow_unbalanced_pose_views

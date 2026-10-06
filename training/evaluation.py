@@ -9,7 +9,7 @@ Example:
 The data directory may be either a folder containing multiple sequence
 folders or one sequence folder. Depth metrics are reported for the whole
 frame, the workspace cube, and a raised cube that excludes the table. Results
-are written to results/<pose-layout>_<checkpoint-stem>/.
+are written to training/evaluation_results/.
 """
 
 from __future__ import annotations
@@ -191,15 +191,6 @@ def _depth_region_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
         }
         for region in DEPTH_REGION_LABELS
     ]
-
-
-def _pose_layout_directory_indicator(allow_unbalanced: bool) -> str:
-    """Return the filename-safe prefix describing the evaluation policy."""
-    return (
-        "unbalanced_pose_views_allowed"
-        if allow_unbalanced
-        else "unbalanced_pose_views_disallowed"
-    )
 
 
 def _write_summary_text(path: Path, summary: dict[str, Any]) -> None:
@@ -640,10 +631,7 @@ def _evaluate_checkpoint(args: argparse.Namespace, device: torch.device) -> None
     for sequence_name, frame_index in selected_example_requests:
         selected_frames_by_sequence.setdefault(sequence_name, []).append(frame_index)
 
-    output_dir = args.results_folder / (
-        f"{_pose_layout_directory_indicator(allow_unbalanced_pose_views)}_"
-        f"{checkpoint_path.stem}"
-    )
+    output_dir = args.results_folder
     output_dir.mkdir(parents=True, exist_ok=True)
 
     calib = load_event_calibration(_CAMERA_DATA_DIR)
@@ -913,11 +901,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--results_folder",
         type=Path,
-        default=Path("results"),
-        help=(
-            "Root output directory. Results are written to a policy-prefixed "
-            "subdirectory named after the checkpoint."
-        ),
+        default=_REPO_DIR / "training" / "evaluation_results",
+        help="Output directory; existing result files in it are overwritten.",
     )
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--workers", type=int, default=4)
@@ -999,7 +984,6 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    args.results_folder.mkdir(parents=True, exist_ok=True)
     print(f"Device: {device}")
     _evaluate_checkpoint(args, device)
 
