@@ -100,29 +100,6 @@ def normal_loss(
     return ((1.0 - cosine) * mask).sum() / mask.sum().clamp_min(1.0)
 
 
-def combined_depth_loss(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-    mask: torch.Tensor,
-    K: torch.Tensor | None = None,
-    lambda_grad: float = 0.5,
-    lambda_normal: float = 0.1,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    charbonnier = charbonnier_loss(prediction, target, mask)
-    gradient = gradient_loss(prediction, target, mask)
-    total = charbonnier + lambda_grad * gradient
-    normal_value = 0.0
-    if K is not None:
-        normal = normal_loss(prediction, target, mask, K)
-        total = total + lambda_normal * normal
-        normal_value = normal.item()
-    return total, {
-        "charb": charbonnier.item(),
-        "grad": gradient.item(),
-        "normal": normal_value,
-    }
-
-
 def l1_metres(
     prediction: torch.Tensor, target_m: torch.Tensor, mask: torch.Tensor
 ) -> torch.Tensor:

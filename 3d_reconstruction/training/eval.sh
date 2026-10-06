@@ -27,8 +27,6 @@ ARGS=(
     --data_dir "$DATA_DIR"
     --workers "$WORKERS"
     --batch_size "$BATCH_SIZE"
-    --spatial_mask_offset_max 0.02
-    --spatial_mask_offset_steps 9
     --fast_mode 1
     --example_sequence "${EXAMPLE_SEQUENCES[@]}"
     --example_frame "${EXAMPLE_FRAMES[@]}"

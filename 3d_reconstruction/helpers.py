@@ -117,19 +117,6 @@ def resolve_path(path: str | Path, base_dir: Path) -> Path:
     return path if path.is_absolute() else (base_dir / path).resolve()
 
 
-# Plotting
-
-def set_3d_axes_equal(axes) -> None:
-    """Set equal data scale on all dimensions of a Matplotlib 3-D axes."""
-    limits = (axes.get_xlim3d(), axes.get_ylim3d(), axes.get_zlim3d())
-    ranges = [abs(upper - lower) for lower, upper in limits]
-    centers = [(lower + upper) * 0.5 for lower, upper in limits]
-    radius = max(ranges) * 0.5
-    axes.set_xlim3d(centers[0] - radius, centers[0] + radius)
-    axes.set_ylim3d(centers[1] - radius, centers[1] + radius)
-    axes.set_zlim3d(centers[2] - radius, centers[2] + radius)
-
-
 # Training
 
 class ModelEMA:
@@ -213,43 +200,7 @@ def depth_cube_mask(
     return mask
 
 
-def depth_cube_masks_for_bottom_offsets(
-    depth_m: np.ndarray,
-    T_cam_from_world: np.ndarray,
-    K: np.ndarray,
-    target_x: float,
-    target_y: float,
-    cube_half_side: float,
-    bottom_z_offsets_m: np.ndarray,
-) -> list[np.ndarray]:
-    """Generate depth masks for cubes whose lower Z planes vary by offset."""
-    depth = np.asarray(depth_m)
-    points_world, ys, xs = depth_to_world_points(depth, T_cam_from_world, K)
-    masks = [np.zeros(depth.shape, dtype=bool) for _ in bottom_z_offsets_m]
-    for mask, bottom_z in zip(masks, bottom_z_offsets_m):
-        center = np.array(
-            [target_x, target_y, float(bottom_z) + cube_half_side],
-            dtype=np.float64,
-        )
-        if len(points_world):
-            inside = points_in_cube(points_world, center, cube_half_side)
-            mask[ys[inside], xs[inside]] = True
-    return masks
-
-
 # Multiview source selection
-
-def fixed_source_offsets(num_views: int, view_interval: int) -> list[int]:
-    """Return alternating past/future offsets for fixed-interval view selection."""
-    offsets: list[int] = []
-    distance = 1
-    while len(offsets) < num_views - 1:
-        offsets.append(-distance * view_interval)
-        if len(offsets) < num_views - 1:
-            offsets.append(distance * view_interval)
-        distance += 1
-    return offsets
-
 
 def pose_neighbours(
     camera_centers: np.ndarray,
@@ -318,23 +269,3 @@ def build_pose_view_ids(
     return view_ids, np.asarray(valid, dtype=np.int64)
 
 
-def pose_layout_counts(view_ids: dict[int, list[int]]) -> dict[str, int]:
-    """Count balanced, asymmetric, and fully one-sided target tuples."""
-    counts = {
-        "balanced": 0,
-        "asymmetric": 0,
-        "one_sided": 0,
-        "reference_only": 0,
-    }
-    for target_idx, selected in view_ids.items():
-        before = sum(0 <= source_idx < target_idx for source_idx in selected[1:])
-        after = sum(source_idx > target_idx for source_idx in selected[1:])
-        if before == 0 and after == 0:
-            counts["reference_only"] += 1
-        elif before == after:
-            counts["balanced"] += 1
-        elif before == 0 or after == 0:
-            counts["one_sided"] += 1
-        else:
-            counts["asymmetric"] += 1
-    return counts

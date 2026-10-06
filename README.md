@@ -8,7 +8,9 @@ model, and reconstruct meshes through TSDF fusion.
 The [`main` branch](https://github.com/mthor01/robot_and_record/tree/main)
 contains the complete project, including synchronized data recording, camera
 calibration, Franka robot control, the U-Net baselines and model comparisons,
-and the visualization and diagnostic tools.
+the architecture and training variants explored during development, additional
+evaluation and reconstruction analyses, and the visualization and diagnostic
+tools.
 
 **[Read the master's thesis (PDF)](https://github.com/mthor01/robot_and_record/blob/main/docs/Masters_Thesis_github.pdf)**
 
@@ -118,7 +120,7 @@ produce coherent surfaces after fusion.
 | `3d_reconstruction/camera_data/` | Camera intrinsics, extrinsics, depth scale, and recorded end-effector poses for the original hardware setup. |
 | `3d_reconstruction/data_precomputation/` | Scripts that project depth into event-camera geometry, create table priors, and build event voxel grids. |
 | `3d_reconstruction/training/` | MVS depth network and training loop, evaluation, losses, and TensorBoard helpers. |
-| `3d_reconstruction/reconstruction.py` | Depth prediction and TSDF reconstruction with surface and rendered-depth metrics. |
+| `3d_reconstruction/reconstruction.py` | Depth prediction, (confidence-weighted) TSDF reconstruction, and surface metrics. |
 | `docker_installation/training_and_reconstruction/` | Dockerfile for the preprocessing, training, and reconstruction environment. |
 
 ## Requirements
@@ -430,11 +432,26 @@ Train the MVS-inspired model:
 ./training/train_mvs.sh
 ```
 
+The defaults of `training/train_mvs.py` reproduce the configuration of the
+thesis model, and `train_mvs.sh` lists the tunable values (network widths,
+depth hypotheses, number of views, loss weights, and optimization settings)
+explicitly. Run `python3 training/train_mvs.py --help` for all options.
+Checkpoints are written to `training/checkpoints/mvs/`, and TensorBoard logs to
+`training/checkpoints/tensorboard/mvs/<run name>/`.
+
 Evaluate a trained checkpoint:
 
 ```bash
 ./training/eval.sh
 ```
+
+Evaluation reports depth metrics (AbsRel, SqRel, MAE, RMSE, RMSE log, and the
+δ thresholds) for the whole frame, for the workspace cube, and for a raised
+cube that contains only the object. It writes `summary.txt`/`summary.json`,
+per-frame and per-sequence CSV files, one random qualitative frame per
+sequence (`qualitative_depth_results.png`), and the frames selected in
+`eval.sh` (`selected_frames_overview.png`) to
+`training/results/<pose-layout>_<checkpoint name>/`.
 
 Create TSDF reconstructions and compare uniform with confidence-weighted
 fusion:
@@ -442,6 +459,14 @@ fusion:
 ```bash
 ./reconstruction.sh
 ```
+
+For every sequence, the predicted and ground-truth depth maps of evenly spaced
+frames are fused into TSDF meshes cropped to the workspace cube. The predicted
+surface is compared with the ground-truth surface (accuracy, completeness,
+Chamfer distance, normal consistency, and precision/recall/F-score at 1, 2, and
+5 cm). Meshes and per-sequence metrics are written to
+`<data_dir>/reconstruction_output/<checkpoint name>/<sequence>/`, and the means
+over all sequences to `reconstruction_summary.txt` in the folder above.
 
 Each launcher also appends arguments supplied on the command line, making short
 temporary overrides possible without editing the file. For example:
