@@ -11,16 +11,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip python3-dev \
  && rm -rf /var/lib/apt/lists/*
 
-# RealSense repository + packages
-RUN mkdir -p /etc/apt/keyrings && \
-    curl -sSf https://librealsense.realsenseai.com/Debian/librealsenseai.asc | gpg --dearmor > /etc/apt/keyrings/librealsenseai.gpg && \
-    echo "deb [signed-by=/etc/apt/keyrings/librealsenseai.gpg] https://librealsense.realsenseai.com/Debian/apt-repo $(lsb_release -cs) main" > /etc/apt/sources.list.d/librealsense.list
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    librealsense2-utils \
-    librealsense2-dev \
- && rm -rf /var/lib/apt/lists/*
-
 # 1) Add Prophesee APT repo list (this is your downloaded file)
 COPY metavision.list /etc/apt/sources.list.d/metavision.list
 
@@ -46,14 +36,13 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 
+# open3d is pinned because 0.20.0 extracts empty meshes from the legacy
+# ScalableTSDFVolume used by reconstruction.py.
 RUN python3 -m pip install --upgrade pip \
  && python3 -m pip install \
     numpy \
     h5py \
     opencv-python \
-    pyrealsense2 \
-    pyzmq \
-    msgpack \
     torch \
     torchvision \
     pillow \
@@ -61,8 +50,8 @@ RUN python3 -m pip install --upgrade pip \
     tqdm \
     matplotlib \
     seaborn \
-    scipy\
-    open3d
+    scipy \
+    open3d==0.19.0
 
 
 # Optional: HDF5 plugin path for Ubuntu 22.04 (doc gives this exact path)

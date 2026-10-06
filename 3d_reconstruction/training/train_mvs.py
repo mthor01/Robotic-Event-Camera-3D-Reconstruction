@@ -2,8 +2,7 @@
 """
 train_mvs.py - Three-stage multi-view event-depth training with a table-plane prior.
 
-This is the multi-view counterpart to train_unet.py. Each sample uses a
-target event voxel frame plus neighbouring source frames:
+Each sample uses a target event voxel frame plus neighbouring source frames:
 
     [x_i | table_plane_channel_i] for i in target + source frames
 
@@ -71,7 +70,6 @@ from helpers import (
     fixed_source_offsets,
     load_event_calibration,
     pose_layout_counts,
-    pose_channels_from_base_event,
     set_3d_axes_equal,
     transform_intrinsics,
 )
@@ -244,7 +242,6 @@ class MultiViewTableDataset(Dataset):
         coarse_depths: int = 32,
         linear_depth_candidates: bool = False,
         fill_invalid: bool = False,
-        pose_channels: bool = False,
         split_indices: np.ndarray | None = None,
         aug: MultiViewAugConfig | None = None,
     ):
@@ -265,7 +262,6 @@ class MultiViewTableDataset(Dataset):
         self.pose_move_threshold = float(pose_move_threshold)
         self.allow_unbalanced_pose_views = bool(allow_unbalanced_pose_views)
         self.fill_invalid = fill_invalid
-        self.pose_channels = bool(pose_channels)
         self.aug = aug or MultiViewAugConfig(enabled=False)
         expected_transform = INTRINSICS_TRANSFORM
 
@@ -337,14 +333,6 @@ class MultiViewTableDataset(Dataset):
             "ij,njk->nik", calib["T_event_from_ee"], T_ee_inv
         ).astype(np.float32)
         self.cam_centers_world = camera_centers_world(self.T_cam_from_world)
-        if self.pose_channels:
-            T_base_from_event = np.linalg.inv(self.T_cam_from_world).astype(np.float32)
-            self.pose_values = np.stack(
-                [pose_channels_from_base_event(T) for T in T_base_from_event],
-                axis=0,
-            ).astype(np.float32)
-        else:
-            self.pose_values = None
 
         self.pose_view_ids: dict[int, list[int]] = {}
         if num_views == 1:
@@ -421,12 +409,7 @@ class MultiViewTableDataset(Dataset):
             tbl_t = F.interpolate(
                 tbl_t.unsqueeze(0), (h, w), mode="bilinear", align_corners=False
             ).squeeze(0)
-        channels = [vox_t, tbl_t]
-        if self.pose_channels:
-            pose_values = self.pose_values[idx]
-            pose_t = torch.from_numpy(pose_values).view(6, 1, 1).expand(-1, h, w)
-            channels.append(pose_t)
-        return torch.cat(channels, dim=0)
+        return torch.cat([vox_t, tbl_t], dim=0)
 
     @staticmethod
     def _axis_angle_to_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
@@ -2092,7 +2075,6 @@ def main() -> None:
         coarse_depths=args.coarse_depths,
         linear_depth_candidates=args.linear_depth_candidates,
         fill_invalid=args.fill_invalid,
-        pose_channels=False,
     )
     train_aug = MultiViewAugConfig(
         enabled=not args.no_augmentations,

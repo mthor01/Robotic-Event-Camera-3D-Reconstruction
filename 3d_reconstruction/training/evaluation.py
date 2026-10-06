@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate U-Net and multiview checkpoints.
+"""Evaluate an MVS checkpoint.
 
 Example:
     python3 evaluation.py \
@@ -514,49 +514,14 @@ def _build_model(
 ) -> torch.nn.Module:
     base = int(_required_metadata(metadata, "base"))
     model_arch = str(metadata.get("model_arch", "ModernMVSNet"))
-    model_cls = ModernMVSNet
-    if model_arch == "ModernMVSNet":
-        pass
-    elif model_arch == "UNet":
-        from train_unet import UNet
-
-        unet = UNet(
-            in_ch=int(_required_metadata(metadata, "in_ch", NUM_BINS + 1)),
-            base=base,
-        )
-        incompatible = unet.load_state_dict(state, strict=True)
-        if incompatible.missing_keys or incompatible.unexpected_keys:
-            raise RuntimeError(
-                f"Checkpoint architecture does not match {model_arch}: {incompatible}"
-            )
-
-        class EarlyFusionUNetEvaluationAdapter(torch.nn.Module):
-            def __init__(self, depth_model: torch.nn.Module) -> None:
-                super().__init__()
-                self.depth_model = depth_model
-
-            def forward(
-                self,
-                images: torch.Tensor,
-                camera_matrices: torch.Tensor,
-                intrinsics: torch.Tensor,
-                depth_values: torch.Tensor,
-                view_valid_mask: torch.Tensor | None = None,
-            ) -> torch.Tensor:
-                del camera_matrices, intrinsics, depth_values, view_valid_mask
-                batch, views, channels, height, width = images.shape
-                fused = images.reshape(batch, views * channels, height, width)
-                return self.depth_model(fused)
-
-        return EarlyFusionUNetEvaluationAdapter(unet).to(device).eval()
-    else:
-        raise ValueError(f"Unsupported multiview checkpoint architecture: {model_arch}")
+    if model_arch != "ModernMVSNet":
+        raise ValueError(f"Unsupported checkpoint architecture: {model_arch}")
 
     fine_window = float(_required_metadata(metadata, "fine_window", 0.08))
     fine_offset_radius = float(
         _required_metadata(metadata, "fine_offset_radius", 2.0)
     )
-    model = model_cls(
+    model = ModernMVSNet(
         in_ch=int(_required_metadata(metadata, "in_ch", NUM_BINS + 1)),
         base=base,
         feature_ch=int(_required_metadata(metadata, "feature_channels", base * 4)),
@@ -800,13 +765,6 @@ def _pose_layout_directory_indicator(allow_unbalanced: bool) -> str:
     )
 
 
-def _model_display_name(is_unet: bool, num_views: int) -> str:
-    """Return the architecture name used in plots and comparison tables."""
-    if not is_unet:
-        return "MVS"
-    return "Single-View U-Net" if num_views == 1 else "Multi-View U-Net"
-
-
 def _write_summary_text(path: Path, summary: dict[str, Any]) -> None:
     boundary = summary["boundary_metrics"]
     masked_boundary = summary["boundary_metrics_spatial_mask_plus_1cm"]
@@ -1021,34 +979,6 @@ def _set_inverse_percentage_axis(axis: Any, values: list[float]) -> None:
     axis.set_ylim(0.0, 100.0 if upper >= 100.0 else upper)
 
 
-def _equal_count_mean_curve(
-    rows: list[dict[str, Any]],
-    x_field: str,
-    y_field: str = "mae_m",
-    bins: int = 12,
-    y_scale: float = 1.0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return sorted equal-count-bin means without exposing frame scatter."""
-    if not rows or x_field not in rows[0] or y_field not in rows[0]:
-        return np.empty(0), np.empty(0)
-    x = np.asarray([row.get(x_field, math.nan) for row in rows], dtype=np.float64)
-    y = np.asarray([row.get(y_field, math.nan) for row in rows], dtype=np.float64)
-    finite = np.isfinite(x) & np.isfinite(y)
-    x = x[finite]
-    y = y[finite] * y_scale
-    if x.size == 0:
-        return np.empty(0), np.empty(0)
-    groups = [
-        indices
-        for indices in np.array_split(np.argsort(x), min(bins, x.size))
-        if indices.size
-    ]
-    mean_x = np.asarray([float(x[indices].mean()) for indices in groups])
-    mean_y = np.asarray([float(y[indices].mean()) for indices in groups])
-    order = np.argsort(mean_x)
-    return mean_x[order], mean_y[order]
-
-
 def _fixed_width_mean_curve(
     x: np.ndarray,
     y: np.ndarray,
@@ -1071,21 +1001,6 @@ def _fixed_width_mean_curve(
         [float(y[bin_indices == index].mean()) for index in populated_bins]
     )
     return centers, means
-
-
-def _fixed_width_mean_curve_from_rows(
-    rows: list[dict[str, Any]],
-    x_field: str,
-    interval: float,
-    y_field: str = "mae_m",
-    y_scale: float = 1.0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return a fixed-width mean curve from per-frame metric rows."""
-    if not rows or x_field not in rows[0] or y_field not in rows[0]:
-        return np.empty(0), np.empty(0)
-    x = np.asarray([row.get(x_field, math.nan) for row in rows], dtype=np.float64)
-    y = np.asarray([row.get(y_field, math.nan) for row in rows], dtype=np.float64)
-    return _fixed_width_mean_curve(x, y * y_scale, interval)
 
 
 def _column_mapping(rows: list[dict[str, Any]]) -> dict[str, list[Any]]:
@@ -1714,650 +1629,6 @@ def _plot_results(
             "target_distance_vs_error",
             "upper left",
         )
-
-
-def _write_comparison_results(
-    output_dir: Path,
-    runs: list[dict[str, Any]],
-) -> None:
-    """Write direct, aggregate plots for a multi-checkpoint evaluation run."""
-    if len(runs) < 2:
-        return
-    output_dir.mkdir(parents=True, exist_ok=True)
-    plt, sns = _setup_seaborn_plotting()
-    palette = sns.color_palette("deep", n_colors=len(runs))
-
-    # Persist a compact machine-readable comparison alongside the plots.
-    comparison_rows = []
-    for run in runs:
-        summary = run["summary"]
-        depth = summary["depth_metrics"]
-        boundary = summary["boundary_metrics"]
-        masked_boundary = summary["boundary_metrics_spatial_mask_plus_1cm"]
-        mvc = summary["multiview_consistency"]
-        performance = summary["performance"]
-        comparison_rows.append(
-            {
-                "model": run["label"],
-                **{name: depth[name] for name in DEPTH_METRIC_NAMES},
-                **{
-                    f"{region}_{name}": metrics[name]
-                    for region, metrics in summary["depth_metrics_by_region"].items()
-                    for name in ("valid_pixels", *DEPTH_METRIC_NAMES)
-                },
-                "boundary_mae_m": boundary["boundary"]["mae_m"],
-                "non_boundary_mae_m": boundary["non_boundary"]["mae_m"],
-                "boundary_spatial_mask_plus_1cm_mae_m": masked_boundary[
-                    "boundary"
-                ]["mae_m"],
-                "non_boundary_spatial_mask_plus_1cm_mae_m": masked_boundary[
-                    "non_boundary"
-                ]["mae_m"],
-                "mvc_mae_m": mvc["mae_m"],
-                "mvc_rmse_m": mvc["rmse_m"],
-                "mvc_within_1cm": mvc["within_1cm"],
-                "mvc_within_2cm": mvc["within_2cm"],
-                "mvc_within_5cm": mvc["within_5cm"],
-                "model_inference_ms_per_frame": performance[
-                    "model_inference_ms_per_frame"
-                ],
-                "model_inference_fps": performance["model_inference_fps"],
-            }
-        )
-    _write_csv(output_dir / "comparison_summary.csv", comparison_rows)
-    with (output_dir / "comparison_summary.json").open(
-        "w", encoding="utf-8"
-    ) as handle:
-        json.dump(_finite_or_none(comparison_rows), handle, indent=2)
-        handle.write("\n")
-
-    def grouped_bar(
-        axis: Any,
-        rows: list[dict[str, Any]],
-        x: str,
-        y: str,
-        title: str,
-        ylabel: str,
-        percentage_values: list[float] | None = None,
-    ) -> None:
-        sns.barplot(
-            data=_column_mapping(rows),
-            x=x,
-            y=y,
-            hue="model",
-            hue_order=[run["label"] for run in runs],
-            palette=palette,
-            ax=axis,
-        )
-        axis.set_title(title)
-        axis.set_ylabel(ylabel)
-        if percentage_values is not None:
-            _set_inverse_percentage_axis(axis, percentage_values)
-        axis.legend(
-            title="Model",
-            fontsize=LEGEND_FONT_SIZE,
-            title_fontsize=LEGEND_TITLE_FONT_SIZE,
-        )
-
-    # Depth metrics for each evaluation domain. Models are adjacent by metric.
-    error_names = ["abs_rel", "sq_rel_m", "mae_m", "rmse_m", "rmse_log"]
-    delta_specs = [
-        ("delta_1", r"$\delta<1.25$"),
-        ("delta_2", r"$\delta<1.25^2$"),
-        ("delta_3", r"$\delta<1.25^3$"),
-    ]
-    for domain_slug, domain_label, _, _ in PER_SEQUENCE_REGION_SPECS:
-        region_key = DOMAIN_SUMMARY_REGION_KEYS[domain_slug]
-        error_rows = [
-            {
-                "metric": metric,
-                "value": float(
-                    run["summary"]["depth_metrics_by_region"][region_key][metric]
-                ),
-                "model": run["label"],
-            }
-            for metric in error_names
-            for run in runs
-        ]
-        delta_rows = [
-            {
-                "threshold": label,
-                "failure_percentage": 100.0
-                * (
-                    1.0
-                    - float(
-                        run["summary"]["depth_metrics_by_region"][region_key][
-                            field
-                        ]
-                    )
-                ),
-                "model": run["label"],
-            }
-            for field, label in delta_specs
-            for run in runs
-        ]
-        figure, axes = plt.subplots(1, 2, figsize=(15, 5.2))
-        grouped_bar(
-            axes[0],
-            error_rows,
-            "metric",
-            "value",
-            f"Depth Errors: {domain_label}",
-            "Error",
-        )
-        axes[0].tick_params(axis="x", rotation=30)
-        grouped_bar(
-            axes[1],
-            delta_rows,
-            "threshold",
-            "failure_percentage",
-            f"Threshold Failure Rate: {domain_label}",
-            "Pixels Outside Threshold [%]",
-            [row["failure_percentage"] for row in delta_rows],
-        )
-        figure.tight_layout()
-        figure.savefig(
-            output_dir / f"depth_metrics_{domain_slug}.png", dpi=180
-        )
-        plt.close(figure)
-
-    region_error_rows = [
-        {
-            "region": DEPTH_REGION_LABELS[region],
-            "metric": metric,
-            "error_cm": 100.0
-            * float(run["summary"]["depth_metrics_by_region"][region][field]),
-            "model": run["label"],
-        }
-        for region in DEPTH_REGION_LABELS
-        for metric, field in (("MAE", "mae_m"), ("RMSE", "rmse_m"))
-        for run in runs
-    ]
-    figure, axes = plt.subplots(1, 2, figsize=(16, 5.8), sharey=True)
-    for axis, metric in zip(axes, ("MAE", "RMSE")):
-        metric_rows = [row for row in region_error_rows if row["metric"] == metric]
-        grouped_bar(
-            axis,
-            metric_rows,
-            "region",
-            "error_cm",
-            f"{metric} by Evaluation Region",
-            "Depth Error [cm]",
-        )
-        axis.set_xlabel("")
-        axis.tick_params(axis="x", rotation=12)
-    figure.tight_layout()
-    figure.savefig(output_dir / "mae_rmse_by_region.png", dpi=180)
-    plt.close(figure)
-
-    mae_region_rows = [
-        row for row in region_error_rows if row["metric"] == "MAE"
-    ]
-    figure, axis = plt.subplots(figsize=(13, 6.2))
-    sns.barplot(
-        data=_column_mapping(mae_region_rows),
-        x="region",
-        y="error_cm",
-        hue="model",
-        order=list(DEPTH_REGION_LABELS.values()),
-        hue_order=[run["label"] for run in runs],
-        ax=axis,
-        palette=palette,
-    )
-    axis.set_xlabel("")
-    axis.set_ylabel("MAE [cm]")
-    axis.set_title("MAE by Model and Evaluation Region")
-    axis.tick_params(axis="x", rotation=0)
-    axis.legend(
-        title="Model",
-        loc="upper left",
-        fontsize=DIAGNOSTIC_LEGEND_FONT_SIZE,
-        title_fontsize=DIAGNOSTIC_LEGEND_TITLE_FONT_SIZE,
-    )
-    figure.tight_layout()
-    figure.savefig(output_dir / "mae_by_region.png", dpi=180)
-    plt.close(figure)
-
-    boundary_rows = []
-    mvc_rows = []
-    for run in runs:
-        label = run["label"]
-        boundary = run["summary"]["boundary_metrics"]
-        mvc = run["summary"]["multiview_consistency"]
-        boundary_rows.extend(
-            [
-                {
-                    "region": "Boundary",
-                    "mae_cm": 100.0 * float(boundary["boundary"]["mae_m"]),
-                    "model": label,
-                },
-                {
-                    "region": "Non-Boundary",
-                    "mae_cm": 100.0 * float(boundary["non_boundary"]["mae_m"]),
-                    "model": label,
-                },
-            ]
-        )
-        mvc_rows.extend(
-            [
-                {
-                    "threshold": threshold,
-                    "percentage": 100.0 * (1.0 - float(mvc[field])),
-                    "model": label,
-                }
-                for field, threshold in (
-                    ("within_1cm", "<1 cm"),
-                    ("within_2cm", "<2 cm"),
-                    ("within_5cm", "<5 cm"),
-                )
-            ]
-        )
-    figure, axes = plt.subplots(1, 2, figsize=(15, 5.2))
-    grouped_bar(
-        axes[0],
-        boundary_rows,
-        "region",
-        "mae_cm",
-        "Depth-Boundary Error",
-        "MAE [cm]",
-    )
-    if any(math.isfinite(row["percentage"]) for row in mvc_rows):
-        grouped_bar(
-            axes[1],
-            mvc_rows,
-            "threshold",
-            "percentage",
-            "Multi-View Inconsistency Thresholds",
-            "Inconsistent Correspondences [%]",
-            [row["percentage"] for row in mvc_rows],
-        )
-    else:
-        axes[1].set_axis_off()
-        axes[1].text(
-            0.5,
-            0.5,
-            "Multi-view consistency disabled\n(--no_mvc)",
-            transform=axes[1].transAxes,
-            ha="center",
-            va="center",
-        )
-    figure.tight_layout()
-    figure.savefig(output_dir / "boundary_and_consistency.png", dpi=180)
-    plt.close(figure)
-
-    for domain_slug, _, _, _ in PER_SEQUENCE_REGION_SPECS:
-        domain_boundary_rows = []
-        for run in runs:
-            label = run["label"]
-            domain_boundary = run["summary"]["boundary_metrics_by_region"][
-                domain_slug
-            ]
-            domain_boundary_rows.extend(
-                [
-                    {
-                        "region": "Boundary",
-                        "mae_cm": 100.0
-                        * float(domain_boundary["boundary"]["mae_m"]),
-                        "model": label,
-                    },
-                    {
-                        "region": "Non-Boundary",
-                        "mae_cm": 100.0
-                        * float(domain_boundary["non_boundary"]["mae_m"]),
-                        "model": label,
-                    },
-                ]
-            )
-        figure, axis = plt.subplots(figsize=(max(8.0, len(runs) * 2.5), 5.2))
-        grouped_bar(
-            axis,
-            domain_boundary_rows,
-            "region",
-            "mae_cm",
-            "",
-            "MAE [cm]",
-        )
-        axis.set_xlabel("Region")
-        figure.tight_layout()
-        figure.savefig(output_dir / f"boundary_error_{domain_slug}.png", dpi=180)
-        plt.close(figure)
-
-    # Per-sequence bars use model as hue, with MAE and RMSE in separate panels.
-    comparison_sequence_labels = _sequence_display_map(
-        [
-            str(row["sequence"])
-            for run in runs
-            for row in run["sequence_rows"]
-        ]
-    )
-    for filename_region, region_label, mae_field, rmse_field in (
-        PER_SEQUENCE_REGION_SPECS
-    ):
-        sequence_plot_rows = []
-        for run in runs:
-            for row in run["sequence_rows"]:
-                for metric, field in (
-                    ("MAE", mae_field),
-                    ("RMSE", rmse_field),
-                ):
-                    sequence_plot_rows.append(
-                        {
-                            "sequence": comparison_sequence_labels[
-                                str(row["sequence"])
-                            ],
-                            "metric": metric,
-                            "error_cm": 100.0 * float(row[field]),
-                            "model": run["label"],
-                        }
-                    )
-        if not sequence_plot_rows:
-            continue
-        figure, axes = plt.subplots(
-            2,
-            1,
-            figsize=(max(10, len(runs) * 2.5), 10),
-        )
-        for axis, metric in zip(axes, ("MAE", "RMSE")):
-            metric_rows = [
-                row
-                for row in sequence_plot_rows
-                if row["metric"] == metric
-            ]
-            grouped_bar(
-                axis,
-                metric_rows,
-                "sequence",
-                "error_cm",
-                f"{metric} per Sequence: {region_label}",
-                "Depth Error [cm]",
-            )
-            axis.tick_params(axis="x", rotation=45)
-        figure.tight_layout()
-        figure.savefig(
-            output_dir / f"error_per_sequence_{filename_region}.png",
-            dpi=180,
-        )
-        if filename_region == "whole_frame":
-            figure.savefig(output_dir / "error_per_sequence.png", dpi=180)
-        plt.close(figure)
-
-    if any(run["sequence_rows"] for run in runs):
-        figure, axes = plt.subplots(
-            len(runs),
-            1,
-            figsize=(max(10, len(runs) * 2.5), 4.5 * len(runs)),
-            squeeze=False,
-            sharey=True,
-        )
-        for run_index, (axis, run) in enumerate(zip(axes[:, 0], runs)):
-            all_domain_mae_rows = [
-                {
-                    "sequence": comparison_sequence_labels[
-                        str(row["sequence"])
-                    ].removeprefix("Sequence "),
-                    "domain": region_label,
-                    "mae_cm": 100.0 * float(row[mae_field]),
-                }
-                for row in run["sequence_rows"]
-                for _, region_label, mae_field, _ in PER_SEQUENCE_REGION_SPECS
-            ]
-            if not all_domain_mae_rows:
-                axis.set_axis_off()
-                continue
-            sns.barplot(
-                data=_column_mapping(all_domain_mae_rows),
-                x="sequence",
-                y="mae_cm",
-                hue="domain",
-                hue_order=[spec[1] for spec in PER_SEQUENCE_REGION_SPECS],
-                ax=axis,
-                palette="deep",
-            )
-            axis.tick_params(axis="x", rotation=0)
-            axis.set_xlabel("")
-            axis.set_ylabel("MAE [cm]")
-            axis.set_title(run["label"])
-            if run_index == 0:
-                axis.legend(title="Domain")
-            elif axis.get_legend() is not None:
-                axis.get_legend().remove()
-        figure.suptitle("MAE per Sequence Across Evaluation Domains")
-        figure.supxlabel("Sequence")
-        figure.tight_layout()
-        figure.savefig(
-            output_dir / "mae_per_sequence_all_domains.png",
-            dpi=180,
-        )
-        plt.close(figure)
-
-    for domain_slug, domain_label, mae_field, _ in PER_SEQUENCE_REGION_SPECS:
-        normalized_time_rows = []
-        normalized_time_curves = []
-        for run in runs:
-            centers, _sequence_curves, mean, std, recording_counts = (
-                _normalized_time_error_curves(
-                    run["frame_rows"], error_field=mae_field
-                )
-            )
-            normalized_time_curves.append((run["label"], centers, mean, std))
-            for index in np.flatnonzero(np.isfinite(mean)):
-                normalized_time_rows.append(
-                    {
-                        "model": run["label"],
-                        "normalized_time": float(centers[index]),
-                        "mean_mae_cm": float(mean[index]),
-                        "std_mae_cm": float(std[index]),
-                        "recordings": int(recording_counts[index]),
-                    }
-                )
-        if not normalized_time_rows:
-            continue
-        _write_csv(
-            output_dir / f"error_over_normalized_time_{domain_slug}.csv",
-            normalized_time_rows,
-        )
-        figure, axis = plt.subplots(figsize=(12, 7.0))
-        for color, (label, centers, mean, std) in zip(
-            palette, normalized_time_curves
-        ):
-            finite = np.isfinite(mean)
-            if not finite.any():
-                continue
-            axis.plot(
-                centers[finite],
-                mean[finite],
-                color=color,
-                linewidth=2.4,
-                label=label,
-            )
-            axis.fill_between(
-                centers[finite],
-                np.maximum(0.0, mean[finite] - std[finite]),
-                mean[finite] + std[finite],
-                color=color,
-                alpha=0.12,
-                linewidth=0,
-            )
-        axis.set_xlim(0.0, 1.0)
-        axis.set_xlabel("Normalized Recording Time")
-        axis.set_ylabel("Per-Frame MAE [cm]")
-        axis.set_title(
-            f"Depth Error Over Normalized Recording Time: {domain_label}"
-        )
-        axis.legend(
-            title="Model",
-            fontsize=DIAGNOSTIC_LEGEND_FONT_SIZE,
-            title_fontsize=DIAGNOSTIC_LEGEND_TITLE_FONT_SIZE,
-        )
-        figure.tight_layout()
-        figure.savefig(
-            output_dir / f"error_over_normalized_time_{domain_slug}.png",
-            dpi=180,
-        )
-        plt.close(figure)
-
-    def mean_line_plot(
-        filename: str,
-        panels: list[tuple[str, str, str]],
-        bins: int = 12,
-        fixed_interval: float | None = None,
-        y_scale: float = 100.0,
-        y_field: str = "mae_m",
-        ylabel: str = "Mean Per-Frame MAE [cm]",
-        legend_loc: str = "upper right",
-        legend_fontsize: int = LEGEND_FONT_SIZE,
-        legend_title_fontsize: int = LEGEND_TITLE_FONT_SIZE,
-    ) -> None:
-        n_panels = len(panels)
-        ncols = min(3, n_panels)
-        nrows = int(math.ceil(n_panels / ncols))
-        if n_panels == 1:
-            figure_size = (12, 7.5)
-        elif n_panels == 2:
-            figure_size = (16, 6.5)
-        else:
-            figure_size = (5.2 * ncols, 4.2 * nrows)
-        figure, axes = plt.subplots(
-            nrows,
-            ncols,
-            figsize=figure_size,
-            squeeze=False,
-        )
-        for axis, (field, xlabel, title) in zip(axes.flat, panels):
-            for color, run in zip(palette, runs):
-                if fixed_interval is None:
-                    x, y = _equal_count_mean_curve(
-                        run["frame_rows"],
-                        field,
-                        y_field=y_field,
-                        bins=bins,
-                        y_scale=y_scale,
-                    )
-                else:
-                    x, y = _fixed_width_mean_curve_from_rows(
-                        run["frame_rows"],
-                        field,
-                        fixed_interval,
-                        y_field=y_field,
-                        y_scale=y_scale,
-                    )
-                if x.size:
-                    axis.plot(x, y, linewidth=2.2, color=color, label=run["label"])
-            axis.set_xlabel(xlabel)
-            axis.set_ylabel(ylabel)
-            axis.set_title(title)
-            if n_panels != 1:
-                axis.legend(
-                    title="Model",
-                    loc=legend_loc,
-                    fontsize=legend_fontsize,
-                    title_fontsize=legend_title_fontsize,
-                )
-        for axis in axes.flat[n_panels:]:
-            axis.set_visible(False)
-        if n_panels == 1:
-            axes.flat[0].legend(
-                title="Model",
-                loc=legend_loc,
-                fontsize=legend_fontsize,
-                title_fontsize=legend_title_fontsize,
-                frameon=True,
-            )
-            figure.tight_layout()
-        else:
-            figure.tight_layout()
-        figure.savefig(output_dir / filename, dpi=180)
-        plt.close(figure)
-
-    # Comparison diagnostics intentionally contain only binned mean curves:
-    # no per-frame scatter and no markers on the curves.
-    for domain_slug, domain_label, mae_field, _ in PER_SEQUENCE_REGION_SPECS:
-        diagnostic_specs = (
-            (
-                "cube_event_activity_vs_error",
-                "cube_event_activity",
-                "Mean Event Activity at GT-Depth Pixels Inside Workspace Cube",
-                "Workspace-Cube Activity vs. Prediction Error",
-                500.0,
-                "upper right",
-            ),
-            (
-                "outside_cube_event_activity_vs_error",
-                "outside_cube_event_activity",
-                (
-                    "Mean Event Activity at Valid GT-Depth Pixels Outside "
-                    "Workspace Cube"
-                ),
-                "Outside-Cube Activity vs. Prediction Error",
-                500.0,
-                "upper right",
-            ),
-            (
-                "arm_speed_vs_error",
-                "arm_speed_m_s",
-                "End-Effector Translational Velocity [m/s]",
-                "Velocity vs. Depth Error",
-                0.01,
-                "upper right",
-            ),
-            (
-                "target_distance_vs_error",
-                "target_distance_m",
-                "Camera Distance to Recording Target [m]",
-                "Target Distance vs. Depth Error",
-                None,
-                "upper left",
-            ),
-        )
-        for filename_prefix, x_field, xlabel, title, fixed_interval, legend_loc in (
-            diagnostic_specs
-        ):
-            mean_line_plot(
-                f"{filename_prefix}_{domain_slug}.png",
-                [(x_field, xlabel, f"{title}: {domain_label}")],
-                bins=12,
-                fixed_interval=fixed_interval,
-                y_field=mae_field,
-                ylabel=(
-                    "MAE [cm]"
-                    if x_field
-                    in {
-                        "cube_event_activity",
-                        "outside_cube_event_activity",
-                        "arm_speed_m_s",
-                    }
-                    else f"Mean {domain_label} Per-Frame MAE [cm]"
-                ),
-                legend_loc=legend_loc,
-                legend_fontsize=DIAGNOSTIC_LEGEND_FONT_SIZE,
-                legend_title_fontsize=DIAGNOSTIC_LEGEND_TITLE_FONT_SIZE,
-            )
-
-    # Only L1 is included in the spatial-mask sweep, with models side by side.
-    offset_rows = []
-    for run in runs:
-        for row in run["summary"]["spatial_mask_z_offset_metrics"]:
-            offset_rows.append(
-                {
-                    "offset_mm": f"{1000.0 * float(row['z_offset_m']):.1f}",
-                    "l1_mm": 1000.0 * float(row["l1_m"]),
-                    "model": run["label"],
-                }
-            )
-    if offset_rows:
-        figure, axis = plt.subplots(figsize=(max(12, len(runs) * 3), 5.5))
-        grouped_bar(
-            axis,
-            offset_rows,
-            "offset_mm",
-            "l1_mm",
-            "L1 Depth Error Under Recomputed Spatial Masks",
-            "L1 Error [mm]",
-        )
-        axis.set_xlabel("Spatial-Mask Cube-Bottom Z Offset [mm]")
-        figure.tight_layout()
-        figure.savefig(output_dir / "spatial_mask_z_offset_metrics.png", dpi=180)
-        plt.close(figure)
 
 
 def _plot_worst_frames(
@@ -3245,8 +2516,7 @@ def _evaluate_checkpoint(
     checkpoint_path: Path,
     args: argparse.Namespace,
     device: torch.device,
-    comparison_label: str,
-) -> dict[str, Any]:
+) -> None:
     print(f"\nLoading checkpoint: {checkpoint_path}", flush=True)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     state, metadata = _checkpoint_state(checkpoint)
@@ -3260,17 +2530,11 @@ def _evaluate_checkpoint(
     model = _build_model(metadata, state, device)
 
     model_arch = str(metadata.get("model_arch", "ModernMVSNet"))
-    unet_model = model_arch == "UNet"
     evaluates_confidence = (
-        not unet_model
-        and bool(metadata.get("uncertainty", False))
+        bool(metadata.get("uncertainty", False))
         and any(key.startswith("confidence_head.") for key in state)
     )
-    num_views = int(metadata.get("num_views", 1)) if unet_model else int(
-        _required_metadata(metadata, "num_views", 5)
-    )
-    model_display_name = _model_display_name(unet_model, num_views)
-    pose_channels = bool(metadata.get("pose_channels", False)) if unet_model else False
+    num_views = int(_required_metadata(metadata, "num_views", 5))
     view_interval = int(_required_metadata(metadata, "view_interval", 5))
     pose_view_selection = bool(_required_metadata(metadata, "pose_view_selection", False))
     pose_move_threshold = float(
@@ -3436,7 +2700,6 @@ def _evaluate_checkpoint(
             coarse_depths=coarse_depths,
             linear_depth_candidates=linear_depth_candidates,
             fill_invalid=args.fill_invalid,
-            pose_channels=pose_channels,
             aug=MultiViewAugConfig(enabled=False),
         )
         available_frames = len(dataset)
@@ -4068,8 +3331,6 @@ def _evaluate_checkpoint(
         },
         "model_configuration": {
             "checkpoint": str(checkpoint_path),
-            "comparison_label": comparison_label,
-            "architecture_label": model_display_name,
             "model_arch": model_arch,
             "num_views": num_views,
             "view_interval": view_interval,
@@ -4291,37 +3552,17 @@ def _evaluate_checkpoint(
         )
     print(f"Evaluation timing: {(output_dir / 'eval_times.txt').resolve()}", flush=True)
     print(f"Results written to: {output_dir.resolve()}", flush=True)
-    return {
-        "label": comparison_label,
-        "allow_unbalanced_pose_views": allow_unbalanced_pose_views,
-        "summary": summary,
-        "frame_rows": frame_rows,
-        "sequence_rows": sequence_rows,
-    }
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate U-Net-table or multiview checkpoints."
+        description="Evaluate an MVS checkpoint."
     )
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        nargs="+",
         required=True,
-        help="One or more supported depth-model checkpoints.",
-    )
-    parser.add_argument(
-        "--checkpoint_label",
-        "--checkpoint-label",
-        type=str,
-        nargs="+",
-        default=None,
-        help=(
-            "Optional display labels paired positionally with --checkpoint. "
-            "By default, each checkpoint's full filename is used, keeping "
-            "different MVS pipelines distinct in comparison tables and plots."
-        ),
+        help="MVS checkpoint saved by train_mvs.py.",
     )
     parser.add_argument(
         "--data_dir",
@@ -4337,17 +3578,8 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("results"),
         help=(
-            "Root output directory. Each checkpoint gets a policy-prefixed "
-            "subdirectory."
-        ),
-    )
-    parser.add_argument(
-        "--comparison_name",
-        type=str,
-        default="",
-        help=(
-            "Optional folder name for multi-checkpoint comparison results. "
-            "An empty value uses the policy-derived default name."
+            "Root output directory. Results are written to a policy-prefixed "
+            "subdirectory named after the checkpoint."
         ),
     )
     parser.add_argument("--batch_size", type=int, default=8)
@@ -4413,15 +3645,6 @@ def _parse_args() -> argparse.Namespace:
         help="Override the checkpoint and require balanced pose-view layouts.",
     )
     parser.set_defaults(pose_layout_override=None)
-    parser.add_argument(
-        "--boundary_threshold",
-        type=float,
-        default=0.02,
-        help=(
-            "Deprecated compatibility option; boundary detection now uses "
-            "defined/undefined and inside/outside spatial-mask transitions."
-        ),
-    )
     parser.add_argument(
         "--boundary_dilation",
         type=int,
@@ -4521,24 +3744,8 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--spatial_mask_offset_min must be < --spatial_mask_offset_max")
     if args.spatial_mask_offset_steps < 2:
         parser.error("--spatial_mask_offset_steps must be >= 2")
-    for checkpoint in args.checkpoint:
-        if not checkpoint.is_file():
-            parser.error(f"Checkpoint does not exist: {checkpoint}")
-    if args.checkpoint_label is not None:
-        if len(args.checkpoint_label) != len(args.checkpoint):
-            parser.error(
-                "--checkpoint_label must contain exactly one label per --checkpoint"
-            )
-        if any(not label.strip() for label in args.checkpoint_label):
-            parser.error("--checkpoint_label entries must not be empty")
-        if len(set(args.checkpoint_label)) != len(args.checkpoint_label):
-            parser.error("--checkpoint_label entries must be unique")
-    if args.comparison_name:
-        comparison_name = Path(args.comparison_name)
-        if comparison_name.is_absolute() or len(comparison_name.parts) != 1:
-            parser.error("--comparison_name must be a single folder name")
-        if args.comparison_name in {".", ".."}:
-            parser.error("--comparison_name must not be '.' or '..'")
+    if not args.checkpoint.is_file():
+        parser.error(f"Checkpoint does not exist: {args.checkpoint}")
     return args
 
 
@@ -4553,37 +3760,7 @@ def main() -> None:
 
     args.results_folder.mkdir(parents=True, exist_ok=True)
     print(f"Device: {device}")
-    comparison_labels = (
-        args.checkpoint_label
-        if args.checkpoint_label is not None
-        else [checkpoint_path.name for checkpoint_path in args.checkpoint]
-    )
-    if len(set(comparison_labels)) != len(comparison_labels):
-        raise RuntimeError(
-            "Checkpoint filenames are not unique. Use --checkpoint_label to "
-            "supply distinct labels for this comparison."
-        )
-    runs = [
-        _evaluate_checkpoint(checkpoint_path, args, device, comparison_label)
-        for checkpoint_path, comparison_label in zip(
-            args.checkpoint, comparison_labels
-        )
-    ]
-    if len(runs) > 1:
-        comparison_policies = {
-            bool(run["allow_unbalanced_pose_views"]) for run in runs
-        }
-        if len(comparison_policies) == 1:
-            comparison_indicator = _pose_layout_directory_indicator(
-                comparison_policies.pop()
-            )
-        else:
-            comparison_indicator = "unbalanced_pose_views_mixed"
-        comparison_dir = args.results_folder / (
-            args.comparison_name or f"{comparison_indicator}_comparison"
-        )
-        _write_comparison_results(comparison_dir, runs)
-        print(f"Comparison written to: {comparison_dir.resolve()}", flush=True)
+    _evaluate_checkpoint(args.checkpoint, args, device)
 
 
 if __name__ == "__main__":

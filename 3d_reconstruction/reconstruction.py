@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
-Depth-map, point-cloud, and TSDF reconstruction from trained depth models.
+Depth-map, point-cloud, and TSDF reconstruction from a trained MVS model.
 
-Supports single- and multi-view early-fusion U-Net checkpoints and geometric
-multiview checkpoints produced by the two
-current training entry points: ``training/train_unet.py`` and
-``training/train_mvs.py``.
+Supports checkpoints produced by ``training/train_mvs.py``.
 Uses the precomputed table-plane channel stored in hdf5/table_plane.h5
 (produced by data_precomputation/precompute_table_plane.py) instead of
 computing it on-the-fly.
@@ -24,31 +21,27 @@ When --data_dir is a parent folder, the cross-sequence summary is written to
   tsdf_metrics.txt/.json/.png  — surface and held-out rendered-depth metrics
 
 Usage:
-    # Compare several checkpoints using identical uniform-TSDF settings.
-    # The comparison summary is written to data/new/eval/reconstruction_output/.
     python3 reconstruction.py \\
-        --checkpoint model_single.pth model_early_fusion.pth model_mvs.pth \\
-        --data_dir data/new/eval
-
-    python3 reconstruction.py \\
-        --checkpoint training/checkpoints/unet_table/best_myrun.pth \\
+        --checkpoint training/checkpoints/mvs/best_l1_myrun.pth \\
         --data_dir   data/new/eval/1
 
     python3 reconstruction.py \\
-        --checkpoint training/checkpoints/unet_table/best_myrun.pth \\
+        --checkpoint training/checkpoints/mvs/best_l1_myrun.pth \\
         --data_dir   data/new/eval/1 \\
+        --save_frame_visualizations \\
         --indices 0 50 100 200 400 \\
-        --out_dir results/lego_1_table
+        --out_dir results/lego_1
 
+    # A parent directory reconstructs every sequence and writes a summary to
+    # data/new/eval/reconstruction_output/<checkpoint_name>/.
     python3 reconstruction.py \\
-        --checkpoint training/checkpoints/unet_table/best_myrun.pth \\
+        --checkpoint training/checkpoints/mvs/best_l1_myrun.pth \\
         --data_dir   data/new/eval
 """
 
 import sys
 import argparse
 import json
-import math
 import subprocess
 import time
 from pathlib import Path
@@ -79,12 +72,11 @@ from helpers import (
     INTRINSICS_TRANSFORM,
     camera_centers_world,
     depth_cube_mask,
+    fixed_source_offsets,
     points_in_cube,
-    pose_channels_from_base_event,
     select_pose_views,
     transform_intrinsics,
 )
-from train_unet import UNet
 from train_mvs import (
     ModernMVSNet,
     _inverse_depth_candidates,
@@ -144,147 +136,86 @@ def load_original_depth_calibration(calib_dir: Path) -> Tuple[np.ndarray, np.nda
 #  Model loading
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _detect_table_ckpt_type(ckpt: dict) -> str:
-    """Infer which table-prior training script produced a checkpoint."""
-    if (
-        "num_views" in ckpt
-        and "coarse_depths" in ckpt
-        and ("feature_channels" in ckpt or any(k.startswith("feature.") for k in ckpt.get("model", {}).keys()))
-    ):
-        return "multiview"
-    if "embed_dim" in ckpt or "window_size" in ckpt or "seq_len" in ckpt:
-        return "ereformer"
-    if "model" in ckpt and any(k.startswith("patch_embed.") for k in ckpt["model"].keys()):
-        return "ereformer"
-    if (
-        "table_z" in ckpt
-        or ("model" in ckpt and "config" not in ckpt and ckpt.get("in_ch", NUM_BINS) > NUM_BINS)
-    ):
-        return "unet_table"
-    return "unknown"
-
-
-def _infer_multiview_model_arch(ckpt: dict) -> str:
-    """Return the sole supported multiview architecture."""
-    return str(ckpt.get("model_arch", "ModernMVSNet"))
-
-
 def load_model(ckpt_path: Path, device: torch.device):
-    """Load a table-prior checkpoint and return (model, ckpt_dict, ckpt_type)."""
+    """Load a train_mvs.py checkpoint and return (model, ckpt_dict)."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    ckpt_type = _detect_table_ckpt_type(ckpt)
-
-    if ckpt_type == "unet_table":
-        in_ch = ckpt.get("in_ch", NUM_BINS + 1)
-        base  = ckpt.get("base",  32)
-        if ckpt.get("model_arch", "UNet") != "UNet":
-            raise ValueError(
-                "Only standard UNet checkpoints are supported; got "
-                f"{ckpt.get('model_arch')!r}"
-            )
-        model = UNet(in_ch=in_ch, base=base).to(device)
-        model.load_state_dict(ckpt["model"])
-        model.eval()
-        return model, ckpt, ckpt_type
-
-    if ckpt_type == "ereformer":
-        in_ch       = ckpt.get("in_ch", NUM_BINS + 1)
-        embed_dim   = ckpt.get("embed_dim", 96)
-        window_size = ckpt.get("window_size", 8)
-        model = EReFormer(
-            in_ch=in_ch,
-            embed_dim=embed_dim,
-            window_size=window_size,
-        ).to(device)
-        model.load_state_dict(ckpt["model"])
-        model.eval()
-        return model, ckpt, ckpt_type
-
-    if ckpt_type == "multiview":
-        model_arch = _infer_multiview_model_arch(ckpt)
-        if model_arch != "ModernMVSNet":
-            raise ValueError(f"Unsupported multiview checkpoint architecture: {model_arch}")
-        fine_window = float(ckpt.get("fine_window", 0.08))
-        fine_offset_radius = float(ckpt.get("fine_offset_radius", 2.0))
-        model = ModernMVSNet(
-            in_ch=ckpt.get("in_ch", NUM_BINS + 1),
-            base=ckpt.get("base", ckpt.get("base_channels_arg", 32)),
-            feature_ch=ckpt.get("feature_channels", None),
-            cost_base=ckpt.get("cost_channels", None),
-            fine_depths=ckpt.get("fine_depths", 5),
-            fine_window=fine_window,
-            fine_offset_radius=fine_offset_radius,
-            fine_window_min=float(
-                ckpt.get(
-                    "fine_window_min",
-                    0.25 * fine_window * fine_offset_radius,
-                )
-            ),
-            fine_window_max=float(
-                ckpt.get(
-                    "fine_window_max",
-                    fine_window * fine_offset_radius,
-                )
-            ),
-            learned_fine_window=ckpt.get("learned_fine_window", False),
-            reference_channels=ckpt.get("reference_channels", 0),
-            coarse_cost_channels=ckpt.get("coarse_cost_channels", 0),
-            fine_cost_channels=ckpt.get("fine_cost_channels", 0),
-            refiner_channels=ckpt.get("refiner_channels", 0),
-            refiner_max_residual_m=ckpt.get("refiner_max_residual_m"),
-            refiner_reference_input=not ckpt.get(
-                "no_refiner_reference_input", False
-            ),
-            no_2d_refinement=ckpt.get("no_2d_refinement", False),
-            coarse_hourglass_levels=ckpt.get("coarse_hourglass_levels", 2),
-            fine_hourglass_levels=ckpt.get("fine_hourglass_levels", 2),
-            fpn_dropout=ckpt.get("fpn_dropout", 0.0),
-            reference_dropout=ckpt.get("reference_dropout", 0.0),
-            hourglass_dropout=ckpt.get("hourglass_dropout", 0.0),
-            drop_path_rate=ckpt.get("drop_path_rate", 0.0),
-            middle_depths=ckpt.get("middle_depths", 8),
-            middle_window=ckpt.get("middle_window", 0.12),
-            middle_cost_channels=ckpt.get("middle_cost_channels", 0),
-            middle_hourglass_levels=ckpt.get("middle_hourglass_levels", 2),
-            middle_feature_channels=ckpt.get("middle_feature_channels", 0),
-            fine_feature_channels=ckpt.get("fine_feature_channels", 0),
-            fpn_lateral_convolutions=not ckpt.get(
-                "no_fpn_lateral_convolutions", False
-            ),
-        ).to(device)
-        incompatible = model.load_state_dict(ckpt["model"], strict=False)
-        unexpected = list(incompatible.unexpected_keys)
-        missing_non_confidence = [
-            k for k in incompatible.missing_keys
-            if not k.startswith("confidence_head.")
-        ]
-        if missing_non_confidence or unexpected:
-            details = []
-            if missing_non_confidence:
-                details.append(f"missing keys: {missing_non_confidence}")
-            if unexpected:
-                details.append(f"unexpected keys: {unexpected}")
-            raise RuntimeError(
-                f"Error(s) in loading state_dict for {model_arch}: "
-                + "; ".join(details)
-            )
-        if incompatible.missing_keys:
-            print(
-                "  note           : checkpoint has no confidence_head weights; "
-                "ignoring learned confidence for reconstruction"
-            )
-        model.eval()
-        return model, ckpt, ckpt_type
-
-    if ckpt_type == "unknown":
+    model_arch = str(ckpt.get("model_arch", "ModernMVSNet"))
+    if model_arch != "ModernMVSNet" or "num_views" not in ckpt or "coarse_depths" not in ckpt:
         raise ValueError(
-            f"Checkpoint does not appear to be a supported table-prior checkpoint: {ckpt_path}\n"
-            "Expected a table-prior U-Net checkpoint ('table_z' or 'in_ch' > NUM_BINS) "
-            "an EReFormer checkpoint ('embed_dim'/'window_size' metadata or patch_embed weights), "
-            "or a train_mvs.py checkpoint "
-            "('num_views'/'coarse_depths' metadata)."
+            f"Checkpoint does not appear to be a train_mvs.py checkpoint: {ckpt_path}\n"
+            "Expected ModernMVSNet weights with 'num_views'/'coarse_depths' metadata."
         )
-    raise AssertionError(f"Unhandled checkpoint type: {ckpt_type}")
+    fine_window = float(ckpt.get("fine_window", 0.08))
+    fine_offset_radius = float(ckpt.get("fine_offset_radius", 2.0))
+    model = ModernMVSNet(
+        in_ch=ckpt.get("in_ch", NUM_BINS + 1),
+        base=ckpt.get("base", ckpt.get("base_channels_arg", 32)),
+        feature_ch=ckpt.get("feature_channels", None),
+        cost_base=ckpt.get("cost_channels", None),
+        fine_depths=ckpt.get("fine_depths", 5),
+        fine_window=fine_window,
+        fine_offset_radius=fine_offset_radius,
+        fine_window_min=float(
+            ckpt.get(
+                "fine_window_min",
+                0.25 * fine_window * fine_offset_radius,
+            )
+        ),
+        fine_window_max=float(
+            ckpt.get(
+                "fine_window_max",
+                fine_window * fine_offset_radius,
+            )
+        ),
+        learned_fine_window=ckpt.get("learned_fine_window", False),
+        reference_channels=ckpt.get("reference_channels", 0),
+        coarse_cost_channels=ckpt.get("coarse_cost_channels", 0),
+        fine_cost_channels=ckpt.get("fine_cost_channels", 0),
+        refiner_channels=ckpt.get("refiner_channels", 0),
+        refiner_max_residual_m=ckpt.get("refiner_max_residual_m"),
+        refiner_reference_input=not ckpt.get(
+            "no_refiner_reference_input", False
+        ),
+        no_2d_refinement=ckpt.get("no_2d_refinement", False),
+        coarse_hourglass_levels=ckpt.get("coarse_hourglass_levels", 2),
+        fine_hourglass_levels=ckpt.get("fine_hourglass_levels", 2),
+        fpn_dropout=ckpt.get("fpn_dropout", 0.0),
+        reference_dropout=ckpt.get("reference_dropout", 0.0),
+        hourglass_dropout=ckpt.get("hourglass_dropout", 0.0),
+        drop_path_rate=ckpt.get("drop_path_rate", 0.0),
+        middle_depths=ckpt.get("middle_depths", 8),
+        middle_window=ckpt.get("middle_window", 0.12),
+        middle_cost_channels=ckpt.get("middle_cost_channels", 0),
+        middle_hourglass_levels=ckpt.get("middle_hourglass_levels", 2),
+        middle_feature_channels=ckpt.get("middle_feature_channels", 0),
+        fine_feature_channels=ckpt.get("fine_feature_channels", 0),
+        fpn_lateral_convolutions=not ckpt.get(
+            "no_fpn_lateral_convolutions", False
+        ),
+    ).to(device)
+    incompatible = model.load_state_dict(ckpt["model"], strict=False)
+    unexpected = list(incompatible.unexpected_keys)
+    missing_non_confidence = [
+        k for k in incompatible.missing_keys
+        if not k.startswith("confidence_head.")
+    ]
+    if missing_non_confidence or unexpected:
+        details = []
+        if missing_non_confidence:
+            details.append(f"missing keys: {missing_non_confidence}")
+        if unexpected:
+            details.append(f"unexpected keys: {unexpected}")
+        raise RuntimeError(
+            f"Error(s) in loading state_dict for {model_arch}: "
+            + "; ".join(details)
+        )
+    if incompatible.missing_keys:
+        print(
+            "  note           : checkpoint has no confidence_head weights; "
+            "ignoring learned confidence for reconstruction"
+        )
+    model.eval()
+    return model, ckpt
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -357,150 +288,6 @@ def _preprocess_voxels(
     return t.squeeze(0).numpy()
 
 
-def _unet_input_np(
-    vox_np: np.ndarray,
-    tbl_np: np.ndarray,
-    pose_values: Optional[np.ndarray] = None,
-) -> np.ndarray:
-    """Build one early-fusion U-Net input frame."""
-    vox_H, vox_W = vox_np.shape[1], vox_np.shape[2]
-    tbl_t = torch.from_numpy(tbl_np.astype(np.float32)).unsqueeze(0)
-    if tbl_t.shape[-2] != vox_H or tbl_t.shape[-1] != vox_W:
-        tbl_t = F.interpolate(
-            tbl_t.unsqueeze(0), (vox_H, vox_W),
-            mode="bilinear", align_corners=False,
-        ).squeeze(0)
-    input_channels = [vox_np, tbl_t.numpy()]
-    if pose_values is not None:
-        pose_np = np.broadcast_to(
-            pose_values.astype(np.float32)[:, None, None],
-            (6, vox_H, vox_W),
-        )
-        input_channels.append(pose_np)
-    return np.concatenate(input_channels, axis=0)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Inference
-# ─────────────────────────────────────────────────────────────────────────────
-
-@torch.no_grad()
-def _infer(
-    model:    torch.nn.Module,
-    vox_np:   np.ndarray,   # (C, H, W)  preprocessed voxels
-    tbl_np:   np.ndarray,   # (H_tbl, W_tbl) precomputed table-plane channel [0, 1]
-    device:   torch.device,
-    states:   Optional[list] = None,
-    pose_values: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, Optional[list]]:
-    """Run a table-prior forward pass. Returns ((H, W) normalised depth, states)."""
-    inp_np = _unet_input_np(vox_np, tbl_np, pose_values=pose_values)
-    inp    = torch.from_numpy(inp_np).unsqueeze(0).to(device)   # (1, C+1, H, W)
-    if isinstance(model, EReFormer):
-        out = model(inp, states)
-    else:
-        out = model(inp)
-
-    if isinstance(out, tuple):
-        pred, states = out
-    else:
-        pred, states = out, None
-    return pred[0, 0].cpu().numpy(), states
-
-
-@torch.no_grad()
-def _infer_early_fusion_unet(
-    model: torch.nn.Module,
-    frame_idx: int,
-    vox_ds,
-    tbl_ds,
-    T_cam_from_world: Optional[np.ndarray],
-    ckpt: dict,
-    device: torch.device,
-    resize_hw: Optional[Tuple[int, int]],
-    crop_hw: Optional[Tuple[int, int]],
-    centers_world: Optional[np.ndarray],
-) -> np.ndarray:
-    """Run a checkpoint-configured early-fusion U-Net forward pass.
-
-    The target/source ordering, temporal offsets, pose-based view selection,
-    table-prior channels, and optional pose channels match TablePriorDataset.
-    """
-    num_views = int(ckpt.get("num_views", 1))
-    n_frames = min(len(vox_ds), len(tbl_ds))
-    if T_cam_from_world is not None:
-        n_frames = min(n_frames, len(T_cam_from_world))
-    view_ids = _multiview_view_ids(
-        frame_idx,
-        n_frames,
-        ckpt,
-        centers_world,
-    )
-
-    use_pose_channels = bool(ckpt.get("pose_channels", False))
-    if use_pose_channels and T_cam_from_world is None:
-        raise RuntimeError(
-            "This U-Net checkpoint uses pose channels, but camera poses are unavailable."
-        )
-
-    view_inputs = []
-    target_vox = _preprocess_voxels(
-        vox_ds[frame_idx].astype(np.float32), resize_hw, crop_hw
-    )
-    target_tbl = tbl_ds[frame_idx].astype(np.float32)
-    target_pose_values = None
-    if use_pose_channels:
-        target_pose_values = pose_channels_from_base_event(
-            np.linalg.inv(T_cam_from_world[frame_idx]).astype(np.float32)
-        )
-    target_input = _unet_input_np(
-        target_vox, target_tbl, pose_values=target_pose_values
-    )
-    for view_idx in view_ids:
-        if view_idx < 0:
-            view_inputs.append(np.zeros_like(target_input))
-            continue
-        if view_idx == frame_idx:
-            view_inputs.append(target_input)
-            continue
-        vox_np = _preprocess_voxels(
-            vox_ds[view_idx].astype(np.float32), resize_hw, crop_hw
-        )
-        tbl_np = tbl_ds[view_idx].astype(np.float32)
-        pose_values = None
-        if use_pose_channels:
-            T_base_from_event = np.linalg.inv(T_cam_from_world[view_idx]).astype(
-                np.float32
-            )
-            pose_values = pose_channels_from_base_event(T_base_from_event)
-        view_inputs.append(
-            _unet_input_np(vox_np, tbl_np, pose_values=pose_values)
-        )
-
-    inp_np = np.concatenate(view_inputs, axis=0)
-    expected_channels = int(ckpt.get("in_ch", inp_np.shape[0]))
-    if inp_np.shape[0] != expected_channels:
-        raise RuntimeError(
-            "Early-fusion U-Net input-channel mismatch: constructed "
-            f"{inp_np.shape[0]} channels from {num_views} view(s), but the "
-            f"checkpoint expects {expected_channels}."
-        )
-    inp = torch.from_numpy(inp_np).unsqueeze(0).to(device)
-    pred = model(inp)
-    return pred[0, 0].cpu().numpy()
-
-
-def _multiview_source_offsets(num_views: int, view_interval: int) -> List[int]:
-    offsets: List[int] = []
-    k = 1
-    while len(offsets) < num_views - 1:
-        offsets.append(-k * view_interval)
-        if len(offsets) < num_views - 1:
-            offsets.append(k * view_interval)
-        k += 1
-    return offsets
-
-
 def _multiview_view_ids(
     frame_idx: int,
     n_frames: int,
@@ -533,7 +320,7 @@ def _multiview_view_ids(
         interval = int(ckpt.get("view_interval", 5))
         view_ids = [frame_idx] + [
             min(max(frame_idx + o, 0), n_frames - 1)
-            for o in _multiview_source_offsets(num_views, interval)
+            for o in fixed_source_offsets(num_views, interval)
         ]
 
     if len(view_ids) < num_views:
@@ -1523,26 +1310,6 @@ def _remove_cli_flag(argv: list[str], option: str) -> list[str]:
     ]
 
 
-def _set_cli_values(argv: list[str], option: str, values: list[str]) -> list[str]:
-    """Replace a CLI option that accepts one or more consecutive values."""
-    updated: list[str] = []
-    index = 0
-    while index < len(argv):
-        token = argv[index]
-        if token == option:
-            index += 1
-            while index < len(argv) and not argv[index].startswith("--"):
-                index += 1
-            continue
-        if token.startswith(option + "="):
-            index += 1
-            continue
-        updated.append(token)
-        index += 1
-    updated.extend([option, *values])
-    return updated
-
-
 def _load_reconstruction_run_summary(output_dir: Path) -> dict:
     """Load an aggregate summary or normalize a single-sequence result."""
     aggregate_path = output_dir / "reconstruction_summary.json"
@@ -1561,231 +1328,6 @@ def _load_reconstruction_run_summary(output_dir: Path) -> dict:
         "surface_selection": payload.get("surface_selection", "all_surfaces"),
         "cases": payload.get("cases", {}),
     }
-
-
-def _write_model_comparison_summary(
-    output_root: Path,
-    model_runs: list[tuple[str, Path]],
-) -> None:
-    """Write aggregate metrics and plots for a multi-checkpoint run."""
-    summaries = {
-        model_name: _load_reconstruction_run_summary(model_dir)
-        for model_name, model_dir in model_runs
-    }
-    surface_selections = {
-        summary.get("surface_selection", "all_surfaces")
-        for summary in summaries.values()
-    }
-    if len(surface_selections) != 1:
-        raise ValueError(
-            "Cannot compare checkpoints reconstructed with different surface "
-            f"selection policies: {sorted(surface_selections)}"
-        )
-    surface_selection = next(iter(surface_selections))
-    reference_objects: Optional[list[str]] = None
-    for model_name, summary in summaries.items():
-        objects = summary.get("objects")
-        if not isinstance(objects, list):
-            continue
-        if reference_objects is None:
-            reference_objects = objects
-        elif objects != reference_objects:
-            raise ValueError(
-                "Cannot compare reconstruction runs evaluated on different "
-                f"object sets; mismatch found for {model_name}"
-            )
-    cases = (
-        ("current_mask", "Workspace cube"),
-        ("raised_object_cube", "Raised cube"),
-    )
-    metrics = (
-        ("chamfer_mean_m", "Chamfer distance [cm]", 100.0),
-        ("normal_consistency_symmetric", "Normal consistency", 1.0),
-        ("fscore_1cm", "F@1 cm [%]", 100.0),
-    )
-
-    comparison: dict[str, dict] = {}
-    lines = [
-        "Reconstruction comparison across checkpoints",
-        "Values are unweighted means across reconstructed objects.",
-        f"Surface selection: {surface_selection}",
-        "",
-    ]
-    for model_name, summary in summaries.items():
-        comparison[model_name] = {
-            "object_count": summary.get("object_count"),
-            "cases": {},
-        }
-        lines.append(
-            f"{model_name} (objects={summary.get('object_count', 'N/A')})"
-        )
-        for case_name, case_label in cases:
-            surface = (
-                summary.get("cases", {})
-                .get(case_name, {})
-                .get("surface_metrics", {})
-                or {}
-            )
-            case_values = {}
-            lines.append(f"  {case_label}")
-            for metric_name, _, _ in metrics:
-                value = surface.get(metric_name)
-                if isinstance(value, (int, float)) and np.isfinite(value):
-                    case_values[metric_name] = float(value)
-                    lines.append(f"    {metric_name}: {float(value):.6f}")
-            comparison[model_name]["cases"][case_name] = case_values
-        lines.append("")
-
-    payload = {
-        "description": "reconstruction comparison across checkpoints",
-        "surface_selection": surface_selection,
-        "models": comparison,
-    }
-    (output_root / "model_comparison_summary.txt").write_text(
-        "\n".join(lines), encoding="utf-8"
-    )
-    (output_root / "model_comparison_summary.json").write_text(
-        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
-    )
-
-    model_names = list(summaries)
-    x = np.arange(len(model_names))
-    width = 0.36
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5.2))
-    for ax, (metric_name, title, scale) in zip(axes, metrics):
-        for offset, (case_name, case_label) in zip(
-            (-width / 2, width / 2), cases
-        ):
-            values = []
-            for model_name in model_names:
-                surface = (
-                    summaries[model_name]
-                    .get("cases", {})
-                    .get(case_name, {})
-                    .get("surface_metrics", {})
-                    or {}
-                )
-                value = surface.get(metric_name, np.nan)
-                values.append(float(value) * scale if value is not None else np.nan)
-            ax.bar(x + offset, values, width, label=case_label)
-        ax.set_xticks(x, model_names, rotation=25, ha="right")
-        ax.set_title(title)
-        ax.grid(axis="y", alpha=0.25)
-    axes[0].set_ylabel("cm")
-    axes[1].set_ylim(0.0, 1.0)
-    axes[2].set_ylabel("Percent")
-    axes[2].set_ylim(0.0, 100.0)
-    axes[0].legend()
-    fig.suptitle("Three-dimensional reconstruction comparison")
-    fig.tight_layout()
-    fig.savefig(output_root / "model_reconstruction_comparison.png", dpi=180)
-    plt.close(fig)
-
-
-def _checkpoint_comparison_label(checkpoint: Path) -> str:
-    """Return a concise plot label for known comparison checkpoint names."""
-    name = checkpoint.stem.lower()
-    if "baseline_1_view" in name:
-        return "Single-view U-Net"
-    if "baseline_9_views" in name:
-        return "Nine-view early-fusion U-Net"
-    if "multiview" in name:
-        return "Geometry-based multiview"
-    return checkpoint.stem
-
-
-def _supports_learned_uncertainty(checkpoint: Path) -> tuple[bool, str]:
-    """Return whether a checkpoint can produce learned confidence weights."""
-    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if _detect_table_ckpt_type(ckpt) != "multiview":
-        return False, "model is not a geometric multiview checkpoint"
-    if not bool(ckpt.get("uncertainty", False)):
-        return False, "checkpoint was not trained with uncertainty"
-    if not any(
-        key.startswith("confidence_head.") for key in ckpt.get("model", {})
-    ):
-        return False, "checkpoint has no confidence-head weights"
-    return True, ""
-
-
-def _run_checkpoint_comparison(args: argparse.Namespace) -> bool:
-    """Run reconstruction independently for every supplied checkpoint."""
-    checkpoints = [Path(path) for path in args.checkpoint]
-    if len(checkpoints) <= 1:
-        return False
-
-    output_root = (
-        Path(args.out_dir)
-        if args.out_dir is not None
-        else _default_output_dir(args.data_dir, "")
-    )
-    output_root.mkdir(parents=True, exist_ok=True)
-    stems = [checkpoint.stem for checkpoint in checkpoints]
-    if len(set(stems)) != len(stems):
-        raise ValueError(
-            "Multi-checkpoint reconstruction requires unique checkpoint filenames"
-        )
-
-    model_runs: list[tuple[str, Path]] = []
-    for checkpoint_number, checkpoint in enumerate(checkpoints, start=1):
-        model_dir = output_root / checkpoint.stem
-        comparison_label = _checkpoint_comparison_label(checkpoint)
-        child_args = _set_cli_values(
-            sys.argv[1:], "--checkpoint", [str(checkpoint)]
-        )
-        if args.out_dir is not None:
-            child_args = _set_cli_option(child_args, "--out_dir", str(model_dir))
-        else:
-            # Let the child place per-sequence outputs inside each sequence.
-            child_args = _set_cli_option(
-                child_args, "--out_subdir", checkpoint.stem
-            )
-        comparison_dir = model_dir
-        uncertainty_requested = bool(
-            args.uncertainty_weighted_tsdf or args.compare_uncertainty_tsdf
-        )
-        if uncertainty_requested:
-            supports_uncertainty, reason = _supports_learned_uncertainty(checkpoint)
-            if not supports_uncertainty:
-                child_args = _remove_cli_flag(
-                    child_args, "--uncertainty_weighted_tsdf"
-                )
-                child_args = _remove_cli_flag(
-                    child_args, "--compare_uncertainty_tsdf"
-                )
-                child_args = _remove_cli_flag(
-                    child_args, "--compare-uncertainty-tsdf"
-                )
-                print(
-                    f"\n[{checkpoint_number}/{len(checkpoints)}] "
-                    f"Ignoring uncertainty TSDF for {checkpoint.name}: {reason}.",
-                    flush=True,
-                )
-            elif args.compare_uncertainty_tsdf:
-                # Report the confidence-weighted MVS reconstruction in the
-                # cross-model summary. Both variants and their direct
-                # comparison remain available below model_dir.
-                comparison_dir = model_dir / "uncertainty_weighted_tsdf"
-                comparison_label += " (uncertainty-weighted TSDF)"
-        command = [sys.executable, str(Path(__file__).resolve()), *child_args]
-        print(
-            f"\n[{checkpoint_number}/{len(checkpoints)}] "
-            f"Reconstructing checkpoint: {checkpoint.name}",
-            flush=True,
-        )
-        result = subprocess.run(command, check=False)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Reconstruction failed for {checkpoint} with exit code "
-                f"{result.returncode}"
-            )
-        model_runs.append((comparison_label, comparison_dir))
-
-    _write_model_comparison_summary(output_root, model_runs)
-    print(
-        f"\nModel comparison written to: {output_root.resolve()}", flush=True
-    )
-    return True
 
 
 def _write_uncertainty_comparison_summary(
@@ -2172,19 +1714,14 @@ def _run_sequence_directory(args: argparse.Namespace) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Depth-map, point-cloud, and TSDF reconstruction from trained depth models.",
+        description="Depth-map, point-cloud, and TSDF reconstruction from a trained MVS model.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        nargs="+",
         required=True,
-        help=(
-            "One or more table-prior checkpoints (.pth). Multiple checkpoints "
-            "are reconstructed independently and compared under --out_dir "
-            "(default: <data_dir>/reconstruction_output/)."
-        ),
+        help="MVS checkpoint (.pth) saved by training/train_mvs.py",
     )
     parser.add_argument(
         "--data_dir",
@@ -2281,8 +1818,7 @@ def main() -> None:
         help=(
             "Write largest-connected-surface copies of the predicted and GT "
             "TSDF meshes and use those copies for all primary surface and "
-            "rendered-depth metrics, including uncertainty and checkpoint "
-            "comparisons"
+            "rendered-depth metrics, including the uncertainty comparison"
         ),
     )
     parser.add_argument(
@@ -2348,14 +1884,8 @@ def main() -> None:
         parser.error("--surface_samples must be > 0")
     if args.render_eval_frames < 0:
         parser.error("--render_eval_frames must be >= 0")
-    for checkpoint in args.checkpoint:
-        if not checkpoint.is_file():
-            parser.error(f"Checkpoint does not exist: {checkpoint}")
-    if _run_checkpoint_comparison(args):
-        return
-
-    # All existing single-checkpoint reconstruction code uses a scalar path.
-    args.checkpoint = args.checkpoint[0]
+    if not args.checkpoint.is_file():
+        parser.error(f"Checkpoint does not exist: {args.checkpoint}")
 
     if _run_uncertainty_tsdf_comparison(args):
         return
@@ -2395,6 +1925,7 @@ def main() -> None:
         (depth_h5_path,       "Run data_precomputation/project_realsense_to_event.py first."),
         (voxels_h5_path,      "Run data_precomputation/precompute_voxels.py first."),
         (table_plane_h5_path, "Run data_precomputation/precompute_table_plane.py first."),
+        (poses_h5_path,       "The MVS model requires camera poses for source-view warping."),
     ]:
         if not p.exists():
             raise FileNotFoundError(f"Missing: {p}\n{hint}")
@@ -2436,7 +1967,7 @@ def main() -> None:
     print(f"Device           : {device}")
 
     # ── Model ─────────────────────────────────────────────────────
-    model, ckpt, ckpt_type = load_model(ckpt_path, device)
+    model, ckpt = load_model(ckpt_path, device)
     if args.pose_layout_override is not None:
         ckpt["allow_unbalanced_pose_views"] = args.pose_layout_override
         ckpt["allow_fewer_pose_views"] = args.pose_layout_override
@@ -2449,8 +1980,6 @@ def main() -> None:
         )
     use_learned_uncertainty = args.uncertainty_weighted_tsdf
     if use_learned_uncertainty:
-        if ckpt_type != "multiview":
-            parser.error("Learned uncertainty is only supported for train_mvs.py checkpoints")
         if not bool(ckpt.get("uncertainty", False)):
             parser.error(
                 "Learned uncertainty requires a train_mvs.py checkpoint trained with --uncertainty"
@@ -2461,105 +1990,41 @@ def main() -> None:
             )
     depth_min = ckpt.get("depth_min", args.depth_min)
     depth_max = ckpt.get("depth_max", args.depth_max)
-    table_z   = ckpt.get("table_z",   None)
 
     print(f"Checkpoint       : {ckpt_path.name}")
-    print(f"  model          : {ckpt_type}")
     print(f"  in_ch          : {ckpt.get('in_ch', NUM_BINS + 1)}")
-    if ckpt_type == "ereformer":
-        print(f"  embed_dim      : {ckpt.get('embed_dim', 96)}")
-        print(f"  window_size    : {ckpt.get('window_size', 8)}")
-        print(f"  seq_len        : {ckpt.get('seq_len', 'N/A')}")
-    if ckpt_type == "multiview":
-        print(f"  architecture   : {_infer_multiview_model_arch(ckpt)}")
-        print(f"  num_views      : {ckpt.get('num_views', 5)}")
-        print(f"  coarse_depths  : {ckpt.get('coarse_depths', 32)}")
-        print(f"  view_interval  : {ckpt.get('view_interval', 5)}")
-        print(f"  pose selection : {ckpt.get('pose_view_selection', False)}")
-        if ckpt.get("pose_view_selection", False):
-            print(
-                "  pose layouts   : "
-                + (
-                    "fewer masked boundary views allowed"
-                    if ckpt.get(
-                        "allow_fewer_pose_views",
-                        ckpt.get("allow_unbalanced_pose_views", False),
-                    )
-                    else "strictly balanced targets only"
+    print(f"  architecture   : {ckpt.get('model_arch', 'ModernMVSNet')}")
+    print(f"  num_views      : {ckpt.get('num_views', 5)}")
+    print(f"  coarse_depths  : {ckpt.get('coarse_depths', 32)}")
+    print(f"  view_interval  : {ckpt.get('view_interval', 5)}")
+    print(f"  pose selection : {ckpt.get('pose_view_selection', False)}")
+    if ckpt.get("pose_view_selection", False):
+        print(
+            "  pose layouts   : "
+            + (
+                "fewer masked boundary views allowed"
+                if ckpt.get(
+                    "allow_fewer_pose_views",
+                    ckpt.get("allow_unbalanced_pose_views", False),
                 )
+                else "strictly balanced targets only"
             )
-        print("  feature encoder: deep_fpn")
-        print(f"  uncertainty    : {bool(ckpt.get('uncertainty', False))}")
-    if ckpt_type == "unet_table":
-        print(f"  num_views      : {ckpt.get('num_views', 1)}")
-        print(f"  view_interval  : {ckpt.get('view_interval', 5)}")
-        print(f"  pose selection : {bool(ckpt.get('pose_view_selection', False))}")
-        if ckpt.get("pose_view_selection", False):
-            print(
-                "  pose layouts   : "
-                + (
-                    "fewer masked boundary views allowed"
-                    if ckpt.get(
-                        "allow_fewer_pose_views",
-                        ckpt.get("allow_unbalanced_pose_views", False),
-                    )
-                    else "strictly balanced targets only"
-                )
-            )
-        print(f"  pose channels  : {bool(ckpt.get('pose_channels', False))}")
-    table_z_msg = (
-        f"{table_z} m"
-        if table_z is not None
-        else f"from {table_plane_h5_path.name}"
-    )
-    print(f"  table_z        : {table_z_msg}")
+        )
+    print("  feature encoder: deep_fpn")
+    print(f"  uncertainty    : {bool(ckpt.get('uncertainty', False))}")
+    print(f"  table_z        : from {table_plane_h5_path.name}")
     print(f"  depth range    : {depth_min} – {depth_max} m")
 
-    # Read table_z from the precomputed h5 as a cross-check
-    with h5py.File(table_plane_h5_path, "r") as _tf:
-        precomp_table_z = float(_tf.attrs.get("table_z_m", 0.0))
-    if table_z is not None and abs(table_z - precomp_table_z) > 1e-4:
-        print(f"  WARNING: checkpoint table_z ({table_z:.4f} m) differs from "
-              f"precomputed table_z ({precomp_table_z:.4f} m). "
-              "Using precomputed value for channel loading; model was trained with "
-              "the checkpoint value.")
-
     # ── Poses ─────────────────────────────────────────────────────
-    if poses_h5_path.exists():
-        with h5py.File(poses_h5_path, "r") as f:
-            ee_T_all = f["ee_T"][:].astype(np.float64)   # (N, 4, 4)
-        T_ee_from_event = load_T_ee_from_event(CALIB_DIR)
-        use_poses = True
-        print(f"Poses loaded     : {len(ee_T_all)} frames")
-    else:
-        ee_T_all        = None
-        T_ee_from_event = None
-        use_poses       = False
-        print("WARNING: poses.h5 not found — TSDF mesh will be in camera frame only")
-    needs_model_poses = (
-        ckpt_type == "multiview"
-        or bool(ckpt.get("pose_channels", False))
-        or bool(ckpt.get("pose_view_selection", False))
-    )
-    if needs_model_poses and not use_poses:
-        raise FileNotFoundError(
-            f"Missing: {poses_h5_path}\n"
-            "This checkpoint requires camera poses for view selection, pose "
-            "channels, or geometric source-view warping."
-        )
-    if use_original_depth_mesh and not use_poses:
-        raise FileNotFoundError(
-            f"Missing: {poses_h5_path}\n"
-            "Native-depth mesh creation requires poses for depth-camera TSDF fusion."
-        )
+    with h5py.File(poses_h5_path, "r") as f:
+        ee_T_all = f["ee_T"][:].astype(np.float64)   # (N, 4, 4)
+    T_ee_from_event = load_T_ee_from_event(CALIB_DIR)
+    print(f"Poses loaded     : {len(ee_T_all)} frames")
 
-    T_cam_from_world = None
-    cam_centers_world = None
-    if use_poses:
-        T_event_from_ee = np.linalg.inv(T_ee_from_event).astype(np.float32)
-        T_ee_inv = np.linalg.inv(ee_T_all.astype(np.float32))
-        T_cam_from_world = np.einsum("ij,njk->nik", T_event_from_ee, T_ee_inv).astype(np.float32)
-        cam_centers_world = camera_centers_world(T_cam_from_world)
+    T_event_from_ee = np.linalg.inv(T_ee_from_event).astype(np.float32)
+    T_ee_inv = np.linalg.inv(ee_T_all.astype(np.float32))
+    T_cam_from_world = np.einsum("ij,njk->nik", T_event_from_ee, T_ee_inv).astype(np.float32)
+    cam_centers_world = camera_centers_world(T_cam_from_world)
 
     # ── Frame counts ──────────────────────────────────────────────
     with h5py.File(depth_h5_path, "r") as f:
@@ -2580,9 +2045,7 @@ def main() -> None:
             n_rs = f["depth"].shape[0]
         n_total = min(n_total, n_rs)
 
-    n_total = min(n_total, n_vox, n_tbl, n_rgb)   # don't go past what's precomputed
-    if T_cam_from_world is not None:
-        n_total = min(n_total, len(T_cam_from_world))
+    n_total = min(n_total, n_vox, n_tbl, n_rgb, len(T_cam_from_world))   # don't go past what's precomputed
     frame_start = 0
     frame_end = n_total - 1
     region_count = frame_end - frame_start + 1
@@ -2594,11 +2057,7 @@ def main() -> None:
             ckpt.get("allow_unbalanced_pose_views", False),
         )
     )
-    if (
-        ckpt.get("pose_view_selection", False)
-        and cam_centers_world is not None
-        and not allow_fewer_pose_views
-    ):
+    if ckpt.get("pose_view_selection", False) and not allow_fewer_pose_views:
         num_views = int(ckpt.get("num_views", 1))
         threshold = float(ckpt.get("pose_move_threshold", 0.01))
         eligible_frames = [
@@ -2693,7 +2152,6 @@ def main() -> None:
     rgb_by_frame = {}
     viz_set      = set(viz_frames)
     mesh_set     = set(mesh_frames)
-    recurrent_states = None
     t_infer_total = 0.0
     depth_error_total = {"n": 0, "abs_sum": 0.0, "sq_sum": 0.0, "max_abs": 0.0}
     depth_error_by_case = {
@@ -2708,48 +2166,20 @@ def main() -> None:
             vox_raw  = voxels_f["voxels"][frame_idx].astype(np.float32)
             vox_np   = _preprocess_voxels(vox_raw, resize_hw, crop_hw)
 
-            # Table-plane channel (precomputed, native camera resolution)
-            tbl_np   = table_f["table_plane"][frame_idx].astype(np.float32)
-            tbl_eval = tbl_np
-            if tbl_eval.shape[0] != out_H or tbl_eval.shape[1] != out_W:
-                tbl_eval = crop_resize(tbl_eval, resize_hw, crop_hw, mode="bilinear")
-
-            if ckpt_type == "multiview":
-                pred_norm, uncertainty_map = _infer_multiview(
-                    model,
-                    frame_idx,
-                    voxels_f["voxels"],
-                    table_f["table_plane"],
-                    T_cam_from_world,
-                    K,
-                    ckpt,
-                    device,
-                    resize_hw,
-                    crop_hw,
-                    cam_centers_world,
-                    return_uncertainty=use_learned_uncertainty,
-                )
-                recurrent_states = None
-            elif ckpt_type == "unet_table":
-                pred_norm = _infer_early_fusion_unet(
-                    model,
-                    frame_idx,
-                    voxels_f["voxels"],
-                    table_f["table_plane"],
-                    T_cam_from_world,
-                    ckpt,
-                    device,
-                    resize_hw,
-                    crop_hw,
-                    cam_centers_world,
-                )
-                recurrent_states = None
-                uncertainty_map = None
-            else:
-                pred_norm, recurrent_states = _infer(
-                    model, vox_np, tbl_np, device, recurrent_states
-                )
-                uncertainty_map = None
+            pred_norm, uncertainty_map = _infer_multiview(
+                model,
+                frame_idx,
+                voxels_f["voxels"],
+                table_f["table_plane"],
+                T_cam_from_world,
+                K,
+                ckpt,
+                device,
+                resize_hw,
+                crop_hw,
+                cam_centers_world,
+                return_uncertainty=use_learned_uncertainty,
+            )
             pred_m    = depth_min + pred_norm * (depth_max - depth_min)
             if uncertainty_map is not None:
                 confidence_by_frame[frame_idx] = np.clip(
@@ -2768,7 +2198,7 @@ def main() -> None:
             frame_err = depth_error_stats(pred_m, gt, gt_mask)
             merge_depth_error_stats(depth_error_total, frame_err)
 
-            if use_poses and frame_idx < len(ee_T_all):
+            if frame_idx < len(ee_T_all):
                 T_base_from_event = ee_T_all[frame_idx] @ T_ee_from_event
                 T_event_from_base = np.linalg.inv(T_base_from_event)
                 for case_name, case_center in (
@@ -2785,7 +2215,7 @@ def main() -> None:
             pts = depth_to_pointcloud(pred_m, pred_mask, K)
 
             # Accumulate for TSDF
-            if use_poses and frame_idx < len(ee_T_all) and frame_idx in mesh_set:
+            if frame_idx < len(ee_T_all) and frame_idx in mesh_set:
                 T_base_from_event = ee_T_all[frame_idx] @ T_ee_from_event
                 pred_masked = np.where(pred_valid, pred_m, np.float32(0.0)).astype(np.float32)
                 gt_masked   = np.where(gt_valid,   gt,     np.float32(0.0)).astype(np.float32)
@@ -3180,7 +2610,7 @@ def main() -> None:
         )
 
     full_rendered_metrics = None
-    if pred_mesh_created and use_poses and args.render_eval_frames > 0:
+    if pred_mesh_created and args.render_eval_frames > 0:
         fusion_ids = set(final_mesh_frame_ids)
         held_out_candidates = [
             idx for idx in range(min(n_total, len(ee_T_all)))

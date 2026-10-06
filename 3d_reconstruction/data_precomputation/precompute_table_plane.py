@@ -6,7 +6,7 @@ For each depth frame the script intersects the per-pixel camera rays with the
 horizontal plane  z = table_z  (in the robot base frame) and stores the
 resulting camera-space depth, normalised to [0, 1] using the training range
 [DEPTH_MIN, D_MAX].  The result can be concatenated with the event voxels as
-an extra input channel during training (train_unet.py).
+an extra input channel during training (train_mvs.py).
 
 Output (per recording):
     hdf5/table_plane.h5 — dataset "table_plane" (N, H, W) float32 in [0, 1]

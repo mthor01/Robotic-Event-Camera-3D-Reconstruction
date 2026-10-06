@@ -6,13 +6,6 @@ from pathlib import Path
 
 import numpy as np
 
-from config import (
-    CHARUCO_MARKER_LEN,
-    CHARUCO_SQUARE_LEN,
-    CHARUCO_SQUARES_H,
-    CHARUCO_SQUARES_V,
-)
-
 
 # Camera geometry and calibration
 
@@ -69,16 +62,6 @@ def load_event_calibration(calib_dir: Path) -> dict[str, np.ndarray | tuple[int,
     }
 
 
-def pose_channels_from_base_event(T_base_from_event: np.ndarray) -> np.ndarray:
-    """Return camera position and unit optical axis in the robot base frame."""
-    position = T_base_from_event[:3, 3].astype(np.float32)
-    optical_axis = T_base_from_event[:3, 2].astype(np.float32)
-    norm = float(np.linalg.norm(optical_axis))
-    if norm > 1e-6:
-        optical_axis /= norm
-    return np.concatenate((position, optical_axis)).astype(np.float32)
-
-
 def camera_centers_world(T_camera_from_world: np.ndarray) -> np.ndarray:
     """Return camera centers in world coordinates for batched world-to-camera poses."""
     rotation = T_camera_from_world[:, :3, :3]
@@ -100,34 +83,6 @@ def depth_pixel_rays(K: np.ndarray, height: int, width: int) -> np.ndarray:
         ((uu - cx) / fx, (vv - cy) / fy, np.ones_like(uu)), axis=-1
     )
     return rays.reshape(-1, 3)
-
-
-# ChArUco calibration
-
-def create_charuco_board():
-    import cv2
-
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
-    board = cv2.aruco.CharucoBoard(
-        (CHARUCO_SQUARES_H, CHARUCO_SQUARES_V),
-        CHARUCO_SQUARE_LEN,
-        CHARUCO_MARKER_LEN,
-        dictionary,
-    )
-    detector = cv2.aruco.CharucoDetector(
-        board, cv2.aruco.CharucoParameters(), cv2.aruco.DetectorParameters()
-    )
-    return board, detector
-
-
-def detect_charuco(image, detector, min_corners: int):
-    import cv2
-
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-    corners, identifiers, _, _ = detector.detectBoard(gray)
-    if corners is not None and len(corners) >= min_corners:
-        return corners, identifiers
-    return None, None
 
 
 # Dataset layout
@@ -173,32 +128,6 @@ def set_3d_axes_equal(axes) -> None:
     axes.set_xlim3d(centers[0] - radius, centers[0] + radius)
     axes.set_ylim3d(centers[1] - radius, centers[1] + radius)
     axes.set_zlim3d(centers[2] - radius, centers[2] + radius)
-
-
-# Temporal diagnostic signals
-
-def box_smooth(values: np.ndarray, kernel_size: int) -> np.ndarray:
-    if kernel_size <= 1:
-        return values.astype(np.float64).copy()
-    kernel = np.ones(kernel_size) / kernel_size
-    return np.convolve(values.astype(np.float64), kernel, mode="same")
-
-
-def find_troughs(signal: np.ndarray, min_prominence_frac: float = 0.15) -> np.ndarray:
-    from scipy.signal import find_peaks
-
-    if len(signal) < 3:
-        return np.array([], dtype=np.float64)
-    value_range = float(signal.max() - signal.min())
-    if value_range == 0:
-        return np.array([], dtype=np.float64)
-    peaks, _ = find_peaks(-signal, prominence=min_prominence_frac * value_range)
-    return peaks.astype(np.float64)
-
-
-def unit_norm(values: np.ndarray) -> np.ndarray:
-    maximum = np.abs(values).max()
-    return values / maximum if maximum > 0 else values
 
 
 # Training

@@ -1,9 +1,0 @@
-__pycache__
-logs/
-calibration_data/
-MISC/
-franka_pipeline/visualization/franka_description/
-
-osc_test_errors*.png
-osc_test_results*.png
-benchmark_grid_search*.json

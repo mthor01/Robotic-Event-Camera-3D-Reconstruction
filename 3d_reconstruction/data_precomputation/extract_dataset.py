@@ -4,7 +4,7 @@
 The source is expected to contain sequence directories, normally below
 ``train/`` and ``eval/``. Two independent copies are produced:
 
-* ``dataset`` contains only files written by ``data_recording/rec_data.py``.
+* ``dataset`` contains only files written by the recorder.
 * ``core_dataset`` contains only the recorder inputs required to run the full
   precomputation pipeline.
 

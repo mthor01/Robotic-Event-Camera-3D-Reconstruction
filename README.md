@@ -1,11 +1,16 @@
-# Robot Recording and Event-Based 3-D Reconstruction
+# Robot Recording and Event-Based 3-D Reconstruction (light)
 
-This repository contains the complete research pipeline developed for my
-master's thesis: synchronized data recording with robot-mounted cameras,
-geometric preprocessing, event-based multi-view depth prediction, and dense
-3-D reconstruction through TSDF fusion.
+This is the **light** branch: a concise version of the research pipeline
+developed for my master's thesis that contains only what is needed to
+preprocess recorded data, train and evaluate the MVS-inspired event-based depth
+model, and reconstruct meshes through TSDF fusion.
 
-**[Read the master's thesis (PDF)](docs/Masters_Thesis_github.pdf)**
+The [`main` branch](https://github.com/mthor01/robot_and_record/tree/main)
+contains the complete project, including synchronized data recording, camera
+calibration, Franka robot control, the U-Net baselines and model comparisons,
+and the visualization and diagnostic tools.
+
+**[Read the master's thesis (PDF)](https://github.com/mthor01/robot_and_record/blob/main/docs/Masters_Thesis_github.pdf)**
 
 The main contribution is an event-based depth-estimation method inspired by
 RGB multi-view stereo (MVS). Instead of matching conventional RGB images, the
@@ -22,18 +27,6 @@ are hardware synchronized, while the robot publishes timestamped end-effector
 poses. Camera, hand-eye, and robot calibration provide the transformations
 needed both to project RealSense depth into the event-camera frame and to place
 all event-camera observations in a common world coordinate system.
-
-<p align="center">
-  <img src="docs/images/cameras_2%20-%20Kopie.jpg" alt="Close-up of the synchronized event and RGB-D cameras mounted on the robot end effector" width="760">
-</p>
-
-<p align="center"><em>The event camera and RealSense depth camera on the custom end-effector mount.</em></p>
-
-<p align="center">
-  <img src="docs/images/robot_arm_2%20-%20Kopie.jpg" alt="Franka robot recording a building-block object on the tabletop" width="560">
-</p>
-
-<p align="center"><em>The complete recording setup with a static building-block object in the workspace.</em></p>
 
 The recorded dataset contains **48 object-specific sequences** of static,
 colored building-block structures on a mostly textureless white table. For
@@ -54,7 +47,8 @@ infrared projector.
 ## End-to-end reconstruction pipeline
 
 The project covers all stages from physical recording to a reconstructed
-surface:
+surface. This branch starts from already recorded data (stage 2); the recording
+and calibration code is on the `main` branch.
 
 1. **Synchronized recording.** The robot follows a multi-view trajectory around
    a static object. Event data, RealSense RGB-D frames, and end-effector poses
@@ -120,28 +114,18 @@ produce coherent surfaces after fusion.
 
 | Path | Purpose |
 | --- | --- |
-| `franka_pipeline/` | Franka robot control, trajectory execution, pose streaming, and synchronized data collection. |
-| `3d_reconstruction/` | Preprocessing, training, evaluation, reconstruction, and visualization tools. |
-| `3d_reconstruction/data_recording/` | System-specific camera calibration, calibration verification, and synchronized recording entry points. |
-| `3d_reconstruction/camera_data/` | Example camera intrinsics, extrinsics, depth scale, and recorded end-effector poses for the original hardware setup. |
+| `3d_reconstruction/config.py`, `helpers.py` | Shared constants, camera geometry, dataset discovery, workspace masks, and view selection. |
+| `3d_reconstruction/camera_data/` | Camera intrinsics, extrinsics, depth scale, and recorded end-effector poses for the original hardware setup. |
 | `3d_reconstruction/data_precomputation/` | Scripts that project depth into event-camera geometry, create table priors, and build event voxel grids. |
-| `3d_reconstruction/training/` | Multiview depth network, training loop, evaluation, and TensorBoard helpers. |
-| `3d_reconstruction/viz_and_tests/` | Analysis and visualization utilities; these are primarily research diagnostics. |
-| `docker_installation/` | Dockerfiles for the robot backend, robot frontend, and recording/training environment. |
-| `instructions/` | Hardware notes and vendor documentation retained from the development setup. |
+| `3d_reconstruction/training/` | MVS depth network and training loop, evaluation, losses, and TensorBoard helpers. |
+| `3d_reconstruction/reconstruction.py` | Depth prediction and TSDF reconstruction with surface and rendered-depth metrics. |
+| `docker_installation/training_and_reconstruction/` | Dockerfile for the preprocessing, training, and reconstruction environment. |
 
 ## Requirements
 
-The physical data-collection system depends on our particular Franka Emika
-Panda, Deoxys backend, synchronized Intel RealSense D435 and IDS event camera,
-custom camera mount, calibration, network setup, and vendor drivers. The
-recording code is included to document and reproduce our experimental system;
-it is not intended as a generic data-collection system to be reimplemented on
-an arbitrary robot or camera setup.
-
-Everything after recording is ready to run inside the main
-`training_and_reconstruction` Docker image: raw-data preprocessing, U-Net and
-MVS-inspired training, quantitative evaluation, and TSDF reconstruction. A
+Everything in this branch runs inside the `training_and_reconstruction` Docker
+image: raw-data preprocessing, MVS-inspired training, quantitative evaluation,
+and TSDF reconstruction. A
 Linux machine is recommended, and model training and reconstruction require an
 NVIDIA GPU with a working NVIDIA Container Toolkit installation.
 
@@ -175,9 +159,8 @@ batch sizes, and worker counts to the available RAM, shared memory, and GPU.
 
 The directory and file names in this section are part of the data interface;
 they are not placeholders except for names written inside angle brackets.
-Each recording of one object is one **sequence directory**.
-`data_recording/rec_data.py`
-creates that directory as:
+Each recording of one object is one **sequence directory**. The recorder
+(`data_recording/rec_data.py` on the `main` branch) creates that directory as:
 
 ```text
 3d_reconstruction/data/real/<object-name>/
@@ -437,11 +420,9 @@ overridden with command-line arguments.
 
 ## Local training, evaluation, and reconstruction
 
-The local `.sh` launchers contain the same experiment commands as the Slurm
-launchers without cluster resource directives or hard-coded cluster paths.
-Their configuration blocks are deliberately near the top of each file. Edit
-the dataset paths, run names, checkpoints, batch sizes, workers, and model
-options there before running them.
+The configuration blocks of the local `.sh` launchers are deliberately near the
+top of each file. Edit the dataset paths, run names, checkpoints, batch sizes,
+workers, and model options there before running them.
 
 Train the MVS-inspired model:
 
@@ -449,19 +430,14 @@ Train the MVS-inspired model:
 ./training/train_mvs.sh
 ```
 
-Train the U-Net baseline:
-
-```bash
-./training/train_unet.sh
-```
-
-Evaluate one or more checkpoints:
+Evaluate a trained checkpoint:
 
 ```bash
 ./training/eval.sh
 ```
 
-Create and compare TSDF reconstructions:
+Create TSDF reconstructions and compare uniform with confidence-weighted
+fusion:
 
 ```bash
 ./reconstruction.sh
