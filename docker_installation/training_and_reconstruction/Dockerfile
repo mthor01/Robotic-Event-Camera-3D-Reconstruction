@@ -61,7 +61,7 @@ RUN python3 -m pip install --upgrade pip \
     tqdm \
     matplotlib \
     seaborn \
-    scipy\
+    scipy \
     open3d
 
 

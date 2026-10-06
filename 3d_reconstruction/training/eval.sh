@@ -10,7 +10,7 @@ cd "$SCRIPT_DIR"
 # Configuration: edit paths, labels, examples, and resource-related settings.
 # Checkpoint and label arrays must have the same number of entries.
 # ---------------------------------------------------------------------------
-DATA_DIR="../data/new_2/eval"
+DATA_DIR="/data/mthormann/core_dataset/eval"
 COMPARISON_NAME="final_comparison_2"
 WORKERS=8
 BATCH_SIZE=15
@@ -18,7 +18,7 @@ BATCH_SIZE=15
 CHECKPOINTS=(
     "checkpoints/unet_table/Single-View_U-Net.pth"
     "checkpoints/unet_table/Multi-View_U-Net.pth"
-    "checkpoints/mvs/best_l1_best_run_feat_pyramid_128_32_no_1x1.pth"
+    "checkpoints/mvs/MVS.pth"
 )
 CHECKPOINT_LABELS=(
     "Single-view U-Net"
@@ -46,7 +46,7 @@ ARGS=(
     --batch_size "$BATCH_SIZE"
     --spatial_mask_offset_max 0.02
     --spatial_mask_offset_steps 9
-    --fast_mode 1
+    --fast_mode 100
     --example_sequence "${EXAMPLE_SEQUENCES[@]}"
     --example_frame "${EXAMPLE_FRAMES[@]}"
     --allow_unbalanced_pose_views

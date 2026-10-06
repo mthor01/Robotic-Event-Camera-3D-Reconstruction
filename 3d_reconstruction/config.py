@@ -14,7 +14,7 @@ from pathlib import Path
 #  Default paths
 # ═══════════════════════════════════════════════════════════════════
 CALIB_DIR = Path("camera_data")
-DATA_ROOT = Path("data/real")
+DATA_ROOT = Path("data/core_dataset")
 # Dataset root used by the temporal-alignment diagnostic scripts.
 TEMPORAL_CHECK_ROOT = Path("data/temporal_check")
 DEFAULT_OUT_DIR = Path("checkpoints_e2depth")

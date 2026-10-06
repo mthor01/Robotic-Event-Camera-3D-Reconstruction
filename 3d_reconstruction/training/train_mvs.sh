@@ -9,9 +9,9 @@ cd "$SCRIPT_DIR"
 # ---------------------------------------------------------------------------
 # Configuration: edit these values for your machine, dataset, and experiment.
 # ---------------------------------------------------------------------------
-RUN_NAME="after_master_test"
+RUN_NAME="after_master_test_panda_3"
 DATA_DIR="../data/new_2"
-BATCH_SIZE=14
+BATCH_SIZE=10
 WORKERS=8
 
 ARGS=(

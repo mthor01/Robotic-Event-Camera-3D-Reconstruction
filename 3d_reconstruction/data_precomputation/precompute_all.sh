@@ -82,7 +82,7 @@ done
 
 # Default to data/real if nothing was specified
 if [[ ${#DATA_ARGS[@]} -eq 0 ]]; then
-    DATA_ARGS=("--data_root" "data/real")
+    DATA_ARGS=("--data_root" "data/core_dataset")
 fi
 
 # Change to the 3d_reconstruction root so that relative data paths (data/real/...)
