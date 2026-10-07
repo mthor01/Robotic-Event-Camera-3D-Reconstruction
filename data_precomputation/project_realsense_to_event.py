@@ -14,27 +14,28 @@ RGB projection (per RGB frame in realsense.h5):
   frame.  Each 3-D point is looked up in the RGB image via the RGB intrinsics
   & T_color_from_depth, and its colour is scattered to the event pixel.
 
+Both outputs are center-cropped and resized to the model input resolution
+(PREPROCESS_CROP_HW, PREPROCESS_RESIZE_HW in config.py).
+
 Outputs (per recording):
-  hdf5/depth_in_event_frame.h5   – (N, EH, EW) float32 depth in metres
-  hdf5/rgb_in_event_frame.h5     – (N, EH, EW, 3) uint8 RGB
-  videos/depth_in_event_frame.mp4 – colorised overlay for verification
-  videos/rgb_in_event_frame.mp4   – RGB overlay for verification
+  hdf5/depth_in_event_frame.h5    – (N, H, W) float32 depth in metres, 0 = no data
+  hdf5/rgb_in_event_frame.h5      – (N, H, W, 3) uint8 colour in BGR order, like
+                                    realsense.h5
+  videos/depth_in_event_frame.mp4 – colorised depth for verification (--save_videos)
+  videos/rgb_in_event_frame.mp4   – projected colour for verification (--save_videos)
 
-Usage:
+Usage (run from the repository root):
     # Process a single recording
-    python3 project_realsense_to_event.py --data_dir data/real/1
+    python3 data_precomputation/project_realsense_to_event.py --data_dir data/Event_and_Depth/eval/20
 
-    # Process all recordings under data/real/
-    python3 project_realsense_to_event.py --data_root data/real
+    # Process all recordings below data/Event_and_Depth (default)
+    python3 data_precomputation/project_realsense_to_event.py
 
     # Depth only (skip RGB projection)
-    python3 project_realsense_to_event.py --data_root data/real --no_rgb
+    python3 data_precomputation/project_realsense_to_event.py --no_rgb
 
     # Overwrite existing outputs
-    python3 project_realsense_to_event.py --data_root data/real --overwrite
-
-    # Custom calibration directory
-    python3 project_realsense_to_event.py --data_root data/real --calib_dir camera_data
+    python3 data_precomputation/project_realsense_to_event.py --overwrite
 """
 
 import argparse
@@ -270,7 +271,7 @@ def project_depth_frame(
 
     # Fill only the small holes caused by scattering the lower-resolution depth
     # grid into the event image.  Copying the spatially nearest sample avoids
-    # the foreground expansion caused by the previous local-minimum fill.
+    # the foreground expansion that a local-minimum fill would cause.
     depth_out = _fill_small_depth_gaps_nearest(depth_out, max_distance_px=2.0)
 
     return depth_out
@@ -363,7 +364,7 @@ def project_rgb_frame(
     order = np.argsort(-z_event)
     rgb_out[pv[order], pu[order]] = colours_f[order]
 
-    # Fill small gaps with dilation (same strategy as depth)
+    # Fill one-pixel scattering gaps with a 3x3 dilation of each channel.
     for c in range(3):
         ch = rgb_out[:, :, c]
         kernel = np.ones((3, 3), dtype=np.uint8)
@@ -425,7 +426,7 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
         has_rgb_src = project_rgb and ("rgb" in rs_h5)
         rgb_ds = rs_h5["rgb"] if has_rgb_src else None
         if project_rgb and not has_rgb_src:
-            print(f"  [{seq_dir.name}] Warning: --rgb requested but no 'rgb' dataset in realsense.h5")
+            print(f"  [{seq_dir.name}] Warning: RGB projection requested but no 'rgb' dataset in realsense.h5")
 
         print(f"[{seq_dir.name}] Projecting {N} frames ({dep_w}x{dep_h}) → event frame ({ev_w}x{ev_h})"
               + (f" → stored ({out_w}x{out_h})" if (out_h, out_w) != (ev_h, ev_w) else "")
@@ -445,7 +446,9 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
                     FPS, (out_w, out_h), isColor=True,
                 )
 
-        # Event frames (or all voxel bins) for overlay
+        # Optional event background for the verification videos: the summed
+        # activity of the voxel grids (--use_voxels) or event frames in
+        # hdf5/events_cam0.h5, which only recordings from the main branch have.
         ev_h5_path     = seq_dir / "hdf5"   / "events_cam0.h5"
         voxel_h5_path  = seq_dir / "events" / "voxels_cam0.h5"
         if use_voxels and voxel_h5_path.exists():
@@ -591,7 +594,9 @@ def process_recording(seq_dir: Path, calib: dict, project_rgb: bool = True,
                             rgb_out_ds[i] = proj_rgb
 
                             if save_videos:
-                                rgb_bgr = cv2.cvtColor(proj_rgb, cv2.COLOR_RGB2BGR)
+                                # realsense.h5 stores BGR (rs.format.bgr8), which
+                                # is also what cv2.VideoWriter expects.
+                                rgb_bgr = proj_rgb
                                 ev_gray = batch_ev[j]
                                 if ev_gray is not None:
                                     if (_ev_source != "voxels" and
@@ -698,8 +703,8 @@ def main():
     parser.add_argument("--crop_w", type=int, default=PREPROCESS_CROP_HW[1],
                         help="Native center-crop width")
     parser.add_argument("--use_voxels", action="store_true",
-                        help="Use the middle bin of precomputed voxel grids (events/voxels_cam0.h5) "
-                             "instead of event frames for the overlay video. "
+                        help="Use the summed activity of all bins of the precomputed voxel grids "
+                             "(events/voxels_cam0.h5) as background of the overlay videos. "
                              "Requires precompute_voxels.py to have been run first.")
     args = parser.parse_args()
 
@@ -729,7 +734,7 @@ def main():
     print(f"Processing {len(dirs)} recording(s)")
     print(f"RGB projection: {'off' if args.no_rgb else 'on'}")
     print(f"Video generation: {'on' if args.save_videos else 'off'}")
-    print(f"Overlay source: {'voxel middle bin' if args.use_voxels else 'event frames'}")
+    print(f"Overlay source: {'voxel activity' if args.use_voxels else 'event frames'}")
     print(f"Crop → {crop_hw[1]}×{crop_hw[0]} → resize → {resize_hw[1]}×{resize_hw[0]}")
     FPS = args.fps
 

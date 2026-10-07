@@ -5,7 +5,10 @@ TensorBoard path and image-visualization helpers.
 ``VizLogger`` writes up to ``n_samples`` rows, one per sampled frame. Each row
 contains:
 
-  events | gt depth | mask | pred depth | error | overlay (events + pred depth)
+  events | gt depth | [table depth] | [mask] | pred depth | error | overlay
+
+The table-depth panel appears when ``table_depth`` is passed to ``add_batch``
+(as train_mvs.py does) and the mask panel when ``show_mask`` is set.
 
 ``UncertaintyErrorLogger`` logs how the learned confidence relates to the
 depth error. These helpers do not define models or affect optimization.
@@ -233,7 +236,7 @@ class VizLogger:
     a visualization panel to TensorBoard.
 
     Each sample row shows (left → right):
-        events | gt depth | mask | pred depth | error | overlay
+        events | gt depth | [table depth] | [mask] | pred depth | error | overlay
 
     Parameters
     ----------
@@ -256,7 +259,7 @@ class VizLogger:
         self.n_samples  = n_samples
         self.tag        = tag
         self.show_mask  = show_mask
-        self._buf: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        self._buf: List[Tuple[np.ndarray, ...]] = []
         self._seen = 0
         self._rng = np.random.default_rng()
 
@@ -338,9 +341,14 @@ class UncertaintyErrorLogger:
     """
     Tracks how predicted uncertainty relates to absolute depth error.
 
+    train_mvs.py passes ``1 - confidence`` as the uncertainty, a unitless value
+    in [0, 1].
+
     TensorBoard outputs:
         <tag>/scatter_uncertainty_vs_error
+        and, unless images_only is set:
         <tag>/corr_uncertainty_vs_error
+        <tag>/mean_uncertainty_m, <tag>/mean_error_m
         <tag>/mean_error_by_uncertainty_bin_XX
     """
 
@@ -371,7 +379,7 @@ class UncertaintyErrorLogger:
 
     def add_batch(
         self,
-        uncertainty: torch.Tensor,  # (B, 1, H, W), metres
+        uncertainty: torch.Tensor,  # (B, 1, H, W)
         pred: torch.Tensor,         # (B, 1, H, W), metres
         depth: torch.Tensor,        # (B, 1, H, W), metres
         mask: torch.Tensor,         # (B, 1, H, W)
@@ -446,7 +454,7 @@ class UncertaintyErrorLogger:
 
             fig, ax = plt.subplots(figsize=(6.0, 4.0), dpi=120)
             ax.scatter(uncertainty, error, s=4, alpha=0.25, linewidths=0)
-            ax.set_xlabel("Predicted uncertainty [m]")
+            ax.set_xlabel("Predicted uncertainty (1 - confidence)")
             ax.set_ylabel("Absolute depth error [m]")
             ax.set_title("Uncertainty vs prediction error")
             ax.grid(True, alpha=0.25)

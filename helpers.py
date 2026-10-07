@@ -1,4 +1,5 @@
-"""Shared helpers for geometry, datasets, calibration, plotting, and view selection."""
+"""Shared helpers for camera geometry, calibration, dataset discovery, EMA,
+workspace masks, and source-view selection."""
 
 from __future__ import annotations
 

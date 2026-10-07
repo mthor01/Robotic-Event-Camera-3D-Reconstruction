@@ -4,25 +4,30 @@
 #   2. precompute_table_plane.py
 #   3. precompute_voxels.py
 #
-# Usage:
-#   ./precompute_all.sh                                         # all objects, default settings
-#   ./precompute_all.sh --data_dir data/real/bottle             # single object
-#   ./precompute_all.sh --data_dir data/real/bottle data/real/cube
-#   ./precompute_all.sh --data_root data/Event_and_Depth        # all recordings below root (default)
+# Each step writes its outputs into the sequence directory and overwrites
+# existing ones (--overwrite is always passed).
+#
+# Usage (relative paths are relative to the repository root):
+#   ./precompute_all.sh                                          # every sequence below data/Event_and_Depth (default)
+#   ./precompute_all.sh --data_dir data/Event_and_Depth/eval/20  # one sequence
+#   ./precompute_all.sh --data_dir data/Event_and_Depth/train/21 data/Event_and_Depth/eval/20
+#   ./precompute_all.sh --data_root data/my_dataset              # every sequence below another root
 #
 # Per-step flags:
 #   Use --project, --table, --voxel as section markers.
-#   Flags before any marker are forwarded to ALL steps.
+#   Flags before any marker are forwarded to ALL steps, so they must be
+#   accepted by all three scripts.
 #   Flags after a marker are forwarded only to that step.
+#   Run a script with --help to list its flags.
 #
 #   Examples:
-#     ./precompute_all.sh --data_dir data/real/bottle \
-#         --voxel --num_bins 7 --float16
+#     # Store voxels as float16, like the published dataset
+#     ./precompute_all.sh --voxel --float16
 #
-#     ./precompute_all.sh \
-#         --project --resize_h 260 --resize_w 346 \
-#         --table  --table_z 0.02 \
-#         --voxel  --num_bins 7 --workers 2
+#     ./precompute_all.sh --data_dir data/Event_and_Depth/eval/20 \
+#         --project --no_rgb --workers 8 \
+#         --table   --debug \
+#         --voxel   --float16 --workers 2
 
 set -euo pipefail
 
@@ -86,7 +91,7 @@ fi
 
 # Change to the repository root so that relative data paths (data/...)
 # resolve correctly.  The individual scripts are invoked by sub-path.
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
 
 echo "============================================================"

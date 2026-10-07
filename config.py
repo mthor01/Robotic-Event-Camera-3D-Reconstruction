@@ -47,8 +47,7 @@ DEPTH_MIN = 0.05  # minimum depth in metres (5 cm)
 #  TSDF reconstruction
 # ═══════════════════════════════════════════════════════════════════
 TSDF_VOXEL_SIZE = 0.002        # metres
-TSDF_SDF_TRUNC_FACTOR = 4.0
-TSDF_DEPTH_MAX = 0.8           # metres (larger range for 3-D reconstruction)
+TSDF_SDF_TRUNC_FACTOR = 4.0    # truncation distance = factor * voxel size
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -56,7 +55,7 @@ TSDF_DEPTH_MAX = 0.8           # metres (larger range for 3-D reconstruction)
 # ═══════════════════════════════════════════════════════════════════
 SPATIAL_CUBE_SIDE = 0.32    # metres (32 cm cube)
 SPATIAL_CUBE_X_OFFSET = 0.05   # metres — shift of cube centre along X in robot base frame
-SPATIAL_CUBE_Z_OFFSET = -0.03
+SPATIAL_CUBE_Z_OFFSET = -0.03  # metres — Z of the cube bottom in robot base frame
 SPATIAL_CUBE_CENTER_Z = SPATIAL_CUBE_Z_OFFSET + SPATIAL_CUBE_SIDE / 2  # metres — Z of cube centre in robot base frame
 # Target point (cube centre) in robot base frame
 SPATIAL_TARGET_X = 0.3 + SPATIAL_CUBE_X_OFFSET   # metres (robot workspace X + cube shift)

@@ -46,15 +46,18 @@ RUN python3 -m pip install --upgrade pip \
     huggingface_hub
 
 
-# Optional: HDF5 plugin path for Ubuntu 22.04 (doc gives this exact path)
+# Optional: HDF5 plugin path for Ubuntu 22.04, as given in the Metavision
+# installation guide.
 ENV HDF5_PLUGIN_PATH=${HDF5_PLUGIN_PATH:-}:/usr/lib/x86_64-linux-gnu/hdf5/serial/plugins
 
-ARG UID=101403
-ARG GID=5018
+# Run as an unprivileged user whose IDs match the host user (pass
+# --build-arg UID=$(id -u) --build-arg GID=$(id -g)), so files written into the
+# mounted repository belong to the host user. An existing group with the same
+# GID is reused.
+ARG UID=1000
+ARG GID=1000
 
-RUN groupadd -g $GID cs_stud || true && \
-    useradd -m -u $UID -g $GID mthormann || true
+RUN groupadd -g $GID user || true && \
+    useradd -m -u $UID -g $GID user || true
 
-USER mthormann
-
-RUN chown mthormann:cs_stud /home/mthormann/.bashrc
+USER $UID:$GID

@@ -5,6 +5,7 @@ multi-view depth estimation and 3-D reconstruction.
 
 **[Read the master's thesis (PDF)](https://github.com/mthor01/robot_and_record/blob/main/docs/Masters_Thesis_github.pdf)**
 · **[Dataset on Hugging Face](https://huggingface.co/datasets/mthor/Event_and_Depth)**
+· **[Pretrained model](https://github.com/mthor01/robot_and_record/releases/tag/master-thesis-mvs-final-weights)**
 
 The main contribution is an event-based depth-estimation method inspired by
 RGB multi-view stereo (MVS). Instead of matching conventional RGB images, the
@@ -17,7 +18,7 @@ each reference view, and fuses the resulting predictions into a 3-D mesh.
 
 | Branch | Contents | Intended use |
 | --- | --- | --- |
-| [`main`](https://github.com/mthor01/robot_and_record/tree/main) | The complete thesis project: Franka robot-arm control, trajectory execution, synchronized data recording, camera and hand-eye calibration, the U-Net baselines and model comparisons, the architecture and training variants explored during development, and many analysis, visualization, and test scripts used throughout the thesis. | Documents and reproduces the full experimental system. |
+| [`main`](https://github.com/mthor01/robot_and_record/tree/main) | The complete thesis project: Franka robot-arm control, trajectory execution, synchronized data recording, camera and hand-eye calibration, the U-Net baselines and model comparisons, the architecture and training variants explored during development, and many analysis, visualization, and test scripts used throughout the thesis. | Documents the full experimental system; cannot be run directly. |
 | **`light`** (this branch) | Everything needed to work with the published dataset: preprocessing, training, evaluation, and TSDF reconstruction of the MVS model. | Using, retraining, and extending the method. |
 
 The `main` branch is very setup specific. Its recording and robot-control code
@@ -26,7 +27,8 @@ control stack, a hardware-synchronized Intel RealSense D435 and IDS event
 camera on a custom end-effector mount, and our calibration, network
 configuration, and vendor drivers. It is not intended as a generic
 data-collection system for arbitrary robots or cameras, and much of it only
-runs on that setup.
+runs on that setup. It also requires the Prophesee Metavision SDK 4.6.2, which
+is no longer available for public download.
 
 For convenience, we therefore provide this **light** version. It starts from
 the recorded dataset, which can be downloaded with a single command, and
@@ -38,6 +40,8 @@ of the model reported in the thesis.
 
 - **Download the dataset** of 50 recorded sequences, either with precomputed
   model inputs or as raw recordings ([Dataset](#dataset)).
+- **Use the pretrained model** of the thesis to evaluate and reconstruct
+  without training ([Pretrained model](#pretrained-model)).
 - **Preprocess raw recordings** into event voxel grids, ground-truth depth in
   the event-camera frame, and table-plane priors, for the published raw files
   or your own recordings in the same format
@@ -109,6 +113,11 @@ reconstructed meshes achieve an accuracy of **0.108 cm**, completeness of
 **0.108 cm**, Chamfer distance of **0.108 cm**, and normal consistency of
 **0.966**.
 
+These results are obtained with the [pretrained model](#pretrained-model).
+The depth metrics are the workspace-cube results of `training/evaluation.sh`
+on all frames, and the mesh metrics are those of `reconstruction.sh` with
+`--save_largest_connected_surface` (see [Usage](#usage)).
+
 ## Repository layout
 
 | Path | Purpose |
@@ -124,6 +133,7 @@ reconstructed meshes achieve an accuracy of **0.108 cm**, completeness of
 | `reconstruction.py`, `reconstruction.sh` | TSDF reconstruction and surface metrics, with its launcher. |
 | `docker_installation/training_and_reconstruction/` | Dockerfile of the software environment. |
 | `data/` | Datasets (created by `download_dataset.py`, not tracked by git). |
+| `training/checkpoints/`, `training/evaluation_results/`, `reconstruction_results/` | Checkpoints and outputs of training, evaluation, and reconstruction (created by the scripts, not tracked by git). |
 
 ## Installation
 
@@ -192,6 +202,18 @@ The script checks the free disk space before downloading. Complete files are
 skipped, so an interrupted download can simply be restarted.
 
 ### Recordings
+
+<p align="center">
+  <img src="docs/images/cameras.jpg" alt="Close-up of the synchronized event and RGB-D cameras mounted on the robot end effector" width="760">
+</p>
+
+<p align="center"><em>The event camera and RealSense depth camera on the custom end-effector mount.</em></p>
+
+<p align="center">
+  <img src="docs/images/robot_arm.jpg" alt="Franka robot recording a building-block object on the tabletop" width="560">
+</p>
+
+<p align="center"><em>The complete recording setup with a static building-block object in the workspace.</em></p>
 
 The dataset contains 50 object-specific recordings of static, colored
 building-block structures on a mostly textureless white table. For every
@@ -321,7 +343,7 @@ using the hand-eye calibration in `camera_data/`
 
 | Dataset | Shape and type | Contents |
 | --- | --- | --- |
-| `rgb` | `(N, 240, 320, 3)`, `uint8`, gzip | RealSense color projected into the event-camera frame together with the depth; pixels without a sample are black. |
+| `rgb` | `(N, 240, 320, 3)`, `uint8`, gzip | RealSense color projected into the event-camera frame together with the depth, in BGR channel order like `realsense.h5`; pixels without a sample are black. |
 
 The light version does not use this file; it is useful for visualization.
 
@@ -351,6 +373,25 @@ to every sequence of the dataset:
 The remaining files are intermediate results of the calibration procedure on
 the `main` branch.
 
+## Pretrained model
+
+The model reported in the thesis is published as `MVS.pth` (109 MB) in the
+[`master-thesis-mvs-final-weights` release](https://github.com/mthor01/robot_and_record/releases/tag/master-thesis-mvs-final-weights).
+Download it to `training/checkpoints/mvs/`, where `training/evaluation.sh` and
+`reconstruction.sh` expect it by default:
+
+```bash
+curl -L --create-dirs -o training/checkpoints/mvs/MVS.pth \
+  https://github.com/mthor01/robot_and_record/releases/download/master-thesis-mvs-final-weights/MVS.pth
+sha256sum training/checkpoints/mvs/MVS.pth
+# 4a3d6baf7fa03394a0de4ae0647a09b0833e1fe3ebd917b89b578a5888ebd3e5
+```
+
+The checkpoint contains the weights with the lowest validation L1 error and
+all settings needed to rebuild the network, so it can be used directly for
+[evaluation](#evaluation) and [reconstruction](#reconstruction). Its configuration is the default of
+`training/train_mvs.py`.
+
 ## Usage
 
 The three launchers `training/train_mvs.sh`, `training/evaluation.sh`, and
@@ -364,8 +405,12 @@ line are appended, which is convenient for short experiments:
 ```
 
 The scripts find the repository from their own location, so they can be
-started from any directory. All outputs are written into the mounted
-repository and remain available after the container exits.
+started from any directory. They change into the directory that contains them,
+so relative paths in their configuration block and on the command line are
+relative to `training/` for `train_mvs.sh` and `evaluation.sh` and to the
+repository root for `reconstruction.sh` and
+`data_precomputation/precompute_all.sh`. All outputs are written into the
+mounted repository and remain available after the container exits.
 
 ### Preprocessing (optional)
 
@@ -389,8 +434,9 @@ table-plane generation (`precompute_table_plane.py`), and voxel generation
 (`precompute_voxels.py`) in this order and writes their outputs into each
 sequence directory, overwriting existing ones. Stage-specific options can be
 passed after the markers `--project`, `--table`, and `--voxel`, for example
-`./data_precomputation/precompute_all.sh --voxel --float16`; run each script
-with `--help` for its settings.
+`./data_precomputation/precompute_all.sh --voxel --float16`, which stores the
+voxel grids as `float16` like the published dataset instead of the default
+`float32`. Run each script with `--help` for its settings.
 
 To use your own dataset, arrange the sequence directories into `train/` and
 `eval/` folders as in the published dataset and set the `DATA_DIR` values of
@@ -425,7 +471,8 @@ Run `python3 training/train_mvs.py --help` for descriptions and defaults. After
 every epoch, the script saves the checkpoints with the best validation L1,
 p95, and worst-10 % L1 error to `training/checkpoints/mvs/` as
 `best_l1_<name>.pth`, `best_p95_<name>.pth`, and `best_l1_worst10_<name>.pth`,
-and at the end the final state as `last_<name>.pth`. Checkpoints store all
+and at the end the final state as `last_<name>.pth`, where `<name>` is
+`RUN_NAME` in `train_mvs.sh` or `--name`. Checkpoints store all
 settings, so evaluation and reconstruction rebuild the network from them
 automatically.
 
@@ -442,7 +489,10 @@ predictions (`viz/`), and the relation between predicted confidence and error
 
 ### Evaluation
 
-Set `CHECKPOINT` in `training/evaluation.sh` to a trained checkpoint and run:
+`CHECKPOINT` in `training/evaluation.sh` points to the
+[pretrained model](#pretrained-model). To evaluate your own model, set it to a
+trained checkpoint, for example `checkpoints/mvs/best_l1_<name>.pth` (relative
+to `training/`). Then run:
 
 ```bash
 ./training/evaluation.sh
@@ -470,12 +520,17 @@ For each region it reports AbsRel, SqRel, MAE, RMSE, RMSE log, and the
 | `qualitative_depth_results.png` | Events, ground truth, prediction, and error of one random frame per sequence |
 | `selected_frames_overview.png` | The same for the frames chosen with `EXAMPLE_SEQUENCES` and `EXAMPLE_FRAMES` in `evaluation.sh` |
 
-A new run overwrites these files. `--fast_mode N` evaluates only every N-th
-frame for quick checks.
+`EXAMPLE_SEQUENCES` takes sequence names (for example `20`) or their position
+in sorted order (`1` = first sequence), and `EXAMPLE_FRAMES` the frame index
+for each of them. A new run overwrites these files. `--fast_mode N` evaluates
+only every N-th frame for quick checks.
 
 ### Reconstruction
 
-Set `CHECKPOINT` in `reconstruction.sh` and run:
+`CHECKPOINT` in `reconstruction.sh` points to the
+[pretrained model](#pretrained-model). To use your own model, set it to a
+trained checkpoint, for example `training/checkpoints/mvs/best_l1_<name>.pth`.
+Then run:
 
 ```bash
 ./reconstruction.sh
@@ -484,23 +539,30 @@ Set `CHECKPOINT` in `reconstruction.sh` and run:
 For every evaluation sequence, the script predicts depth for evenly spaced
 frames (`--mesh_frame_count`, 200 in `reconstruction.sh`) and fuses the
 predicted and the ground-truth depth maps into TSDF meshes cropped to the
-workspace cube. With `--compare_uncertainty_tsdf`, as in `reconstruction.sh`,
-it creates two predicted meshes, one with uniform and one with
-confidence-weighted fusion, and compares both with the ground-truth mesh:
-accuracy, completeness, Chamfer distance, normal consistency, and
-precision/recall/F-score at 1, 2, and 5 cm. `--save_largest_connected_surface`
-keeps only the largest connected surface of each mesh before computing the
-metrics.
+workspace cube. The predicted mesh is fused with confidence weighting and
+compared with the ground-truth mesh: accuracy, completeness, Chamfer distance,
+normal consistency, and precision/recall/F-score at 1, 2, and 5 cm. Further
+outputs are created only when their flag is appended to `ARGS` in
+`reconstruction.sh` or passed on the command line:
+
+| Flag | Effect |
+| --- | --- |
+| `--compare_uncertainty_tsdf` | Also fuses a uniformly weighted predicted mesh and compares both fusion variants |
+| `--uniform_tsdf` | Fuses only the uniformly weighted predicted mesh, for checkpoints trained without `--uncertainty` |
+| `--save_largest_connected_surface` | Writes `..._largest_component.obj` copies that keep only the largest connected surface of each mesh and computes the metrics on them |
+
+The mesh metrics in [Results](#results) were computed with
+`--save_largest_connected_surface`.
 
 The results are written to
-`data/Event_and_Depth/eval/reconstruction_output/<checkpoint name>/`:
+`reconstruction_results/<checkpoint name>/`:
 
 | File | Contents |
 | --- | --- |
 | `<sequence>/<sequence>_gt_mesh.obj` | Mesh fused from the ground-truth depth |
-| `<sequence>/<sequence>_uniform_mesh.obj`, `..._uncertainty_weighted_mesh.obj` | Meshes fused from the predicted depth |
+| `<sequence>/<sequence>_uncertainty_weighted_mesh.obj` | Mesh fused from the predicted depth (`..._uniform_mesh.obj` with `--compare_uncertainty_tsdf` or `--uniform_tsdf`) |
 | `<sequence>/reconstruction_metrics.json`, `.txt` | Surface metrics of the sequence |
-| `reconstruction_summary.json`, `.txt` | Means over all sequences and the difference between the two fusion variants |
+| `reconstruction_summary.json`, `.txt` | Means over all sequences and, with `--compare_uncertainty_tsdf`, the difference between the two fusion variants |
 | `chamfer_by_object.png` | Chamfer distance of every sequence |
 
 The meshes can be inspected with any mesh viewer, for example MeshLab.

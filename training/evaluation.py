@@ -67,8 +67,9 @@ DEPTH_REGION_LABELS = {
     "lower_cube": "Workspace Cube",
     "upper_cube": "Raised Cube",
 }
-# The workspace cube is shifted up slightly; the raised cube additionally
-# starts 1 cm above the table so that it contains only the object.
+# The workspace cube is shifted up by 5 mm; the raised cube starts at
+# z = 1.5 cm in the robot base frame, above the table, so that it contains only
+# the object.
 SPATIAL_MASK_VERTICAL_SHIFT_M = 0.005
 RAISED_CUBE_BOTTOM_Z_M = 0.01 + SPATIAL_MASK_VERTICAL_SHIFT_M
 QUALITATIVE_RANDOM_SEED = 20260813
@@ -588,7 +589,7 @@ def _evaluate_checkpoint(args: argparse.Namespace, device: torch.device) -> None
     print(
         "Pose-view layouts: "
         + (
-            "up to four sources per side; missing boundary views masked"
+            f"up to {(num_views - 1) // 2} sources per side; missing boundary views masked"
             if allow_unbalanced_pose_views
             else "strictly balanced"
         )
@@ -977,7 +978,11 @@ def _parse_args() -> argparse.Namespace:
         if any(frame < 0 for frame in args.example_frame):
             parser.error("all --example_frame values must be >= 0")
     if not args.checkpoint.is_file():
-        parser.error(f"Checkpoint does not exist: {args.checkpoint}")
+        parser.error(
+            f"Checkpoint does not exist: {args.checkpoint}\n"
+            "  Download the pretrained model (README, section 'Pretrained model') "
+            "or train one with training/train_mvs.sh."
+        )
     return args
 
 

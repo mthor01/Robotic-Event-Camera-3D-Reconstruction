@@ -3,13 +3,17 @@
 
 set -euo pipefail
 
+# Relative paths below and on the command line are relative to training/,
+# where this script lives.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # ---------------------------------------------------------------------------
 # Configuration: edit these values for your machine, dataset, and experiment.
 # ---------------------------------------------------------------------------
-RUN_NAME="after_master_test"
+# Checkpoints are saved as checkpoints/mvs/{best_l1,best_p95,best_l1_worst10,last}_<RUN_NAME>.pth
+RUN_NAME="mvs"
+# Dataset root containing train/ (training) and eval/ (validation after every epoch)
 DATA_DIR="../data/Event_and_Depth"
 BATCH_SIZE=10
 WORKERS=8
@@ -60,6 +64,7 @@ ARGS=(
     --ema_decay 0.9995
 )
 
-# Extra command-line arguments are appended, for example:
+# Extra command-line arguments are appended; an option given again there
+# replaces its value above, for example:
 #   ./train_mvs.sh --epochs 5 --name local_smoke_test
 exec python3 -u train_mvs.py "${ARGS[@]}" "$@"

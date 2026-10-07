@@ -10,18 +10,22 @@ an extra input channel during training (train_mvs.py).
 
 Output (per recording):
     hdf5/table_plane.h5 — dataset "table_plane" (N, H, W) float32 in [0, 1]
-                         using intrinsics transformed through resize + centred crop
-                         — attrs: table_z_m, depth_min, depth_max, description
+                         using intrinsics transformed through centred crop + resize
+                         — attrs: table_z_m, depth_min, depth_max,
+                           intrinsics_transform, description
 
 Optional debug image:
     debug/table_plane_debug.png  — GT depth | table-plane depth side-by-side
                                    for 8 evenly-spaced frames
 
+The default plane height is the bottom of the workspace cube plus
+TABLE_Z_OFFSET (config.py), i.e. z = -0.02 m.
+
 Usage:
     python3 data_precomputation/precompute_table_plane.py
-    python3 data_precomputation/precompute_table_plane.py --data_dir data/new/train/1
+    python3 data_precomputation/precompute_table_plane.py --data_dir data/Event_and_Depth/eval/20
     python3 data_precomputation/precompute_table_plane.py --debug --overwrite
-    python3 data_precomputation/precompute_table_plane.py --table_z 0.02
+    python3 data_precomputation/precompute_table_plane.py --table_z -0.025
 """
 
 import argparse
@@ -98,8 +102,8 @@ def _compute_channel(
     Return (out_H, out_W) float32 channel: per-pixel depth [m] to the table
     plane  z = table_z  in the robot base frame, normalised to [0, 1].
 
-    Pixels whose rays are parallel to the plane or face away from it are set
-    to 0 (they would need depth_max or more, so they're outside the range).
+    Pixels whose rays are parallel to the plane or point away from it never
+    hit the table; they are assigned depth_max, i.e. a channel value of 1.
     """
     K = K_native.copy()
     K[0, :] *= out_W / native_W
@@ -192,7 +196,7 @@ def process_sequence(
     overwrite: bool = False,
     debug:     bool = False,
 ) -> dict:
-    """Compute and save the canonical corrected table_plane.h5 prior."""
+    """Compute and save the table_plane.h5 prior of one sequence."""
     result = {"name": seq_dir.name, "success": False, "n_frames": 0, "error": None}
 
     depth_h5_path = seq_dir / "hdf5" / "depth_in_event_frame.h5"
@@ -286,6 +290,8 @@ def process_sequence(
             (resize_H, resize_W),
             (crop_H, crop_W),
         )
+        # K_for_table is already at the output resolution, so the rescaling
+        # inside _compute_channel is the identity.
         K_native_H, K_native_W = H, W
 
         for fi in tqdm(range(n_frames), desc=seq_dir.name, leave=False):
@@ -314,7 +320,7 @@ def process_sequence(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Precompute the corrected table-plane depth prior "
+            "Precompute the table-plane depth prior "
             "(hdf5/table_plane.h5)."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,

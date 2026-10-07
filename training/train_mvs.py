@@ -331,12 +331,8 @@ class MultiViewTableDataset(Dataset):
         return len(self.valid_indices)
 
     def _load_input(self, idx: int) -> torch.Tensor:
-        vox = self._vox[idx]
-        if vox.dtype == np.float16:
-            vox = vox.astype(np.float32)
-        else:
-            vox = vox.astype(np.float32)
-        vox_t = torch.from_numpy(vox)
+        """Return the voxel grid of one frame with its table-plane channel appended."""
+        vox_t = torch.from_numpy(self._vox[idx].astype(np.float32))
         _, h, w = vox_t.shape
 
         tbl = self._tbl[idx].astype(np.float32)
@@ -1058,7 +1054,6 @@ class ModernMVSNet(nn.Module):
         return final_norm
 
 
-
 # Network hyperparameters: each one is a ModernMVSNet argument, a command-line
 # option of this script, and a checkpoint key with the same name.
 MODEL_ARGS = (
@@ -1106,6 +1101,7 @@ def load_checkpoint(path: Path, device: torch.device) -> tuple[ModernMVSNet, dic
     return model.eval(), ckpt
 
 
+# ---------------------------------------------------------------------------
 # Training / validation
 # ---------------------------------------------------------------------------
 

@@ -10,6 +10,7 @@ training/checkpoints/
 **/*.sif
 **/*.def
 training/evaluation_results/
+reconstruction_results/
 instructions
 .vscode
 **/viz_and_tests

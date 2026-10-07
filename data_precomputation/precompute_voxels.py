@@ -3,14 +3,14 @@
 Precompute frame-aligned voxel grids from raw events.
 
 Raw event-camera recordings are split by the RealSense hardware-trigger
-timestamps and accumulated into temporal bins. Trigger data are read from the
-RAW recording, with the event HDF5 copy used as a fallback. Each grid receives
-the same centred crop and resize used by depth projection and model inference.
-The resulting ``hdf5/voxels.h5`` can be loaded directly during training.
+timestamps, which the raw recording stores as external-trigger events, and
+accumulated into temporal bins. Each grid receives the same centred crop and
+resize used by depth projection and model inference. The resulting
+``events/voxels_cam0.h5`` is loaded directly during training.
 
 Usage:
-    python3 data_precomputation/precompute_voxels.py --data_root data/new/train
-    python3 data_precomputation/precompute_voxels.py --data_dir data/new/train/1 data/new/train/2
+    python3 data_precomputation/precompute_voxels.py --data_root data/Event_and_Depth/train
+    python3 data_precomputation/precompute_voxels.py --data_dir data/Event_and_Depth/eval/20 --float16
 
 Hardware-trigger alignment is required; recordings without trigger timestamps
 are rejected instead of falling back to cross-clock elapsed-time estimates.
@@ -81,8 +81,8 @@ def events_to_voxel_grid(
     p = events['p'].astype(np.float32)  # 0 or 1
     t = events['t'].astype(np.float64)
     
-    # Apply 180° rotation to match the HDF5 event frames
-    # (generate_event_videos applies cv2.ROTATE_180)
+    # The event camera is mounted upside down. Rotate by 180° into the image
+    # orientation in which it was calibrated (camera_data/event_intrinsics.npz).
     x = (width  - 1) - x
     y = (height - 1) - y
     
@@ -178,7 +178,7 @@ def load_events_from_raw(raw_path: Path) -> np.ndarray:
 
 def process_sequence(
     sequence_dir: Path,
-    num_bins: int = 5,
+    num_bins: int = NUM_BINS,
     overwrite: bool = False,
     output_hw: Tuple[int, int] = PREPROCESS_RESIZE_HW,
     as_float16: bool = False,
@@ -391,7 +391,7 @@ def main():
                        help="Sequence directory(ies) to process")
     parser.add_argument("--data_root", type=str, default=str(DATA_ROOT),
                        help="Root data directory (will process all subdirs)")
-    parser.add_argument("--num_bins", type=int, default=5,
+    parser.add_argument("--num_bins", type=int, default=NUM_BINS,
                        help="Number of temporal bins for voxel grid")
     parser.add_argument("--overwrite", action="store_true",
                        help="Overwrite existing voxel files")
@@ -408,7 +408,8 @@ def main():
     parser.add_argument("--crop_w", type=int, default=PREPROCESS_CROP_HW[1],
                        help="Native center-crop width")
     parser.add_argument("--float16", action="store_true",
-                       help="Store voxels as float16 instead of float32 (2x extra space saving).")
+                       help="Store voxels as float16 instead of float32 (half the size; "
+                            "the published dataset uses float16).")
     parser.add_argument("--no_normalize", "--no-normalize", action="store_true",
                        help="Store raw accumulated voxel event counts without mean/std normalization.")
     args = parser.parse_args()

@@ -9,12 +9,16 @@ computing it on-the-fly.
 
 Predicted and GT depth maps of evenly spaced frames are fused into TSDF meshes
 that are cropped to the workspace cube, and the predicted surface is compared
-with the GT surface. Predictions can be fused uniformly, weighted by the
-learned per-pixel confidence, or both for a direct comparison.
+with the GT surface. By default predictions are fused weighted by the learned
+per-pixel confidence; uniform fusion, or both for a direct comparison, and
+largest-connected-surface copies of the meshes are only written on request.
 
-Outputs, by default below <data_dir>/reconstruction_output/<checkpoint_name>/:
+Outputs, by default below reconstruction_results/<checkpoint_name>/ next to this script:
   <sequence>/<sequence>_gt_mesh.obj         — TSDF-fused GT mesh
-  <sequence>/<sequence>_<variant>_mesh.obj  — TSDF-fused predicted mesh
+  <sequence>/<sequence>_<variant>_mesh.obj  — TSDF-fused predicted mesh, where
+                                              <variant> is uncertainty_weighted
+                                              and/or uniform
+  <sequence>/*_largest_component.obj        — only with --save_largest_connected_surface
   <sequence>/reconstruction_metrics.json/.txt
   reconstruction_summary.json/.txt          — means over all sequences
   chamfer_by_object.png
@@ -67,7 +71,7 @@ from helpers import (
 from train_mvs import _inverse_depth_candidates, load_checkpoint
 
 CALIB_DIR = _HERE / _CALIB_DIR
-OUTPUT_DIRNAME = "reconstruction_output"
+OUTPUT_ROOT = _HERE / "reconstruction_results"
 # Surface metrics written to the per-sequence and summary files.
 SURFACE_METRICS = (
     "accuracy_mean_m", "accuracy_median_m", "completeness_mean_m",
@@ -322,6 +326,8 @@ def tsdf_fuse(
           f"(voxel={voxel_length * 1000:.1f} mm, trunc={sdf_trunc * 1000:.1f} mm"
           f"{weighting_msg}) …")
 
+    # Open3D expects the extrinsic as world-to-camera; depth beyond depth_max
+    # is ignored.
     def integrate_depth(depth_m: np.ndarray, T_cam_from_world: np.ndarray) -> None:
         depth_o3d = o3d.geometry.Image(np.ascontiguousarray(depth_m, dtype=np.float32))
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
@@ -849,7 +855,7 @@ def main() -> None:
         ),
     )
     parser.add_argument("--out_dir", type=Path, default=None,
-                        help="Output directory (default: <data_dir>/reconstruction_output/<checkpoint_name>)")
+                        help="Output directory (default: reconstruction_results/<checkpoint_name>)")
     parser.add_argument("--mesh_frame_count", type=int, default=80,
                         help="Number of evenly spaced frames fused into each mesh")
     pose_layout_group = parser.add_mutually_exclusive_group()
@@ -874,15 +880,17 @@ def main() -> None:
     parser.set_defaults(pose_layout_override=None)
     parser.add_argument("--voxel_size",        type=float, default=TSDF_VOXEL_SIZE)
     parser.add_argument("--sdf_trunc_factor",  type=float, default=TSDF_SDF_TRUNC_FACTOR)
-    parser.add_argument(
-        "--uncertainty_weighted_tsdf",
+    fusion_group = parser.add_mutually_exclusive_group()
+    fusion_group.add_argument(
+        "--uniform_tsdf",
         action="store_true",
         help=(
-            "Weight predicted TSDF updates with the checkpoint's learned "
-            "per-pixel confidence; does not affect GT TSDF fusion"
+            "Fuse the predicted mesh uniformly instead of weighting it with the "
+            "checkpoint's learned per-pixel confidence (needed for checkpoints "
+            "trained without --uncertainty)"
         ),
     )
-    parser.add_argument(
+    fusion_group.add_argument(
         "--compare_uncertainty_tsdf",
         "--compare-uncertainty-tsdf",
         action="store_true",
@@ -925,7 +933,11 @@ def main() -> None:
     if args.surface_samples <= 0:
         parser.error("--surface_samples must be > 0")
     if not args.checkpoint.is_file():
-        parser.error(f"Checkpoint does not exist: {args.checkpoint}")
+        parser.error(
+            f"Checkpoint does not exist: {args.checkpoint}\n"
+            "  Download the pretrained model (README, section 'Pretrained model') "
+            "or train one with training/train_mvs.sh."
+        )
 
     sequence_dirs = find_precomputed_sequences(args.data_dir)
     if not sequence_dirs:
@@ -935,23 +947,22 @@ def main() -> None:
         )
     if args.compare_uncertainty_tsdf:
         variants = ["uniform", "uncertainty_weighted"]
-    elif args.uncertainty_weighted_tsdf:
-        variants = ["uncertainty_weighted"]
-    else:
+    elif args.uniform_tsdf:
         variants = ["uniform"]
+    else:
+        variants = ["uncertainty_weighted"]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, ckpt = load_checkpoint(args.checkpoint, device)
     if "uncertainty_weighted" in variants and not ckpt.get("uncertainty", False):
         parser.error(
-            "Learned uncertainty requires a train_mvs.py checkpoint trained with --uncertainty"
+            "Learned uncertainty requires a train_mvs.py checkpoint trained with "
+            "--uncertainty; use --uniform_tsdf for other checkpoints"
         )
     if args.pose_layout_override is not None:
         ckpt["allow_unbalanced_pose_views"] = args.pose_layout_override
         ckpt["allow_fewer_pose_views"] = args.pose_layout_override
-    output_root = args.out_dir or (
-        args.data_dir / OUTPUT_DIRNAME / args.checkpoint.stem
-    )
+    output_root = args.out_dir or OUTPUT_ROOT / args.checkpoint.stem
     output_root.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoint : {args.checkpoint.name} (device {device})")
     print(f"Variants   : {', '.join(variants)}")
