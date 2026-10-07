@@ -174,16 +174,16 @@ scripts and launchers, with:
 python3 download_dataset.py
 ```
 
-By default this downloads the training and evaluation sequences with the
-precomputed model inputs (about 60 GB), which is all that training,
-evaluation, and reconstruction need. Options:
+By default this downloads every file of the 42 training and 6 evaluation
+sequences (about 154 GB). Training, evaluation, and reconstruction only need
+the precomputed model inputs, which `--precomputed_only` selects (about
+60 GB). Options:
 
 | Option | Effect |
 | --- | --- |
-| `--files precomputed` (default) | Voxel grids, ground-truth depth, poses, and table priors (about 60 GB for `train` and `eval`). |
-| `--files raw` | Raw event streams, RealSense recordings, and poses: the inputs of the preprocessing (about 91 GB). |
-| `--files all` | Every file of the selected sequences (about 154 GB for `train` and `eval`). |
-| `--splits train eval special eval_and_special` | Dataset folders to download (default: `train eval`). |
+| `--precomputed_only` | Voxel grids, ground-truth depth, poses, and table priors: the inputs of training, evaluation, and reconstruction (about 60 GB). |
+| `--raw_only` | Raw event streams, RealSense recordings, and poses: the inputs of the preprocessing (about 91 GB). |
+| `--eval_only` | Only the evaluation sequences (about 21 GB). Can be combined with `--precomputed_only` (about 8 GB) or `--raw_only` (about 12 GB). |
 | `--sequences 20 25` | Download only the named sequences. |
 | `--dry_run` | Print the number of files and the download size without downloading. |
 
@@ -213,7 +213,9 @@ The recordings are organized into four folders. Each recording is one
 The objects of the evaluation sequences do not appear in the training
 sequences, and there is no separate test set. `eval_and_special/` contains the
 same data as `eval/` and `special/`, so it does not need to be downloaded in
-addition to those two folders.
+addition to those two folders. `download_dataset.py` fetches only `train/` and
+`eval/`; `special/` and `eval_and_special/` can be downloaded from the dataset
+page on the Hugging Face Hub.
 
 ### Sequence directory
 
@@ -234,8 +236,8 @@ inputs derived from it:
     └── rgb_in_event_frame.h5    other  RGB in the event-camera frame (visualization only)
 ```
 
-Files marked *model* are the precomputed model inputs (`--files precomputed`),
-files marked *raw* are the inputs of the preprocessing (`--files raw`), and
+Files marked *model* are the precomputed model inputs (`--precomputed_only`),
+files marked *raw* are the inputs of the preprocessing (`--raw_only`), and
 `poses.h5` belongs to both. A sequence can be used for training, evaluation,
 and reconstruction once its four model inputs exist.
 
@@ -367,7 +369,7 @@ repository and remain available after the container exits.
 ### Preprocessing (optional)
 
 The downloaded dataset already contains the model inputs, so this step is only
-needed for raw data: after `download_dataset.py --files raw`, or for your own
+needed for raw data: after `download_dataset.py --raw_only`, or for your own
 recordings in the format described above. It requires `raw_event_data/`,
 `hdf5/realsense.h5`, and `hdf5/poses.h5` in every sequence and the
 calibration in `camera_data/`.

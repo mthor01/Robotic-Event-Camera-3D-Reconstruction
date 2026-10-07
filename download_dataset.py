@@ -7,21 +7,22 @@ evaluation, and reconstruction scripts expect:
 
     data/Event_and_Depth/{train,eval}/<sequence>/...
 
-Two further folders can be selected with --splits: special/ (sequences 40
-and 60) and eval_and_special/ (the evaluation sequences plus special/).
-
-By default only the precomputed model inputs are downloaded (about 60 GB for
-train and eval). Use --files raw for the recorder files needed to rerun
-data_precomputation/precompute_all.sh, or --files all for every file.
+By default every file of the train and eval sequences is downloaded (about
+154 GB). --precomputed_only restricts the download to the model inputs that
+training, evaluation, and reconstruction read (about 60 GB), --raw_only to
+the recorder files needed to rerun data_precomputation/precompute_all.sh
+(about 91 GB). --eval_only restricts the download to the evaluation
+sequences and can be combined with either of the two.
 Files that are already complete are skipped, so an interrupted download can
 simply be restarted.
 
 Usage:
-    python3 download_dataset.py                      # train + eval model inputs
-    python3 download_dataset.py --splits eval        # evaluation sequences only
-    python3 download_dataset.py --sequences 20 25    # selected sequences only
-    python3 download_dataset.py --files raw          # inputs for precompute_all.sh
-    python3 download_dataset.py --dry_run            # list sizes, download nothing
+    python3 download_dataset.py                                # everything
+    python3 download_dataset.py --precomputed_only             # model inputs only
+    python3 download_dataset.py --raw_only                     # inputs for precompute_all.sh
+    python3 download_dataset.py --eval_only --precomputed_only # evaluation inputs only
+    python3 download_dataset.py --sequences 20 25              # selected sequences only
+    python3 download_dataset.py --dry_run                      # list sizes, download nothing
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ from config import DATA_ROOT
 
 REPO_ID = "mthor/Event_and_Depth"
 REPO_DIR = Path(__file__).resolve().parent
-SPLITS = ("train", "eval", "special", "eval_and_special")
+SPLITS = ("train", "eval")
 FILE_SETS = {
     # Inputs of training, evaluation, and reconstruction.
     "precomputed": (
@@ -71,10 +72,13 @@ def main() -> None:
     )
     parser.add_argument("--out_dir", type=Path, default=REPO_DIR / DATA_ROOT,
                         help="Target directory (default: data/Event_and_Depth)")
-    parser.add_argument("--splits", nargs="+", choices=SPLITS, default=["train", "eval"],
-                        help="Dataset folders to download")
-    parser.add_argument("--files", choices=(*FILE_SETS, "all"), default="precomputed",
-                        help="precomputed: model inputs; raw: inputs of precompute_all.sh; all: everything")
+    parser.add_argument("--eval_only", action="store_true",
+                        help="Download only the evaluation sequences")
+    file_group = parser.add_mutually_exclusive_group()
+    file_group.add_argument("--precomputed_only", action="store_true",
+                            help="Download only the inputs of training, evaluation, and reconstruction")
+    file_group.add_argument("--raw_only", action="store_true",
+                            help="Download only the recorder files that precompute_all.sh needs")
     parser.add_argument("--sequences", nargs="+", default=None,
                         help="Download only these sequence names, for example 20 25")
     parser.add_argument("--workers", type=int, default=8,
@@ -82,6 +86,8 @@ def main() -> None:
     parser.add_argument("--dry_run", action="store_true",
                         help="Only print what would be downloaded")
     args = parser.parse_args()
+    splits = ("eval",) if args.eval_only else SPLITS
+    file_set = "precomputed" if args.precomputed_only else "raw" if args.raw_only else "all"
 
     try:
         from huggingface_hub import HfApi, snapshot_download
@@ -97,11 +103,11 @@ def main() -> None:
         if getattr(entry, "size", None) is None or len(parts) != 3:
             continue  # folders and repository files such as .gitattributes
         split, sequence, relative = parts
-        if split not in args.splits or relative.endswith(".tmp_index"):
+        if split not in splits or relative.endswith(".tmp_index"):
             continue  # .tmp_index files are caches that Metavision rebuilds
         if args.sequences is not None and sequence not in args.sequences:
             continue
-        if args.files != "all" and relative not in FILE_SETS[args.files]:
+        if file_set != "all" and relative not in FILE_SETS[file_set]:
             continue
         selected.append(entry)
     if not selected:
@@ -110,7 +116,7 @@ def main() -> None:
         found = {entry.path.split("/")[1] for entry in selected}
         unknown = sorted(set(args.sequences) - found)
         if unknown:
-            sys.exit(f"[ERROR] Sequences not found in {args.splits}: {unknown}")
+            sys.exit(f"[ERROR] Sequences not found in {', '.join(splits)}: {unknown}")
 
     missing = [
         entry for entry in selected
@@ -123,7 +129,7 @@ def main() -> None:
     print(f"Dataset   : https://huggingface.co/datasets/{REPO_ID}")
     print(f"Target    : {args.out_dir}")
     print(f"Sequences : {', '.join(f'{count} {split}' for split, count in sequences.items())}")
-    print(f"Files     : {len(selected)} ({args.files}), {format_size(sum(e.size for e in selected))}")
+    print(f"Files     : {len(selected)} ({file_set}), {format_size(sum(e.size for e in selected))}")
     needed = sum(entry.size for entry in missing)
     available = free_space(args.out_dir)
     print(f"To fetch  : {len(missing)} files, {format_size(needed)} "
@@ -142,7 +148,7 @@ def main() -> None:
         max_workers=args.workers,
     )
     print(f"\nDone. Dataset stored in {args.out_dir}")
-    if args.files == "raw":
+    if file_set == "raw":
         print("Run ./data_precomputation/precompute_all.sh to create the model inputs.")
 
 
