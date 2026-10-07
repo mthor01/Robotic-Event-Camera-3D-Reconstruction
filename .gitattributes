@@ -1,0 +1,4 @@
+# Everything runs in a Linux container, so keep LF line endings on every
+# platform. CRLF from a Windows checkout breaks the shell scripts and the
+# python3 shebangs.
+* text=auto eol=lf

@@ -3,7 +3,7 @@ FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /work
 
-# Basic tools + deps mentioned in the 4.6.2 Linux install doc
+# Basic tools + deps mentioned in the Metavision Linux install doc
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl gnupg lsb-release \
     usbutils libusb-1.0-0 \
@@ -11,28 +11,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip python3-dev \
  && rm -rf /var/lib/apt/lists/*
 
-# 1) Add Prophesee APT repo list (this is your downloaded file)
-COPY metavision.list /etc/apt/sources.list.d/metavision.list
-
-# (Optional) Pin to a specific SDK version if needed (doc shows pinning example)
-# Replace 4.6.2 with the exact version string if the repo uses 4.6.2.0 / 4.6.2-1 etc.
-RUN printf "Package: metavision-*\nPin: version 4.6.2*\nPin-Priority: 1001\n" \
-    > /etc/apt/preferences.d/prophesee
-
-# 2) Install Metavision SDK packages
-RUN apt-get update \
- && apt-get install -y metavision-sdk \
- && rm -rf /var/lib/apt/lists/*
-
-# Optional: if you need python 3.9 bindings on Ubuntu 22.04 (doc mentions this extra package)
-# RUN apt-get update && apt-get install -y metavision-sdk-python3.9 && rm -rf /var/lib/apt/lists/*
-
-# Copy IDS uEye EVS plugin (must match SDK 4.6.2)
-COPY ueye-evs_4.6.2.2_amd64.deb /tmp/
-
-RUN apt-get update \
- && apt-get install -y /tmp/ueye-evs_4.6.2.2_amd64.deb \
- && rm /tmp/ueye-evs_4.6.2.2_amd64.deb \
+# Install OpenEB, the open-source part of the Metavision SDK, from Prophesee's
+# public APT repository (no login needed). Preprocessing only uses
+# metavision_core.event_io to read the raw event files, so neither the full
+# SDK nor the IDS uEye EVS camera plugin is needed. The old repository
+# apt.prophesee.ai is offline and the public one only offers OpenEB 5.x.
+# Pinning the meta package pins all of its components, which require the
+# exact same version.
+RUN curl -fsSL https://propheseeai.jfrog.io/artifactory/api/security/keypair/prophesee-gpg/public \
+      -o /etc/apt/keyrings/prophesee.asc \
+ && echo "deb [signed-by=/etc/apt/keyrings/prophesee.asc] https://propheseeai.jfrog.io/artifactory/openeb-debian/ jammy main" \
+      > /etc/apt/sources.list.d/openeb.list \
+ && apt-get update \
+ && apt-get install -y metavision-openeb=5.3.0 \
  && rm -rf /var/lib/apt/lists/*
 
 
@@ -63,9 +54,6 @@ ARG GID=5018
 
 RUN groupadd -g $GID cs_stud || true && \
     useradd -m -u $UID -g $GID mthormann || true
-
-RUN chown root:root /usr/share/metavision/apps/metavision_studio/internal/client/chrome-sandbox \
- && chmod 4755 /usr/share/metavision/apps/metavision_studio/internal/client/chrome-sandbox
 
 USER mthormann
 

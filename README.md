@@ -129,8 +129,9 @@ reconstructed meshes achieve an accuracy of **0.108 cm**, completeness of
 
 Everything runs inside the Docker image defined in
 `docker_installation/training_and_reconstruction/`. It contains PyTorch,
-Open3D, the Metavision SDK (needed only to read raw event files during
-preprocessing), and `huggingface_hub`. A Linux machine with an NVIDIA GPU and
+Open3D, OpenEB 5.3 (the open-source part of the Prophesee Metavision SDK,
+needed only to read raw event files during preprocessing), and
+`huggingface_hub`. A Linux machine with an NVIDIA GPU and
 the NVIDIA Container Toolkit is recommended for training and reconstruction.
 
 Build the image from the repository root. Supplying the local user and group
