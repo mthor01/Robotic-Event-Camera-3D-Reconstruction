@@ -275,52 +275,13 @@ skipped, so an interrupted download can simply be restarted.
 The structure and contents of the files are described in detail in
 [Dataset format](#dataset-format) at the end of this README.
 
-## Pretrained model
-
-The model reported in the thesis is published as `MVS.pth` (109 MB) in the
-[`master-thesis-mvs-final-weights` release](https://github.com/mthor01/robot_and_record/releases/tag/master-thesis-mvs-final-weights).
-Download it to `training/checkpoints/mvs/`, where `training/evaluation.sh` and
-`reconstruction.sh` expect it by default:
-
-```bash
-curl -L --create-dirs -o training/checkpoints/mvs/MVS.pth \
-  https://github.com/mthor01/robot_and_record/releases/download/master-thesis-mvs-final-weights/MVS.pth
-sha256sum training/checkpoints/mvs/MVS.pth
-# 4a3d6baf7fa03394a0de4ae0647a09b0833e1fe3ebd917b89b578a5888ebd3e5
-```
-
-The checkpoint contains the weights with the lowest validation L1 error and
-all settings needed to rebuild the network, so it can be used directly for
-[evaluation](#evaluation) and [reconstruction](#reconstruction). Its
-configuration is the default of `training/train_mvs.py`.
-
-## Usage
-
-The three launchers `training/train_mvs.sh`, `training/evaluation.sh`, and
-`reconstruction.sh` collect their settings in a configuration block at the top
-of the file. They work with the downloaded dataset as they are; edit the block
-to change paths, checkpoints, or parameters. Arguments given on the command
-line are appended, which is convenient for short experiments:
-
-```bash
-./training/train_mvs.sh --epochs 5 --name smoke_test
-```
-
-The scripts find the repository from their own location, so they can be
-started from any directory. They change into the directory that contains them,
-so relative paths in their configuration block and on the command line are
-relative to `training/` for `train_mvs.sh` and `evaluation.sh` and to the
-repository root for `reconstruction.sh` and
-`data_precomputation/precompute_all.sh`. All outputs are written into the
-mounted repository and remain available after the container exits.
-
 ### Preprocessing (optional)
 
 The downloaded dataset already contains the model inputs, so this step is only
 needed for raw data: after `download_dataset.py --raw_only`, or for your own
-recordings in the format described in [Dataset format](#dataset-format). It requires `raw_event_data/`,
-`hdf5/realsense.h5`, and `hdf5/poses.h5` in every sequence and the
-calibration in `camera_data/`.
+recordings in the format described in [Dataset format](#dataset-format). It
+requires `raw_event_data/`, `hdf5/realsense.h5`, and `hdf5/poses.h5` in every
+sequence and the calibration in `camera_data/`.
 
 ```bash
 # every sequence below data/ (default)
@@ -344,6 +305,32 @@ To use your own dataset, arrange the sequence directories into `train/` and
 `eval/` folders as in the published dataset and set the `DATA_DIR` values of
 the three launchers accordingly. Recordings from another setup also need their
 own calibration in `camera_data/`.
+
+## Pretrained model
+
+The model reported in the thesis is published as `MVS.pth` (109 MB) in the
+[`master-thesis-mvs-final-weights` release](https://github.com/mthor01/robot_and_record/releases/tag/master-thesis-mvs-final-weights).
+Download it to `training/checkpoints/mvs/`, where `training/evaluation.sh` and
+`reconstruction.sh` expect it by default:
+
+```bash
+curl -L --create-dirs -o training/checkpoints/mvs/MVS.pth \
+  https://github.com/mthor01/robot_and_record/releases/download/master-thesis-mvs-final-weights/MVS.pth
+sha256sum training/checkpoints/mvs/MVS.pth
+# 4a3d6baf7fa03394a0de4ae0647a09b0833e1fe3ebd917b89b578a5888ebd3e5
+```
+
+The checkpoint contains the weights with the lowest validation L1 error and
+all settings needed to rebuild the network, so it can be used directly for
+[evaluation](#evaluation) and [reconstruction](#reconstruction). Its
+configuration is the default of `training/train_mvs.py`.
+
+## Usage
+
+The launchers `training/train_mvs.sh`, `training/evaluation.sh`, and
+`reconstruction.sh` keep their settings in a configuration block at the top of
+the file, and arguments given on the command line are appended. Relative paths
+are relative to the directory of the launcher.
 
 ### Training
 
