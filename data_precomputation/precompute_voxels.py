@@ -9,8 +9,8 @@ resize used by depth projection and model inference. The resulting
 ``events/voxels_cam0.h5`` is loaded directly during training.
 
 Usage:
-    python3 data_precomputation/precompute_voxels.py --data_root data/Event_and_Depth/train
-    python3 data_precomputation/precompute_voxels.py --data_dir data/Event_and_Depth/eval/20 --float16
+    python3 data_precomputation/precompute_voxels.py --data_root data/train
+    python3 data_precomputation/precompute_voxels.py --data_dir data/eval/20 --float16
 
 Hardware-trigger alignment is required; recordings without trigger timestamps
 are rejected instead of falling back to cross-clock elapsed-time estimates.

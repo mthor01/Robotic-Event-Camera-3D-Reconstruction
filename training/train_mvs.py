@@ -21,7 +21,7 @@ returned. Source views are selected by camera motion between frames.
 All defaults reproduce the configuration of the model used in the thesis.
 
 Usage:
-    python3 training/train_mvs.py --data_dir data/Event_and_Depth --name my_run
+    python3 training/train_mvs.py --data_dir data --name my_run
     python3 training/train_mvs.py --name small --num_views 5 --feature_channels 64
 """
 

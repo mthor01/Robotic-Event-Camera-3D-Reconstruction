@@ -18,7 +18,7 @@ cd "$SCRIPT_DIR"
 # ---------------------------------------------------------------------------
 # Configuration: edit dataset, checkpoint, and TSDF settings here.
 # ---------------------------------------------------------------------------
-DATA_DIR="data/Event_and_Depth/eval"
+DATA_DIR="data/eval"
 CHECKPOINT="training/checkpoints/mvs/MVS.pth"
 
 ARGS=(

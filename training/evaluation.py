@@ -4,7 +4,7 @@
 Example:
     python3 evaluation.py \\
         --checkpoint checkpoints/mvs/best_model.pth \\
-        --data_dir ../data/Event_and_Depth/eval
+        --data_dir ../data/eval
 
 The data directory may be either a folder containing multiple sequence
 folders or one sequence folder. Depth metrics are reported for the whole

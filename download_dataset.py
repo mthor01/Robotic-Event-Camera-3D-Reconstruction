@@ -5,7 +5,7 @@ The dataset (https://huggingface.co/datasets/mthor/Event_and_Depth) contains
 42 training and 6 evaluation sequences in the layout that the training,
 evaluation, and reconstruction scripts expect:
 
-    data/Event_and_Depth/{train,eval}/<sequence>/...
+    data/{train,eval}/<sequence>/...
 
 By default every file of the train and eval sequences is downloaded (about
 154 GB). --precomputed_only restricts the download to the model inputs that
@@ -71,7 +71,7 @@ def main() -> None:
         description=f"Download the {REPO_ID} dataset from the Hugging Face Hub."
     )
     parser.add_argument("--out_dir", type=Path, default=REPO_DIR / DATA_ROOT,
-                        help="Target directory (default: data/Event_and_Depth)")
+                        help="Target directory (default: data)")
     parser.add_argument("--eval_only", action="store_true",
                         help="Download only the evaluation sequences")
     file_group = parser.add_mutually_exclusive_group()

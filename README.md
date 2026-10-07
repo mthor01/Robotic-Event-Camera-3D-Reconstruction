@@ -38,7 +38,7 @@ of the model reported in the thesis.
 
 ## What you can do with the light version
 
-- **Download the dataset** of 50 recorded sequences, either with precomputed
+- **Download the dataset** of 48 recorded sequences, either with precomputed
   model inputs or as raw recordings ([Dataset](#dataset)).
 - **Use the pretrained model** of the thesis to evaluate and reconstruct
   without training ([Pretrained model](#pretrained-model)).
@@ -54,6 +54,35 @@ of the model reported in the thesis.
 - **Reconstruct 3-D meshes** by fusing predicted depth maps with uniform or
   confidence-weighted TSDF integration, and compare them with meshes from the
   ground-truth depth ([Reconstruction](#reconstruction)).
+
+## Quick start
+
+Build and start the Docker container as described in
+[Installation](#installation), then run the following commands in it from the
+repository root:
+
+```bash
+# 1. Download the dataset: the model inputs of all 48 sequences (about 60 GB)
+python3 download_dataset.py --precomputed_only
+#    or only those of the 6 evaluation sequences (about 8 GB), which suffice
+#    for evaluation and reconstruction but not for training
+python3 download_dataset.py --precomputed_only --eval_only
+
+# 2. Download the pretrained model of the thesis
+curl -L --create-dirs -o training/checkpoints/mvs/MVS.pth \
+  https://github.com/mthor01/robot_and_record/releases/download/master-thesis-mvs-final-weights/MVS.pth
+
+# 3. Train, evaluate, and reconstruct
+./training/train_mvs.sh     # checkpoints in training/checkpoints/mvs/
+./training/evaluation.sh    # depth metrics in training/evaluation_results/
+./reconstruction.sh         # meshes and surface metrics in reconstruction_results/
+```
+
+`training/evaluation.sh` and `reconstruction.sh` use the pretrained model
+`training/checkpoints/mvs/MVS.pth` by default, so they can be run without
+training. To use a model you trained yourself, set `CHECKPOINT` in both
+scripts to its checkpoint, for example `best_l1_mvs.pth` (see
+[Evaluation](#evaluation) and [Reconstruction](#reconstruction)).
 
 ## Method overview
 
@@ -115,8 +144,8 @@ reconstructed meshes achieve an accuracy of **0.108 cm**, completeness of
 
 These results are obtained with the [pretrained model](#pretrained-model).
 The depth metrics are the workspace-cube results of `training/evaluation.sh`
-on all frames, and the mesh metrics are those of `reconstruction.sh` with
-`--save_largest_connected_surface` (see [Usage](#usage)).
+on all frames, and the mesh metrics are those of `reconstruction.sh` (see
+[Usage](#usage)).
 
 ## Repository layout
 
@@ -127,12 +156,13 @@ on all frames, and the mesh metrics are those of `reconstruction.sh` with
 | `helpers.py` | Camera geometry, dataset discovery, workspace masks, and source-view selection. |
 | `camera_data/` | Calibration of the recording setup (intrinsics, extrinsics, depth scale). |
 | `data_precomputation/` | Preprocessing of raw recordings into model inputs. |
-| `training/train_mvs.py`, `train_mvs.sh` | MVS network, dataset loader, and training loop, with its launcher. |
-| `training/evaluation.py`, `evaluation.sh` | Depth evaluation, with its launcher. |
-| `training/depth_losses.py`, `tensorboard_helper.py` | Training losses and TensorBoard logging. |
+| `training/train_mvs.py`, `training/train_mvs.sh` | MVS network, dataset loader, and training loop, with its launcher. |
+| `training/evaluation.py`, `training/evaluation.sh` | Depth evaluation, with its launcher. |
+| `training/depth_losses.py`, `training/tensorboard_helper.py` | Training losses and TensorBoard logging. |
 | `reconstruction.py`, `reconstruction.sh` | TSDF reconstruction and surface metrics, with its launcher. |
 | `docker_installation/training_and_reconstruction/` | Dockerfile of the software environment. |
-| `data/` | Datasets (created by `download_dataset.py`, not tracked by git). |
+| `docs/images/` | Images used in this README. |
+| `data/` | Dataset with the `train/` and `eval/` sequences (created by `download_dataset.py`, not tracked by git). |
 | `training/checkpoints/`, `training/evaluation_results/`, `reconstruction_results/` | Checkpoints and outputs of training, evaluation, and reconstruction (created by the scripts, not tracked by git). |
 
 ## Installation
@@ -174,12 +204,43 @@ All commands below are run from this container shell in `/workspace`. Adjust
 
 ## Dataset
 
+<p align="center">
+  <img src="docs/images/cameras.jpg" alt="Close-up of the synchronized event and RGB-D cameras mounted on the robot end effector" width="760">
+</p>
+
+<p align="center"><em>The event camera and RealSense depth camera on the custom end-effector mount.</em></p>
+
+<p align="center">
+  <img src="docs/images/robot_arm.jpg" alt="Franka robot recording a building-block object on the tabletop" width="560">
+</p>
+
+<p align="center"><em>The complete recording setup with a static building-block object in the workspace.</em></p>
+
+The dataset contains 48 object-specific recordings of static, colored
+building-block structures on a mostly textureless white table. For every
+recording, the robot moves the camera rig along a smooth path through randomly
+sampled, reachable viewpoints on a restricted hemisphere around the object.
+Each trajectory is constructed from 30 target poses and is recorded
+continuously, producing synchronized event streams, RGB-D measurements, and
+camera poses at 30 frames per second.
+
+The recordings are split into a training and an evaluation folder. Each
+recording is one **sequence directory**, named by its recording number:
+
+| Folder | Sequences | Frames per sequence | Use |
+| --- | --- | --- | --- |
+| `train/` | 42: 21–24, 26–29, 31–39, 41–44, 46–49, 51–59, 61–64, 66–69 | 798–1571 (43,543 in total) | Training |
+| `eval/` | 6: 20, 25, 30, 50, 65, 70 | 922–1590 (6,959 in total) | Validation during training and the evaluation reported in the thesis |
+
+The objects of the evaluation sequences do not appear in the training
+sequences, and there is no separate test set.
+
 ### Download
 
 The dataset is published on the Hugging Face Hub as
 [`mthor/Event_and_Depth`](https://huggingface.co/datasets/mthor/Event_and_Depth).
-Download it into `data/Event_and_Depth/`, the default dataset location of all
-scripts and launchers, with:
+Download it into `data/`, the default dataset location of all scripts and
+launchers, with:
 
 ```bash
 python3 download_dataset.py
@@ -201,44 +262,201 @@ the precomputed model inputs, which `--precomputed_only` selects (about
 The script checks the free disk space before downloading. Complete files are
 skipped, so an interrupted download can simply be restarted.
 
-### Recordings
+The structure and contents of the files are described in detail in
+[Dataset format](#dataset-format) at the end of this README.
 
-<p align="center">
-  <img src="docs/images/cameras.jpg" alt="Close-up of the synchronized event and RGB-D cameras mounted on the robot end effector" width="760">
-</p>
+## Pretrained model
 
-<p align="center"><em>The event camera and RealSense depth camera on the custom end-effector mount.</em></p>
+The model reported in the thesis is published as `MVS.pth` (109 MB) in the
+[`master-thesis-mvs-final-weights` release](https://github.com/mthor01/robot_and_record/releases/tag/master-thesis-mvs-final-weights).
+Download it to `training/checkpoints/mvs/`, where `training/evaluation.sh` and
+`reconstruction.sh` expect it by default:
 
-<p align="center">
-  <img src="docs/images/robot_arm.jpg" alt="Franka robot recording a building-block object on the tabletop" width="560">
-</p>
+```bash
+curl -L --create-dirs -o training/checkpoints/mvs/MVS.pth \
+  https://github.com/mthor01/robot_and_record/releases/download/master-thesis-mvs-final-weights/MVS.pth
+sha256sum training/checkpoints/mvs/MVS.pth
+# 4a3d6baf7fa03394a0de4ae0647a09b0833e1fe3ebd917b89b578a5888ebd3e5
+```
 
-<p align="center"><em>The complete recording setup with a static building-block object in the workspace.</em></p>
+The checkpoint contains the weights with the lowest validation L1 error and
+all settings needed to rebuild the network, so it can be used directly for
+[evaluation](#evaluation) and [reconstruction](#reconstruction). Its
+configuration is the default of `training/train_mvs.py`.
 
-The dataset contains 50 object-specific recordings of static, colored
-building-block structures on a mostly textureless white table. For every
-recording, the robot moves the camera rig along a smooth path through randomly
-sampled, reachable viewpoints on a restricted hemisphere around the object.
-Each trajectory is constructed from 30 target poses and is recorded
-continuously, producing synchronized event streams, RGB-D measurements, and
-camera poses at 30 frames per second.
+## Usage
 
-The recordings are organized into four folders. Each recording is one
-**sequence directory**, named by its recording number:
+The three launchers `training/train_mvs.sh`, `training/evaluation.sh`, and
+`reconstruction.sh` collect their settings in a configuration block at the top
+of the file. They work with the downloaded dataset as they are; edit the block
+to change paths, checkpoints, or parameters. Arguments given on the command
+line are appended, which is convenient for short experiments:
 
-| Folder | Sequences | Frames per sequence | Use |
-| --- | --- | --- | --- |
-| `train/` | 42: 21–24, 26–29, 31–39, 41–44, 46–49, 51–59, 61–64, 66–69 | 798–1571 (43,543 in total) | Training |
-| `eval/` | 6: 20, 25, 30, 50, 65, 70 | 922–1590 (6,959 in total) | Validation during training and the evaluation reported in the thesis |
-| `special/` | 2: 40, 60 | 989 and 999 | Two additional recordings outside the training/evaluation split |
-| `eval_and_special/` | 8: the sequences of `eval/` and `special/` | | All eight non-training sequences in one folder, for example to evaluate them in one run |
+```bash
+./training/train_mvs.sh --epochs 5 --name smoke_test
+```
 
-The objects of the evaluation sequences do not appear in the training
-sequences, and there is no separate test set. `eval_and_special/` contains the
-same data as `eval/` and `special/`, so it does not need to be downloaded in
-addition to those two folders. `download_dataset.py` fetches only `train/` and
-`eval/`; `special/` and `eval_and_special/` can be downloaded from the dataset
-page on the Hugging Face Hub.
+The scripts find the repository from their own location, so they can be
+started from any directory. They change into the directory that contains them,
+so relative paths in their configuration block and on the command line are
+relative to `training/` for `train_mvs.sh` and `evaluation.sh` and to the
+repository root for `reconstruction.sh` and
+`data_precomputation/precompute_all.sh`. All outputs are written into the
+mounted repository and remain available after the container exits.
+
+### Preprocessing (optional)
+
+The downloaded dataset already contains the model inputs, so this step is only
+needed for raw data: after `download_dataset.py --raw_only`, or for your own
+recordings in the format described in [Dataset format](#dataset-format). It requires `raw_event_data/`,
+`hdf5/realsense.h5`, and `hdf5/poses.h5` in every sequence and the
+calibration in `camera_data/`.
+
+```bash
+# every sequence below data/ (default)
+./data_precomputation/precompute_all.sh
+
+# selected sequences
+./data_precomputation/precompute_all.sh \
+  --data_dir data/train/21 data/eval/20
+```
+
+The script runs depth/RGB projection (`project_realsense_to_event.py`),
+table-plane generation (`precompute_table_plane.py`), and voxel generation
+(`precompute_voxels.py`) in this order and writes their outputs into each
+sequence directory, overwriting existing ones. Stage-specific options can be
+passed after the markers `--project`, `--table`, and `--voxel`, for example
+`./data_precomputation/precompute_all.sh --voxel --float16`, which stores the
+voxel grids as `float16` like the published dataset instead of the default
+`float32`. Run each script with `--help` for its settings.
+
+To use your own dataset, arrange the sequence directories into `train/` and
+`eval/` folders as in the published dataset and set the `DATA_DIR` values of
+the three launchers accordingly. Recordings from another setup also need their
+own calibration in `camera_data/`.
+
+### Training
+
+```bash
+./training/train_mvs.sh
+```
+
+Training uses the sequences in `data/train/` and validates on `data/eval/`
+after every epoch. For each target frame, the
+source views are selected by camera motion: up to four earlier and four later
+frames, each at least 5 cm away from the previously selected view.
+
+The defaults of `training/train_mvs.py` reproduce the thesis configuration,
+and `train_mvs.sh` lists the main settings explicitly so they are easy to
+change:
+
+| Group | Options |
+| --- | --- |
+| Network | `--feature_channels`, `--cost_channels`, `--reference_channels`, `--coarse/middle/fine_hourglass_levels`, `--refiner_channels`, `--refiner_max_residual_m` |
+| Depth hypotheses | `--coarse_depths`, `--middle_depths`, `--middle_window`, `--fine_depths`, `--fine_window_min`, `--fine_window_max` |
+| Source views | `--num_views`, `--pose_move_threshold`, `--allow_fewer_pose_views` / `--strict_balanced_pose_views` |
+| Loss | `--lambda_grad`, `--lambda_normal`, `--uncertainty` / `--no-uncertainty`, `--lambda_confidence`, `--confidence_abs_tolerance`, `--confidence_rel_tolerance` |
+| Optimization | `--epochs`, `--batch_size`, `--lr`, `--min_lr`, `--weight_decay`, `--ema_decay` (AdamW with a cosine schedule) |
+| Regularization | `--fpn_dropout`, `--reference_dropout`, `--hourglass_dropout`, `--drop_path_rate`, and the `--no_*` switches of the four data augmentations |
+
+Run `python3 training/train_mvs.py --help` for descriptions and defaults. After
+every epoch, the script saves the checkpoints with the best validation L1,
+p95, and worst-10 % L1 error to `training/checkpoints/mvs/` as
+`best_l1_<name>.pth`, `best_p95_<name>.pth`, and `best_l1_worst10_<name>.pth`,
+and at the end the final state as `last_<name>.pth`, where `<name>` is
+`RUN_NAME` in `train_mvs.sh` or `--name`. Checkpoints store all
+settings, so evaluation and reconstruction rebuild the network from them
+automatically.
+
+Training writes TensorBoard logs to `training/checkpoints/tensorboard/`. With
+the container started as shown above, run
+
+```bash
+tensorboard --logdir training/checkpoints/tensorboard --host 0.0.0.0 --port 6006
+```
+
+and open <http://localhost:6006> to follow the losses and errors, sample
+predictions (`viz/`), and the relation between predicted confidence and error
+(`uncertainty/`).
+
+### Evaluation
+
+`CHECKPOINT` in `training/evaluation.sh` points to the
+[pretrained model](#pretrained-model). To evaluate your own model, set it to a
+trained checkpoint, for example `checkpoints/mvs/best_l1_<name>.pth` (relative
+to `training/`). Then run:
+
+```bash
+./training/evaluation.sh
+```
+
+Evaluation predicts depth for the evaluation sequences and compares it with
+the ground truth in three regions:
+
+- **Whole frame:** all pixels with valid ground-truth depth.
+- **Workspace cube:** pixels whose ground-truth point lies inside a 32 cm cube
+  around the object, which contains the object and the surrounding table.
+- **Raised cube:** the same cube, raised so that its bottom lies at
+  z = 1.5 cm in the robot base frame, above the table, so that it contains
+  only the object.
+
+For each region it reports AbsRel, SqRel, MAE, RMSE, RMSE log, and the
+δ < 1.25, 1.25², and 1.25³ accuracies. The results are written to
+`training/evaluation_results/`:
+
+| File | Contents |
+| --- | --- |
+| `summary.txt`, `summary.json` | Metrics over all sequences and the evaluation settings |
+| `depth_metrics_by_region.csv` | Metrics over all sequences, one row per region |
+| `per_sequence_metrics.csv`, `per_frame_metrics.csv` | Metrics of every sequence and every frame |
+| `qualitative_depth_results.png` | Events, ground truth, prediction, and error of one random frame per sequence |
+| `selected_frames_overview.png` | The same for the frames chosen with `EXAMPLE_SEQUENCES` and `EXAMPLE_FRAMES` in `evaluation.sh` |
+
+`EXAMPLE_SEQUENCES` takes sequence names (for example `20`) or their position
+in sorted order (`1` = first sequence), and `EXAMPLE_FRAMES` the frame index
+for each of them. A new run overwrites these files. `--fast_mode N` evaluates
+only every N-th frame for quick checks.
+
+### Reconstruction
+
+`CHECKPOINT` in `reconstruction.sh` points to the
+[pretrained model](#pretrained-model). To use your own model, set it to a
+trained checkpoint, for example `training/checkpoints/mvs/best_l1_<name>.pth`.
+Then run:
+
+```bash
+./reconstruction.sh
+```
+
+For every evaluation sequence, the script predicts depth for evenly spaced
+frames (`--mesh_frame_count`, 200 in `reconstruction.sh`) and fuses the
+predicted and the ground-truth depth maps into TSDF meshes cropped to the
+workspace cube. The predicted mesh is fused with confidence weighting and
+compared with the ground-truth mesh: accuracy, completeness, Chamfer distance,
+normal consistency, and precision/recall/F-score at 1, 2, and 5 cm. Further
+outputs are created only when their flag is appended to `ARGS` in
+`reconstruction.sh` or passed on the command line:
+
+| Flag | Effect |
+| --- | --- |
+| `--compare_uncertainty_tsdf` | Also fuses a uniformly weighted predicted mesh and compares both fusion variants |
+| `--uniform_tsdf` | Fuses only the uniformly weighted predicted mesh, for checkpoints trained without `--uncertainty` |
+| `--save_largest_connected_surface` | Writes `..._largest_component.obj` copies that keep only the largest connected surface of each mesh and computes the metrics on them |
+
+The results are written to
+`reconstruction_results/<checkpoint name>/`:
+
+| File | Contents |
+| --- | --- |
+| `<sequence>/<sequence>_gt_mesh.obj` | Mesh fused from the ground-truth depth |
+| `<sequence>/<sequence>_uncertainty_weighted_mesh.obj` | Mesh fused from the predicted depth (`..._uniform_mesh.obj` with `--compare_uncertainty_tsdf` or `--uniform_tsdf`) |
+| `<sequence>/reconstruction_metrics.json`, `.txt` | Surface metrics of the sequence |
+| `reconstruction_summary.json`, `.txt` | Means over all sequences and, with `--compare_uncertainty_tsdf`, the difference between the two fusion variants |
+| `chamfer_by_object.png` | Chamfer distance of every sequence |
+
+The meshes can be inspected with any mesh viewer, for example MeshLab.
+
+## Dataset format
 
 ### Sequence directory
 
@@ -246,7 +464,7 @@ Every sequence directory contains the raw recording and the precomputed model
 inputs derived from it:
 
 ```text
-<split>/<sequence>/
+data/<split>/<sequence>/
 ├── raw_event_data/
 │   └── events_cam0.raw          raw    event stream with hardware triggers
 ├── events/
@@ -372,197 +590,3 @@ to every sequence of the dataset:
 
 The remaining files are intermediate results of the calibration procedure on
 the `main` branch.
-
-## Pretrained model
-
-The model reported in the thesis is published as `MVS.pth` (109 MB) in the
-[`master-thesis-mvs-final-weights` release](https://github.com/mthor01/robot_and_record/releases/tag/master-thesis-mvs-final-weights).
-Download it to `training/checkpoints/mvs/`, where `training/evaluation.sh` and
-`reconstruction.sh` expect it by default:
-
-```bash
-curl -L --create-dirs -o training/checkpoints/mvs/MVS.pth \
-  https://github.com/mthor01/robot_and_record/releases/download/master-thesis-mvs-final-weights/MVS.pth
-sha256sum training/checkpoints/mvs/MVS.pth
-# 4a3d6baf7fa03394a0de4ae0647a09b0833e1fe3ebd917b89b578a5888ebd3e5
-```
-
-The checkpoint contains the weights with the lowest validation L1 error and
-all settings needed to rebuild the network, so it can be used directly for
-[evaluation](#evaluation) and [reconstruction](#reconstruction). Its configuration is the default of
-`training/train_mvs.py`.
-
-## Usage
-
-The three launchers `training/train_mvs.sh`, `training/evaluation.sh`, and
-`reconstruction.sh` collect their settings in a configuration block at the top
-of the file. They work with the downloaded dataset as they are; edit the block
-to change paths, checkpoints, or parameters. Arguments given on the command
-line are appended, which is convenient for short experiments:
-
-```bash
-./training/train_mvs.sh --epochs 5 --name smoke_test
-```
-
-The scripts find the repository from their own location, so they can be
-started from any directory. They change into the directory that contains them,
-so relative paths in their configuration block and on the command line are
-relative to `training/` for `train_mvs.sh` and `evaluation.sh` and to the
-repository root for `reconstruction.sh` and
-`data_precomputation/precompute_all.sh`. All outputs are written into the
-mounted repository and remain available after the container exits.
-
-### Preprocessing (optional)
-
-The downloaded dataset already contains the model inputs, so this step is only
-needed for raw data: after `download_dataset.py --raw_only`, or for your own
-recordings in the format described above. It requires `raw_event_data/`,
-`hdf5/realsense.h5`, and `hdf5/poses.h5` in every sequence and the
-calibration in `camera_data/`.
-
-```bash
-# every sequence below data/Event_and_Depth (default)
-./data_precomputation/precompute_all.sh
-
-# selected sequences
-./data_precomputation/precompute_all.sh \
-  --data_dir data/Event_and_Depth/train/21 data/Event_and_Depth/eval/20
-```
-
-The script runs depth/RGB projection (`project_realsense_to_event.py`),
-table-plane generation (`precompute_table_plane.py`), and voxel generation
-(`precompute_voxels.py`) in this order and writes their outputs into each
-sequence directory, overwriting existing ones. Stage-specific options can be
-passed after the markers `--project`, `--table`, and `--voxel`, for example
-`./data_precomputation/precompute_all.sh --voxel --float16`, which stores the
-voxel grids as `float16` like the published dataset instead of the default
-`float32`. Run each script with `--help` for its settings.
-
-To use your own dataset, arrange the sequence directories into `train/` and
-`eval/` folders as in the published dataset and set the `DATA_DIR` values of
-the three launchers accordingly. Recordings from another setup also need their
-own calibration in `camera_data/`.
-
-### Training
-
-```bash
-./training/train_mvs.sh
-```
-
-Training uses the sequences in `data/Event_and_Depth/train/` and validates on
-`data/Event_and_Depth/eval/` after every epoch. For each target frame, the
-source views are selected by camera motion: up to four earlier and four later
-frames, each at least 5 cm away from the previously selected view.
-
-The defaults of `training/train_mvs.py` reproduce the thesis configuration,
-and `train_mvs.sh` lists the main settings explicitly so they are easy to
-change:
-
-| Group | Options |
-| --- | --- |
-| Network | `--feature_channels`, `--cost_channels`, `--reference_channels`, `--coarse/middle/fine_hourglass_levels`, `--refiner_channels`, `--refiner_max_residual_m` |
-| Depth hypotheses | `--coarse_depths`, `--middle_depths`, `--middle_window`, `--fine_depths`, `--fine_window_min`, `--fine_window_max` |
-| Source views | `--num_views`, `--pose_move_threshold`, `--allow_fewer_pose_views` / `--strict_balanced_pose_views` |
-| Loss | `--lambda_grad`, `--lambda_normal`, `--uncertainty` / `--no-uncertainty`, `--lambda_confidence`, `--confidence_abs_tolerance`, `--confidence_rel_tolerance` |
-| Optimization | `--epochs`, `--batch_size`, `--lr`, `--min_lr`, `--weight_decay`, `--ema_decay` (AdamW with a cosine schedule) |
-| Regularization | `--fpn_dropout`, `--reference_dropout`, `--hourglass_dropout`, `--drop_path_rate`, and the `--no_*` switches of the four data augmentations |
-
-Run `python3 training/train_mvs.py --help` for descriptions and defaults. After
-every epoch, the script saves the checkpoints with the best validation L1,
-p95, and worst-10 % L1 error to `training/checkpoints/mvs/` as
-`best_l1_<name>.pth`, `best_p95_<name>.pth`, and `best_l1_worst10_<name>.pth`,
-and at the end the final state as `last_<name>.pth`, where `<name>` is
-`RUN_NAME` in `train_mvs.sh` or `--name`. Checkpoints store all
-settings, so evaluation and reconstruction rebuild the network from them
-automatically.
-
-Training writes TensorBoard logs to `training/checkpoints/tensorboard/`. With
-the container started as shown above, run
-
-```bash
-tensorboard --logdir training/checkpoints/tensorboard --host 0.0.0.0 --port 6006
-```
-
-and open <http://localhost:6006> to follow the losses and errors, sample
-predictions (`viz/`), and the relation between predicted confidence and error
-(`uncertainty/`).
-
-### Evaluation
-
-`CHECKPOINT` in `training/evaluation.sh` points to the
-[pretrained model](#pretrained-model). To evaluate your own model, set it to a
-trained checkpoint, for example `checkpoints/mvs/best_l1_<name>.pth` (relative
-to `training/`). Then run:
-
-```bash
-./training/evaluation.sh
-```
-
-Evaluation predicts depth for the evaluation sequences and compares it with
-the ground truth in three regions:
-
-- **Whole frame:** all pixels with valid ground-truth depth.
-- **Workspace cube:** pixels whose ground-truth point lies inside a 32 cm cube
-  around the object, which contains the object and the surrounding table.
-- **Raised cube:** the same cube, raised so that its bottom lies at
-  z = 1.5 cm in the robot base frame, above the table, so that it contains
-  only the object.
-
-For each region it reports AbsRel, SqRel, MAE, RMSE, RMSE log, and the
-δ < 1.25, 1.25², and 1.25³ accuracies. The results are written to
-`training/evaluation_results/`:
-
-| File | Contents |
-| --- | --- |
-| `summary.txt`, `summary.json` | Metrics over all sequences and the evaluation settings |
-| `depth_metrics_by_region.csv` | Metrics over all sequences, one row per region |
-| `per_sequence_metrics.csv`, `per_frame_metrics.csv` | Metrics of every sequence and every frame |
-| `qualitative_depth_results.png` | Events, ground truth, prediction, and error of one random frame per sequence |
-| `selected_frames_overview.png` | The same for the frames chosen with `EXAMPLE_SEQUENCES` and `EXAMPLE_FRAMES` in `evaluation.sh` |
-
-`EXAMPLE_SEQUENCES` takes sequence names (for example `20`) or their position
-in sorted order (`1` = first sequence), and `EXAMPLE_FRAMES` the frame index
-for each of them. A new run overwrites these files. `--fast_mode N` evaluates
-only every N-th frame for quick checks.
-
-### Reconstruction
-
-`CHECKPOINT` in `reconstruction.sh` points to the
-[pretrained model](#pretrained-model). To use your own model, set it to a
-trained checkpoint, for example `training/checkpoints/mvs/best_l1_<name>.pth`.
-Then run:
-
-```bash
-./reconstruction.sh
-```
-
-For every evaluation sequence, the script predicts depth for evenly spaced
-frames (`--mesh_frame_count`, 200 in `reconstruction.sh`) and fuses the
-predicted and the ground-truth depth maps into TSDF meshes cropped to the
-workspace cube. The predicted mesh is fused with confidence weighting and
-compared with the ground-truth mesh: accuracy, completeness, Chamfer distance,
-normal consistency, and precision/recall/F-score at 1, 2, and 5 cm. Further
-outputs are created only when their flag is appended to `ARGS` in
-`reconstruction.sh` or passed on the command line:
-
-| Flag | Effect |
-| --- | --- |
-| `--compare_uncertainty_tsdf` | Also fuses a uniformly weighted predicted mesh and compares both fusion variants |
-| `--uniform_tsdf` | Fuses only the uniformly weighted predicted mesh, for checkpoints trained without `--uncertainty` |
-| `--save_largest_connected_surface` | Writes `..._largest_component.obj` copies that keep only the largest connected surface of each mesh and computes the metrics on them |
-
-The mesh metrics in [Results](#results) were computed with
-`--save_largest_connected_surface`.
-
-The results are written to
-`reconstruction_results/<checkpoint name>/`:
-
-| File | Contents |
-| --- | --- |
-| `<sequence>/<sequence>_gt_mesh.obj` | Mesh fused from the ground-truth depth |
-| `<sequence>/<sequence>_uncertainty_weighted_mesh.obj` | Mesh fused from the predicted depth (`..._uniform_mesh.obj` with `--compare_uncertainty_tsdf` or `--uniform_tsdf`) |
-| `<sequence>/reconstruction_metrics.json`, `.txt` | Surface metrics of the sequence |
-| `reconstruction_summary.json`, `.txt` | Means over all sequences and, with `--compare_uncertainty_tsdf`, the difference between the two fusion variants |
-| `chamfer_by_object.png` | Chamfer distance of every sequence |
-
-The meshes can be inspected with any mesh viewer, for example MeshLab.

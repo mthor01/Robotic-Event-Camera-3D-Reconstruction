@@ -26,9 +26,9 @@ Outputs (per recording):
 
 Usage (run from the repository root):
     # Process a single recording
-    python3 data_precomputation/project_realsense_to_event.py --data_dir data/Event_and_Depth/eval/20
+    python3 data_precomputation/project_realsense_to_event.py --data_dir data/eval/20
 
-    # Process all recordings below data/Event_and_Depth (default)
+    # Process all recordings below data (default)
     python3 data_precomputation/project_realsense_to_event.py
 
     # Depth only (skip RGB projection)

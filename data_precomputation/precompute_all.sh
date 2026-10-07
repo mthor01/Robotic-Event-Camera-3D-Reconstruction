@@ -8,9 +8,9 @@
 # existing ones (--overwrite is always passed).
 #
 # Usage (relative paths are relative to the repository root):
-#   ./precompute_all.sh                                          # every sequence below data/Event_and_Depth (default)
-#   ./precompute_all.sh --data_dir data/Event_and_Depth/eval/20  # one sequence
-#   ./precompute_all.sh --data_dir data/Event_and_Depth/train/21 data/Event_and_Depth/eval/20
+#   ./precompute_all.sh                                          # every sequence below data (default)
+#   ./precompute_all.sh --data_dir data/eval/20  # one sequence
+#   ./precompute_all.sh --data_dir data/train/21 data/eval/20
 #   ./precompute_all.sh --data_root data/my_dataset              # every sequence below another root
 #
 # Per-step flags:
@@ -24,7 +24,7 @@
 #     # Store voxels as float16, like the published dataset
 #     ./precompute_all.sh --voxel --float16
 #
-#     ./precompute_all.sh --data_dir data/Event_and_Depth/eval/20 \
+#     ./precompute_all.sh --data_dir data/eval/20 \
 #         --project --no_rgb --workers 8 \
 #         --table   --debug \
 #         --voxel   --float16 --workers 2
@@ -84,9 +84,9 @@ while [[ $i -le $# ]]; do
     esac
 done
 
-# Default to data/Event_and_Depth if nothing was specified
+# Default to data if nothing was specified
 if [[ ${#DATA_ARGS[@]} -eq 0 ]]; then
-    DATA_ARGS=("--data_root" "data/Event_and_Depth")
+    DATA_ARGS=("--data_root" "data")
 fi
 
 # Change to the repository root so that relative data paths (data/...)

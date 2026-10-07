@@ -14,7 +14,7 @@ cd "$SCRIPT_DIR"
 # Checkpoints are saved as checkpoints/mvs/{best_l1,best_p95,best_l1_worst10,last}_<RUN_NAME>.pth
 RUN_NAME="mvs"
 # Dataset root containing train/ (training) and eval/ (validation after every epoch)
-DATA_DIR="../data/Event_and_Depth"
+DATA_DIR="../data"
 BATCH_SIZE=10
 WORKERS=8
 

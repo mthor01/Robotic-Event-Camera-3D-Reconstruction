@@ -13,7 +13,7 @@ cd "$SCRIPT_DIR"
 # ---------------------------------------------------------------------------
 # Configuration: edit paths, examples, and resource-related settings.
 # ---------------------------------------------------------------------------
-DATA_DIR="../data/Event_and_Depth/eval"
+DATA_DIR="../data/eval"
 CHECKPOINT="checkpoints/mvs/MVS.pth"
 WORKERS=8
 BATCH_SIZE=15

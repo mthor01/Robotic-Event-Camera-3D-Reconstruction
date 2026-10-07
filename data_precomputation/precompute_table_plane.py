@@ -23,7 +23,7 @@ TABLE_Z_OFFSET (config.py), i.e. z = -0.02 m.
 
 Usage:
     python3 data_precomputation/precompute_table_plane.py
-    python3 data_precomputation/precompute_table_plane.py --data_dir data/Event_and_Depth/eval/20
+    python3 data_precomputation/precompute_table_plane.py --data_dir data/eval/20
     python3 data_precomputation/precompute_table_plane.py --debug --overwrite
     python3 data_precomputation/precompute_table_plane.py --table_z -0.025
 """

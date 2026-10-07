@@ -26,11 +26,11 @@ Outputs, by default below reconstruction_results/<checkpoint_name>/ next to this
 Usage:
     python3 reconstruction.py \\
         --checkpoint training/checkpoints/mvs/best_l1_myrun.pth \\
-        --data_dir   data/Event_and_Depth/eval/20
+        --data_dir   data/eval/20
 
     python3 reconstruction.py \\
         --checkpoint training/checkpoints/mvs/best_l1_myrun.pth \\
-        --data_dir   data/Event_and_Depth/eval \\
+        --data_dir   data/eval \\
         --compare_uncertainty_tsdf --save_largest_connected_surface
 """
 
