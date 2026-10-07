@@ -3,7 +3,7 @@
 This repository contains the code of my master's thesis on event-based
 multi-view depth estimation and 3-D reconstruction.
 
-**[Read the master's thesis (PDF)](https://github.com/mthor01/robot_and_record/blob/main/docs/Masters_Thesis_github.pdf)**
+**[Read the master's thesis (PDF)](docs/Masters_Thesis_github.pdf)**
 · **[Dataset on Hugging Face](https://huggingface.co/datasets/mthor/Event_and_Depth)**
 · **[Pretrained model](https://github.com/mthor01/robot_and_record/releases/tag/master-thesis-mvs-final-weights)**
 
@@ -55,11 +55,58 @@ of the model reported in the thesis.
   confidence-weighted TSDF integration, and compare them with meshes from the
   ground-truth depth ([Reconstruction](#reconstruction)).
 
-## Quick start
+## Installation and quick start
 
-Build and start the Docker container as described in
-[Installation](#installation), then run the following commands in it from the
-repository root:
+### Installation
+
+All scripts in this repository are meant to run inside the Docker image
+defined in `docker_installation/training_and_reconstruction/`. It contains
+PyTorch, Open3D, OpenEB 5.3 (the open-source part of the Prophesee Metavision
+SDK, needed only to read raw event files during preprocessing), and
+`huggingface_hub`. A Linux machine with an NVIDIA GPU and the NVIDIA Container
+Toolkit is recommended for training and reconstruction.
+
+Build the image from the repository root. Supplying the local user and group
+IDs keeps files written into the mounted repository owned by you:
+
+```bash
+docker build \
+  --build-arg UID="$(id -u)" \
+  --build-arg GID="$(id -g)" \
+  -t robot-record-reconstruction \
+  docker_installation/training_and_reconstruction
+```
+
+Start a container with the repository mounted at `/workspace`. The port
+mapping is only needed for TensorBoard:
+
+```bash
+docker run --rm -it \
+  --gpus all \
+  --ipc=host \
+  --shm-size=16g \
+  -p 6006:6006 \
+  -v "$(pwd):/workspace" \
+  -w /workspace \
+  robot-record-reconstruction bash
+```
+
+All commands in this README are run from this container shell in
+`/workspace`. Adjust `--shm-size`, batch sizes, and worker counts to the
+available memory and GPU.
+
+### Quick start
+
+Inside the container, the following commands download the data and the
+pretrained model and run training, evaluation, and reconstruction. Each step
+is explained in more detail further below:
+
+1. Dataset download and all its options: [Download](#download); the structure
+   of the downloaded files: [Dataset format](#dataset-format).
+2. Pretrained model: [Pretrained model](#pretrained-model).
+3. Running the scripts and changing their settings: [Usage](#usage),
+   [Training](#training), [Evaluation](#evaluation), and
+   [Reconstruction](#reconstruction).
 
 ```bash
 # 1. Download the dataset: the model inputs of all 48 sequences (about 60 GB)
@@ -161,48 +208,19 @@ on all frames, and the mesh metrics are those of `reconstruction.sh` (see
 | `training/depth_losses.py`, `training/tensorboard_helper.py` | Training losses and TensorBoard logging. |
 | `reconstruction.py`, `reconstruction.sh` | TSDF reconstruction and surface metrics, with its launcher. |
 | `docker_installation/training_and_reconstruction/` | Dockerfile of the software environment. |
-| `docs/images/` | Images used in this README. |
+| `docs/` | The master's thesis (`Masters_Thesis_github.pdf`) and the images used in this README. |
 | `data/` | Dataset with the `train/` and `eval/` sequences (created by `download_dataset.py`, not tracked by git). |
 | `training/checkpoints/`, `training/evaluation_results/`, `reconstruction_results/` | Checkpoints and outputs of training, evaluation, and reconstruction (created by the scripts, not tracked by git). |
 
-## Installation
-
-Everything runs inside the Docker image defined in
-`docker_installation/training_and_reconstruction/`. It contains PyTorch,
-Open3D, OpenEB 5.3 (the open-source part of the Prophesee Metavision SDK,
-needed only to read raw event files during preprocessing), and
-`huggingface_hub`. A Linux machine with an NVIDIA GPU and
-the NVIDIA Container Toolkit is recommended for training and reconstruction.
-
-Build the image from the repository root. Supplying the local user and group
-IDs keeps files written into the mounted repository owned by you:
-
-```bash
-docker build \
-  --build-arg UID="$(id -u)" \
-  --build-arg GID="$(id -g)" \
-  -t robot-record-reconstruction \
-  docker_installation/training_and_reconstruction
-```
-
-Start a container with the repository mounted at `/workspace`. The port
-mapping is only needed for TensorBoard:
-
-```bash
-docker run --rm -it \
-  --gpus all \
-  --ipc=host \
-  --shm-size=16g \
-  -p 6006:6006 \
-  -v "$(pwd):/workspace" \
-  -w /workspace \
-  robot-record-reconstruction bash
-```
-
-All commands below are run from this container shell in `/workspace`. Adjust
-`--shm-size`, batch sizes, and worker counts to the available memory and GPU.
-
 ## Dataset
+
+The dataset contains 48 object-specific recordings of static, colored
+building-block structures on a mostly textureless white table. For every
+recording, the robot moves the camera rig along a smooth path through randomly
+sampled, reachable viewpoints on a restricted hemisphere around the object.
+Each trajectory is constructed from 30 target poses and is recorded
+continuously, producing synchronized event streams, RGB-D measurements, and
+camera poses at 30 frames per second.
 
 <p align="center">
   <img src="docs/images/cameras.jpg" alt="Close-up of the synchronized event and RGB-D cameras mounted on the robot end effector" width="760">
@@ -215,14 +233,6 @@ All commands below are run from this container shell in `/workspace`. Adjust
 </p>
 
 <p align="center"><em>The complete recording setup with a static building-block object in the workspace.</em></p>
-
-The dataset contains 48 object-specific recordings of static, colored
-building-block structures on a mostly textureless white table. For every
-recording, the robot moves the camera rig along a smooth path through randomly
-sampled, reachable viewpoints on a restricted hemisphere around the object.
-Each trajectory is constructed from 30 target poses and is recorded
-continuously, producing synchronized event streams, RGB-D measurements, and
-camera poses at 30 frames per second.
 
 The recordings are split into a training and an evaluation folder. Each
 recording is one **sequence directory**, named by its recording number:
