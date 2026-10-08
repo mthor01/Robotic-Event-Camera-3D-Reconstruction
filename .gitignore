@@ -22,3 +22,5 @@ instructions
 **/.vscode
 **/extract_dataset.py
 **/extract_dataset.sbatch
+*.deb
+**/metavision*.list

@@ -21,7 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     librealsense2-dev \
  && rm -rf /var/lib/apt/lists/*
 
-# 1) Add Prophesee APT repo list (this is your downloaded file)
+# 1) Add Prophesee APT repo list (this is your downloaded file; not included
+#    in the repository, place it next to this Dockerfile)
 COPY metavision.list /etc/apt/sources.list.d/metavision.list
 
 # (Optional) Pin to a specific SDK version if needed (doc shows pinning example)
@@ -37,7 +38,8 @@ RUN apt-get update \
 # Optional: if you need python 3.9 bindings on Ubuntu 22.04 (doc mentions this extra package)
 # RUN apt-get update && apt-get install -y metavision-sdk-python3.9 && rm -rf /var/lib/apt/lists/*
 
-# Copy IDS uEye EVS plugin (must match SDK 4.6.2)
+# Copy IDS uEye EVS plugin (must match SDK 4.6.2; not included in the
+# repository, download it from IDS and place it next to this Dockerfile)
 COPY ueye-evs_4.6.2.2_amd64.deb /tmp/
 
 RUN apt-get update \
