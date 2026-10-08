@@ -5,7 +5,7 @@ multi-view depth estimation and 3-D reconstruction.
 
 **[Read the master's thesis (PDF)](docs/Masters_Thesis_github.pdf)**
 · **[Dataset on Hugging Face](https://huggingface.co/datasets/mthor/Event_and_Depth)**
-· **[Pretrained model](https://github.com/mthor01/robot_and_record/releases/tag/master-thesis-mvs-final-weights)**
+· **[Pretrained model](https://github.com/mthor01/Robotic-Event-Camera-3D-Reconstruction/releases/tag/master-thesis-mvs-final-weights)**
 
 The main contribution is an event-based depth-estimation method inspired by
 RGB multi-view stereo (MVS). Instead of matching conventional RGB images, the
@@ -18,7 +18,7 @@ each reference view, and fuses the resulting predictions into a 3-D mesh.
 
 | Branch | Contents | Intended use |
 | --- | --- | --- |
-| [`main`](https://github.com/mthor01/robot_and_record/tree/main) | The complete thesis project: Franka robot-arm control, trajectory execution, synchronized data recording, camera and hand-eye calibration, the U-Net baselines and model comparisons, the architecture and training variants explored during development, and many analysis, visualization, and test scripts used throughout the thesis. | Documents the full experimental system; cannot be run directly. |
+| [`main`](https://github.com/mthor01/Robotic-Event-Camera-3D-Reconstruction/tree/main) | The complete thesis project: Franka robot-arm control, trajectory execution, synchronized data recording, camera and hand-eye calibration, the U-Net baselines and model comparisons, the architecture and training variants explored during development, and many analysis, visualization, and test scripts used throughout the thesis. | Documents the full experimental system; cannot be run directly. |
 | **`light`** (this branch) | Everything needed to work with the published dataset: preprocessing, training, evaluation, and TSDF reconstruction of the MVS model. | Using, retraining, and extending the method. |
 
 The `main` branch is very setup specific. Its recording and robot-control code
@@ -114,7 +114,7 @@ python3 download_dataset.py --precomputed_only --eval_only
 
 # 2. Download the pretrained model of the thesis
 curl -L --create-dirs -o training/checkpoints/mvs/MVS.pth \
-  https://github.com/mthor01/robot_and_record/releases/download/master-thesis-mvs-final-weights/MVS.pth
+  https://github.com/mthor01/Robotic-Event-Camera-3D-Reconstruction/releases/download/master-thesis-mvs-final-weights/MVS.pth
 
 # 3. Train, evaluate, and reconstruct
 ./training/train_mvs.sh     # checkpoints in training/checkpoints/mvs/
@@ -306,13 +306,13 @@ own calibration in `camera_data/`.
 ## Pretrained model
 
 The model reported in the thesis is published as `MVS.pth` (109 MB) in the
-[`master-thesis-mvs-final-weights` release](https://github.com/mthor01/robot_and_record/releases/tag/master-thesis-mvs-final-weights).
+[`master-thesis-mvs-final-weights` release](https://github.com/mthor01/Robotic-Event-Camera-3D-Reconstruction/releases/tag/master-thesis-mvs-final-weights).
 Download it to `training/checkpoints/mvs/`, where `training/evaluation.sh` and
 `reconstruction.sh` expect it by default:
 
 ```bash
 curl -L --create-dirs -o training/checkpoints/mvs/MVS.pth \
-  https://github.com/mthor01/robot_and_record/releases/download/master-thesis-mvs-final-weights/MVS.pth
+  https://github.com/mthor01/Robotic-Event-Camera-3D-Reconstruction/releases/download/master-thesis-mvs-final-weights/MVS.pth
 sha256sum training/checkpoints/mvs/MVS.pth
 # 4a3d6baf7fa03394a0de4ae0647a09b0833e1fe3ebd917b89b578a5888ebd3e5
 ```
