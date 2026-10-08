@@ -9,4 +9,4 @@ for one specific robot and camera setup, and it requires the Prophesee
 Metavision SDK 4.6.2, which Prophesee no longer offers for public download.
 
 To work with the method and the published dataset, use the
-[`light` branch](https://github.com/mthor01/robot_and_record/tree/light).
+[`light` branch](https://github.com/mthor01/Robotic-Event-Camera-3D-Reconstruction/tree/light).
