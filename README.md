@@ -1,4 +1,4 @@
-# Robot Recording and Event-Based 3-D Reconstruction
+# Event-Based 3-D Reconstruction through learning based Multi-View-Stereo
 
 This repository contains the code of my master's thesis on event-based
 multi-view depth estimation and 3-D reconstruction.
