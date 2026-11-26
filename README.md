@@ -128,93 +128,15 @@ training. To use a model you trained yourself, set `CHECKPOINT` in both
 scripts to its checkpoint, for example `best_l1_mvs.pth` (see
 [Evaluation](#evaluation) and [Reconstruction](#reconstruction)).
 
-## Method overview
-
-An Intel RealSense D435 RGB-D camera and an IDS UE-39B0XCP-E event camera are
-rigidly attached to the end effector of a Franka Emika Panda robot. The cameras
-are hardware synchronized, while the robot publishes timestamped end-effector
-poses. Calibration provides the transformations needed both to project
-RealSense depth into the event-camera frame and to place all event-camera
-observations in a common world coordinate system, the robot base frame. The
-RealSense depth serves only as supervision; the model sees only events and the
-table prior.
-
-1. **Recording** (`main` branch). The robot moves the cameras along a smooth
-   multi-view trajectory around a static object.
-2. **Preprocessing.** RealSense depth is projected into the event-camera
-   frame, events are accumulated into five-bin voxel grids per frame, and a
-   view-dependent table-plane depth prior is generated.
-3. **MVS-inspired depth prediction.** One event observation is the reference
-   view and up to eight displaced observations of the same scene are source
-   views. A shared feature pyramid extracts multi-scale features, calibrated
-   camera geometry warps source-view features across depth hypotheses, and
-   three cascaded cost volumes progressively narrow the depth interval. A
-   refinement network predicts full-resolution depth and a per-pixel
-   confidence map.
-4. **TSDF reconstruction.** Predicted depth maps are transformed into the
-   world frame and integrated into a truncated signed distance field.
-   Confidence-weighted fusion reduces the influence of unreliable predictions,
-   and the surface is extracted as a triangle mesh.
-
-```text
-event streams + RealSense depth + robot poses        (recording, main branch)
-                      |
-                      v
- event voxel grids + table priors + ground-truth depth       (preprocessing)
-                      |
-                      v
- geometry-aware multi-view depth and confidence prediction      (MVS model)
-                      |
-                      v
-        confidence-weighted TSDF fusion -> 3-D mesh          (reconstruction)
-```
-
-## Results
-
-The results are measured on the six held-out evaluation sequences, whose
-objects were not used for training, inside the workspace cube around the
-object. The model achieves a mean absolute depth error (MAE) of **0.180 cm**
-and a root mean squared error (RMSE) of **0.630 cm**.
-
-For reconstruction, the predicted depth maps are fused with confidence-weighted
-TSDF integration and compared with reference meshes fused from the
-ground-truth depth maps. Accuracy measures predicted-to-reference surface
-distance, completeness measures reference-to-predicted distance, and their
-symmetric mean is the Chamfer distance; lower is better. Normal consistency is
-better when closer to one. Averaged over the six evaluation objects, the
-reconstructed meshes achieve an accuracy of **0.108 cm**, completeness of
-**0.108 cm**, Chamfer distance of **0.108 cm**, and normal consistency of
-**0.966**.
-
-These results are obtained with the [pretrained model](#pretrained-model).
-The depth metrics are the workspace-cube results of `training/evaluation.sh`
-on all frames, and the mesh metrics are those of `reconstruction.sh` (see
-[Usage](#usage)).
-
-## Repository layout
-
-| Path | Purpose |
-| --- | --- |
-| `download_dataset.py` | Downloads the dataset from the Hugging Face Hub into `data/`. |
-| `config.py` | Shared constants: dataset location, input resolution, depth range, workspace cube, and TSDF settings. |
-| `helpers.py` | Camera geometry, dataset discovery, workspace masks, and source-view selection. |
-| `camera_data/` | Calibration of the recording setup (intrinsics, extrinsics, depth scale). |
-| `data_precomputation/` | Preprocessing of raw recordings into model inputs. |
-| `training/train_mvs.py`, `training/train_mvs.sh` | MVS network, dataset loader, and training loop, with its launcher. |
-| `training/evaluation.py`, `training/evaluation.sh` | Depth evaluation, with its launcher. |
-| `training/depth_losses.py`, `training/tensorboard_helper.py` | Training losses and TensorBoard logging. |
-| `reconstruction.py`, `reconstruction.sh` | TSDF reconstruction and surface metrics, with its launcher. |
-| `docker_installation/training_and_reconstruction/` | Dockerfile of the software environment. |
-| `docs/` | The master's thesis (`Masters_Thesis_github.pdf`) and the images used in this README. |
-| `data/` | Dataset with the `train/` and `eval/` sequences (created by `download_dataset.py`, not tracked by git). |
-| `training/checkpoints/`, `training/evaluation_results/`, `reconstruction_results/` | Checkpoints and outputs of training, evaluation, and reconstruction (created by the scripts, not tracked by git). |
-
 ## Dataset
 
 The dataset contains 48 object-specific recordings of static, colored
-building-block structures on a mostly textureless white table. For every
-recording, the robot moves the camera rig along a smooth path through randomly
-sampled, reachable viewpoints on a restricted hemisphere around the object.
+building-block structures on a mostly textureless white table. They were
+recorded with an Intel RealSense D435 RGB-D camera and an IDS UE-39B0XCP-E
+event camera, which are hardware synchronized and rigidly attached to the end
+effector of a Franka Emika Panda robot. For every recording, the robot moves
+this camera rig along a smooth path through randomly sampled, reachable
+viewpoints on a restricted hemisphere around the object.
 Each trajectory is constructed from 30 target poses and is recorded
 continuously, producing synchronized event streams, RGB-D measurements, and
 camera poses at 30 frames per second.
@@ -302,6 +224,86 @@ To use your own dataset, arrange the sequence directories into `train/` and
 `eval/` folders as in the published dataset and set the `DATA_DIR` values of
 the three launchers accordingly. Recordings from another setup also need their
 own calibration in `camera_data/`.
+
+## Method overview
+
+The method works on the recordings of the [dataset](#dataset): synchronized
+event streams and RealSense frames, with the robot's timestamped end-effector
+poses. Calibration provides the transformations needed both to project
+RealSense depth into the event-camera frame and to place all event-camera
+observations in a common world coordinate system, the robot base frame. The
+RealSense depth serves only as supervision; the model sees only events and the
+table prior.
+
+1. **Recording** (`main` branch). The robot moves the cameras along a smooth
+   multi-view trajectory around a static object (see [Dataset](#dataset)).
+2. **Preprocessing.** RealSense depth is projected into the event-camera
+   frame, events are accumulated into five-bin voxel grids per frame, and a
+   view-dependent table-plane depth prior is generated.
+3. **MVS-inspired depth prediction.** One event observation is the reference
+   view and up to eight displaced observations of the same scene are source
+   views. A shared feature pyramid extracts multi-scale features, calibrated
+   camera geometry warps source-view features across depth hypotheses, and
+   three cascaded cost volumes progressively narrow the depth interval. A
+   refinement network predicts full-resolution depth and a per-pixel
+   confidence map.
+4. **TSDF reconstruction.** Predicted depth maps are transformed into the
+   world frame and integrated into a truncated signed distance field.
+   Confidence-weighted fusion reduces the influence of unreliable predictions,
+   and the surface is extracted as a triangle mesh.
+
+```text
+event streams + RealSense depth + robot poses        (recording, main branch)
+                      |
+                      v
+ event voxel grids + table priors + ground-truth depth       (preprocessing)
+                      |
+                      v
+ geometry-aware multi-view depth and confidence prediction      (MVS model)
+                      |
+                      v
+        confidence-weighted TSDF fusion -> 3-D mesh          (reconstruction)
+```
+
+## Results
+
+The results are measured on the six held-out evaluation sequences, whose
+objects were not used for training, inside the workspace cube around the
+object. The model achieves a mean absolute depth error (MAE) of **0.180 cm**
+and a root mean squared error (RMSE) of **0.630 cm**.
+
+For reconstruction, the predicted depth maps are fused with confidence-weighted
+TSDF integration and compared with reference meshes fused from the
+ground-truth depth maps. Accuracy measures predicted-to-reference surface
+distance, completeness measures reference-to-predicted distance, and their
+symmetric mean is the Chamfer distance; lower is better. Normal consistency is
+better when closer to one. Averaged over the six evaluation objects, the
+reconstructed meshes achieve an accuracy of **0.108 cm**, completeness of
+**0.108 cm**, Chamfer distance of **0.108 cm**, and normal consistency of
+**0.966**.
+
+These results are obtained with the [pretrained model](#pretrained-model).
+The depth metrics are the workspace-cube results of `training/evaluation.sh`
+on all frames, and the mesh metrics are those of `reconstruction.sh` (see
+[Usage](#usage)).
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `download_dataset.py` | Downloads the dataset from the Hugging Face Hub into `data/`. |
+| `config.py` | Shared constants: dataset location, input resolution, depth range, workspace cube, and TSDF settings. |
+| `helpers.py` | Camera geometry, dataset discovery, workspace masks, and source-view selection. |
+| `camera_data/` | Calibration of the recording setup (intrinsics, extrinsics, depth scale). |
+| `data_precomputation/` | Preprocessing of raw recordings into model inputs. |
+| `training/train_mvs.py`, `training/train_mvs.sh` | MVS network, dataset loader, and training loop, with its launcher. |
+| `training/evaluation.py`, `training/evaluation.sh` | Depth evaluation, with its launcher. |
+| `training/depth_losses.py`, `training/tensorboard_helper.py` | Training losses and TensorBoard logging. |
+| `reconstruction.py`, `reconstruction.sh` | TSDF reconstruction and surface metrics, with its launcher. |
+| `docker_installation/training_and_reconstruction/` | Dockerfile of the software environment. |
+| `docs/` | The master's thesis (`Masters_Thesis_github.pdf`) and the images used in this README. |
+| `data/` | Dataset with the `train/` and `eval/` sequences (created by `download_dataset.py`, not tracked by git). |
+| `training/checkpoints/`, `training/evaluation_results/`, `reconstruction_results/` | Checkpoints and outputs of training, evaluation, and reconstruction (created by the scripts, not tracked by git). |
 
 ## Pretrained model
 
